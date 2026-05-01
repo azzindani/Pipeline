@@ -47,6 +47,72 @@ Local models (Ollama, llama.cpp, LM Studio) are weaker at long-context reasoning
 
 ---
 
+## Development standards
+
+All code, architecture, testing, security, and tooling decisions in this project follow the standards defined in:
+
+> **https://github.com/azzindani/Standards**
+
+This is the authoritative reference. When any decision is ambiguous, consult the relevant standard before proceeding.
+
+### How to use Standards in this project
+
+Pipeline loads standards at init and keeps a local cache in `.pipeline/standards/`. Standards are fetched by category on demand and updated on `pipeline update`.
+
+```
+pipeline standards fetch              # clone/pull Standards repo locally
+pipeline standards list               # show all available standards
+pipeline standards show <category>    # read a specific standard
+pipeline standards apply <category>   # agent applies standard to current codebase
+```
+
+### Standards that apply to Pipeline itself
+
+Every standard in the catalog applies to Pipeline's own codebase. Priority order for agents working on Pipeline:
+
+| Priority | Standard | Path | Applies to |
+|---|---|---|---|
+| 1 | Architecture | `architecture/STANDARDS.md` | Overall system structure |
+| 2 | Rust | `rust/STANDARDS.md` | All Rust crates |
+| 3 | CI/CD | `cicd/STANDARDS.md` | Pipeline's own pipeline.yaml |
+| 4 | Local MCP | `local_mcp/STANDARDS.md` | pipeline-mcp crate |
+| 5 | CLI | `cli/STANDARDS.md` | pipeline-cli crate |
+| 6 | Testing | `testing/STANDARDS.md` | All test suites |
+| 7 | Error handling | `error_handling/STANDARDS.md` | All crates |
+| 8 | Observability | `observability/STANDARDS.md` | pipeline-report, logging |
+| 9 | Security | `security/STANDARDS.md` | Secret scanning, gates |
+| 10 | Database | `database/STANDARDS.md` | pipeline-memory SQLite schema |
+| 11 | Git | `git/STANDARDS.md` | Branching, commits, tags |
+| 12 | Agent | `agent/STANDARDS.md` | This CLAUDE.md file itself |
+| 13 | Directory | `directory/STANDARDS.md` | Project layout |
+| 14 | Dependencies | `dependencies/STANDARDS.md` | Cargo.toml management |
+| 15 | Performance | `performance/STANDARDS.md` | Stage runner performance |
+
+### Standards for projects Pipeline manages
+
+When Pipeline scaffolds or manages a target project, it selects and applies the relevant subset of standards based on that project's stack:
+
+```
+python-uv project  → architecture · python · testing · cicd · security · git · error_handling
+bun/typescript     → architecture · typescript · testing · cicd · security · git · error_handling
+rust project       → architecture · rust · testing · cicd · security · git · error_handling
+go project         → architecture · go · testing · cicd · security · git · error_handling
+web project        → architecture · web · api · database · security · testing
+ml project         → architecture · ml · data_pipeline · python · testing
+mcp server         → architecture · local_mcp · cli · error_handling · security
+```
+
+Pipeline's `pipeline_init` command reads the target stack and automatically fetches + applies the correct standard subset during scaffolding.
+
+### Writing style rule (from Standards/CLAUDE.md)
+
+All code comments, documentation, and agent outputs in this project follow the high-density writing rule from Standards:
+
+- Strip: articles, weak modals, scaffolding phrases, hedging, restatements
+- Operators: `→` leads-to · `·` co-required · `|` alternative · `✗` never · `;` except · `!` critical
+- Structure over prose: comparisons → tables · workflows → `A → B → C`
+- Never compress: negations · hard thresholds · exception clauses · code blocks
+
 ---
 
 ## Full lifecycle
@@ -526,7 +592,12 @@ pipeline/
 │   ├── pipeline-stages/     # built-in stages
 │   ├── pipeline-config/     # pipeline.yaml schema, serde
 │   ├── pipeline-memory/     # SQLite + sqlite-vec, session, handover
-│   └── pipeline-report/     # structured output, JSON
+│   ├── pipeline-report/     # structured output, JSON
+│   ├── pipeline-digest/     # repo digestion, capability extraction, license check
+│   ├── pipeline-port/       # language translation, module porting, validation
+│   ├── pipeline-re/         # reverse engineering: codebase, service, binary, docker
+│   ├── pipeline-spec/       # specification generation, contract registry
+│   └── pipeline-knowledge/ # export/import, knowledge packaging, llm context
 ├── plugins/                 # WASM plugins (v2)
 ├── pipeline.yaml            # Pipeline dogfoods itself
 ├── CLAUDE.md                # this file
@@ -547,6 +618,11 @@ pipeline/
 | `pipeline-stages` | Static, unit, container, integration stage implementations |
 | `pipeline-config` | pipeline.yaml deserialization, validation, defaults |
 | `pipeline-report` | JSON report generation, design tool integration |
+| `pipeline-digest` | Repo clone, structural analysis, capability indexing, digest JSON |
+| `pipeline-port` | Language translation planning, module mapping, porting validation |
+| `pipeline-re` | RE targets: codebase, binary, service, Docker image, infra |
+| `pipeline-spec` | OpenAPI, JSONSchema, Protobuf, AsyncAPI generation and registry |
+| `pipeline-knowledge` | Knowledge export/import, LLM context packaging |
 
 ---
 
@@ -561,6 +637,9 @@ pipeline monitor       # maintenance daemon
 pipeline mcp           # start MCP server (agents connect here)
 pipeline dev           # start mcp + watch together (primary dev command)
 pipeline report        # open last report
+pipeline standards     # fetch, list, show, apply standards from Standards repo
+pipeline repo digest   # ingest external repo, build capability index
+pipeline repo port     # translate external repo to target language
 ```
 
 ---
@@ -613,7 +692,40 @@ Week 6 — Maintenance + memory maturity
   Auto-PR on green update
   Full handover protocol, semantic memory, learning loop
 
-v2 — LSP integration, WASM plugins
+Week 7 — Standards integration
+  pipeline standards fetch, list, show, apply
+  Standards compliance check baked into every stage run
+  pipeline_init applies correct standard subset per stack automatically
+
+Week 8 — Repo digestion
+  pipeline_repo_digest, pipeline_repo_list_capabilities
+  pipeline_repo_extract, pipeline_repo_diff
+  License check + secrets scan on external repos
+  Digest storage in .pipeline/digests/
+
+Week 9 — Repo porting
+  pipeline_repo_port, pipeline_repo_port_module
+  pipeline_repo_port_validate, pipeline_repo_port_report
+  Translation paths: Python ↔ Rust, Python ↔ Go, Go ↔ Rust, any → TypeScript
+  Standards enforcement on ported code (target language standards, not source)
+
+Week 10 — Reverse engineering
+  pipeline_re_analyze, pipeline_re_report
+  pipeline_re_reconstruct_api, pipeline_re_reconstruct_schema
+  pipeline_re_reconstruct_dockerfile
+  Binary + service + codebase RE targets
+
+Week 11 — Extended capabilities
+  pipeline_arch_synthesize, pipeline_spec_generate
+  pipeline_testgen_behavioral, pipeline_security_map
+  pipeline_migration_plan, pipeline_compliance_check
+
+Week 12 — Knowledge layer
+  pipeline_knowledge_export, pipeline_knowledge_import
+  pipeline_dep_archeology
+  Full capability relationship graph operational
+
+v2 — LSP integration, WASM plugins, binary RE (decompilation)
 ```
 
 ---
@@ -635,6 +747,195 @@ Pipeline must run itself from Week 1. The `pipeline.yaml` at the root of this re
 | No project memory | Accumulates institutional knowledge |
 | Cloud-first | Local-first, cloud for confirmation |
 | Works with one agent | Works with any agent via MCP |
+| No standards enforcement | Enforces Standards repo across all projects |
+| Cannot learn from other repos | Digests external repos, extracts capabilities |
+| Cannot understand undocumented systems | Reverse engineers any target into structured digest |
+| No spec generation | Reconstructs API, schema, Dockerfile specs from live systems |
+| Knowledge lost between sessions | Knowledge exported, portable across agents and projects |
+| Language-locked | Ports projects across languages with Standards compliance |
+
+---
+
+## Repo digestion
+
+Pipeline can ingest any external repository and extract reusable capabilities, patterns, or logic — then apply them to the current project. This is distinct from copy-paste: Pipeline understands the source repo structurally and applies only what is relevant.
+
+### What repo digestion means
+
+```
+Source repo (any language, any structure)
+    ↓ pipeline_repo_digest()
+Pipeline analyzes:
+  - Directory structure and module boundaries
+  - Core abstractions and their interfaces
+  - Business logic patterns
+  - Test strategies
+  - Configuration patterns
+  - Data flow and dependency graph
+    ↓
+Produces a digest: structured summary stored in .pipeline/digests/<repo-name>.json
+    ↓
+Agent queries the digest to replicate specific abilities into the current project
+```
+
+### Use cases
+
+- Pull a retry/backoff pattern from a Go service into your Rust project
+- Replicate an authentication flow from a reference implementation
+- Extract a data validation pipeline from a Python project
+- Copy a well-tested queue worker pattern into a new service
+- Understand how a reference project handles observability, then apply it
+
+### MCP tools for repo digestion
+
+```
+pipeline_repo_digest(url, branch?)
+  → clones repo, analyzes structure, stores digest
+  → returns: module map, pattern index, capability list
+
+pipeline_repo_list_capabilities(repo_name)
+  → lists extractable capabilities from a digested repo
+  → example output: ["retry-with-backoff", "jwt-auth", "queue-worker", "rate-limiter"]
+
+pipeline_repo_extract(repo_name, capability, target_path?)
+  → agent-guided extraction of a specific capability
+  → produces: implementation plan + relevant source references
+  → does NOT blindly copy — agent adapts to current project's patterns
+
+pipeline_repo_diff(repo_name, current_project)
+  → compares digested repo against current project
+  → surfaces: missing patterns, structural gaps, capability opportunities
+
+pipeline_repo_apply_standards(repo_name)
+  → checks digested repo against Standards
+  → reports: which standards it follows, which it violates
+  → useful before extracting — know what you're inheriting
+```
+
+### Digest storage
+
+```
+.pipeline/
+└── digests/
+    ├── my-reference-service.json     ← structured digest
+    ├── auth-library.json
+    └── data-pipeline-example.json
+```
+
+Each digest contains:
+
+```json
+{
+  "repo": "https://github.com/org/repo",
+  "digested_at": "2026-04-30T10:00:00Z",
+  "language": "go",
+  "structure": { ... },
+  "capabilities": [
+    {
+      "name": "retry-with-backoff",
+      "location": "pkg/retry/retry.go",
+      "interface": "Retry(fn func() error, opts RetryOpts) error",
+      "dependencies": ["context", "time"],
+      "test_coverage": "pkg/retry/retry_test.go",
+      "pattern": "exponential-backoff-with-jitter"
+    }
+  ],
+  "standards_compliance": {
+    "architecture": "partial",
+    "error_handling": "compliant",
+    "testing": "compliant"
+  }
+}
+```
+
+### Important boundaries
+
+- Digestion does not copy code automatically — agent always mediates extraction
+- License check runs before digest — GPL/AGPL flagged, extraction blocked unless user confirms
+- Secrets scan runs on digested repo — flagged before any extraction
+- Private repos supported — SSH key or token passed via Pipeline config, never stored in digest
+
+---
+
+## Repo porting (language translation)
+
+Pipeline can break down a reference project and port its logic to a different programming language. This goes beyond digestion — it produces working translated code following the target language's standards.
+
+### What porting means
+
+```
+Source repo (language A)
+    ↓ pipeline_repo_port()
+Pipeline decomposes:
+  - Identifies language-agnostic logic units (pure functions, data transforms, state machines)
+  - Maps language-specific constructs to equivalents in target language
+  - Preserves: interfaces, contracts, test cases (translated), error handling patterns
+  - Discards: language idioms that don't translate, runtime-specific details
+    ↓
+Agent produces translated implementation in target language
+    ↓
+Pipeline validates translated output through its own stage runner
+```
+
+### Supported translation paths (v1)
+
+| From | To | Confidence |
+|---|---|---|
+| Python | Rust | High — type system improves on translation |
+| Python | Go | High — concurrency model maps well |
+| Python | TypeScript | High — dynamic → typed, good tooling |
+| Go | Rust | High — ownership maps to borrow checker |
+| Go | TypeScript | Medium — goroutines need adaptation |
+| TypeScript | Rust | Medium — async model differs |
+| TypeScript | Go | Medium — interface patterns differ |
+| Rust | Go | Medium — ownership concepts simplify |
+| Any | Python | High — Python is always the fallback |
+
+### MCP tools for porting
+
+```
+pipeline_repo_port(url, target_language, scope?)
+  → scope: "full" | "module:<name>" | "capability:<name>"
+  → produces: porting plan with complexity estimate per module
+
+pipeline_repo_port_module(repo_name, module_path, target_language)
+  → translates a single module
+  → returns: translated code + test translation + adaptation notes
+
+pipeline_repo_port_validate(ported_path)
+  → runs Pipeline's stage runner against ported code
+  → confirms translated code passes static, unit, and integration stages
+  → compares behavior against original test suite (if available)
+
+pipeline_repo_port_report(repo_name, target_language)
+  → full report: what translated cleanly, what needed adaptation, what was dropped
+  → flags: patterns with no direct equivalent, manual review required items
+```
+
+### Porting process (agent-driven)
+
+```
+1. Digest source repo → build module map
+2. Identify pure logic units (language-agnostic core)
+3. Map each unit to target language equivalent
+4. Translate module by module (not file by file)
+5. Translate tests alongside implementation
+6. Run Pipeline stages on each translated module
+7. Fix failures → rerun → green → move to next module
+8. Final integration test of full ported project
+9. Generate porting report
+```
+
+### Standards applied during porting
+
+Ported code is held to the target language's standards from the Standards repo, not the source language's. A Python project ported to Rust must comply with `rust/STANDARDS.md`, not `python/STANDARDS.md`. Pipeline enforces this automatically during the validation stage.
+
+### What porting cannot do
+
+- Translate runtime-specific behavior (e.g., Python GIL assumptions, Go scheduler behavior)
+- Guarantee identical performance characteristics
+- Handle external dependencies with no equivalent in target ecosystem — flagged for manual substitution
+- Port UI/frontend code (scope: backend logic only in v1)
 
 ---
 
@@ -644,5 +945,281 @@ Pipeline must run itself from Week 1. The `pipeline.yaml` at the root of this re
 
 ---
 
-*Last updated: session 1 — initial design*
-*Next: scaffold Rust workspace, implement pipeline-core + pipeline-mcp*
+*Last updated: session 1 — initial design + Standards + digest + port + reverse engineering + extended capabilities*
+*Next: scaffold Rust workspace → pipeline-core → pipeline-mcp → pipeline-digest → pipeline-port → pipeline-re → pipeline-knowledge*
+
+---
+
+## Reverse engineering
+
+Reverse engineering in Pipeline means taking an existing system — compiled binary, running service, undocumented codebase, API with no spec, or legacy monolith — and reconstructing its intent, structure, contracts, and logic into a form agents can work with.
+
+In the AI agent era this is no longer a slow manual process. Agents can parallelize analysis across hundreds of files, correlate patterns across layers, and produce structured output that feeds directly into digest, port, or scaffold workflows.
+
+### What reverse engineering targets
+
+```
+BINARY / COMPILED
+  Executable with no source → reconstruct logic + data structures
+  Closed-source library → extract interface + behavior contracts
+  WASM module → reconstruct intent from bytecode
+
+UNDOCUMENTED CODEBASE
+  Repo with no docs, no tests, no comments → reconstruct architecture
+  Spaghetti legacy code → identify module boundaries that don't exist yet
+  Dead project → extract reusable patterns before it's abandoned
+
+RUNNING SERVICE (black-box)
+  API with no spec → reconstruct OpenAPI schema from observed traffic
+  Database with no schema docs → reconstruct schema from queries + data
+  Message queue with no contract → reconstruct message shapes from consumers
+
+DEPLOYED SYSTEM
+  Docker image → reconstruct Dockerfile + compose + environment
+  Running container → extract config, env vars, runtime behavior
+  Infrastructure (cloud or on-prem) → reconstruct IaC from live state
+```
+
+### Reverse engineering pipeline
+
+```
+Target (any of the above)
+    ↓ pipeline_re_analyze()
+Stage 1 — Surface extraction
+  Static: file tree, binary strings, symbol tables, import/export maps
+  Dynamic (if runnable): execution traces, syscall logs, network traffic
+  Semantic: naming patterns, magic numbers, error messages
+
+Stage 2 — Structure reconstruction
+  Module boundary detection (clustering by coupling/cohesion)
+  Data flow mapping (where does data come in, transform, go out)
+  Dependency graph (internal + external)
+  State machine reconstruction (for services with lifecycle)
+
+Stage 3 — Intent reconstruction
+  Agent reasons over extracted structure
+  Names anonymous constructs based on behavior
+  Identifies design patterns (retry, circuit breaker, repository, etc.)
+  Cross-references against Standards repo for pattern recognition
+
+Stage 4 — Contract generation
+  OpenAPI spec from observed API behavior
+  Type definitions from runtime data shapes
+  Test suite from observed inputs/outputs
+  Architecture diagram from module map
+
+Stage 5 — Output (feeds into digest/port/scaffold)
+  Structured digest (same format as pipeline_repo_digest output)
+  Reconstructed source skeleton (stubs + interfaces, agent fills logic)
+  Standards compliance gap report
+  Recommended modernization path
+```
+
+### MCP tools for reverse engineering
+
+```
+pipeline_re_analyze(target, type?)
+  → target: path | url | image | host:port
+  → type: "codebase" | "binary" | "service" | "docker" | "infra" | auto-detect
+  → starts analysis, returns job_id for async tracking
+
+pipeline_re_status(job_id)
+  → progress per stage, ETA, partial results available
+
+pipeline_re_report(job_id)
+  → full structured output: module map, contracts, patterns, gaps
+  → same digest format as pipeline_repo_digest — feeds into port/scaffold
+
+pipeline_re_reconstruct_api(target_url, sample_count?)
+  → fires observed requests, collects responses
+  → produces OpenAPI 3.1 spec from traffic analysis
+  → agent fills in descriptions, validates edge cases
+
+pipeline_re_reconstruct_schema(connection_string)
+  → connects to live DB (read-only)
+  → reconstructs schema: tables, relations, constraints, indexes
+  → infers missing foreign keys from naming + data patterns
+  → produces migration files + schema diagram
+
+pipeline_re_reconstruct_dockerfile(image_name)
+  → pulls image, inspects layers, env, entrypoint, labels
+  → reconstructs best-guess Dockerfile + compose
+  → applies docker/STANDARDS.md best practices to reconstruction
+  → flags: hardcoded secrets, root user, missing healthcheck
+
+pipeline_re_modernize(job_id, target_stack?)
+  → takes RE output → produces modernization plan
+  → breaks monolith into bounded services
+  → maps to target stack (default: current project's stack)
+  → produces: phased migration plan, risk assessment, effort estimate
+```
+
+### AI acceleration in reverse engineering
+
+Without agents, RE is bottlenecked by human reading speed and pattern recognition. With agents:
+
+| Task | Manual | Agent-accelerated |
+|---|---|---|
+| Read 50k LOC legacy codebase | Days | Minutes |
+| Identify module boundaries | Weeks | Hours |
+| Reconstruct undocumented API | Days of traffic analysis | Minutes of observed calls |
+| Name anonymous functions | Hours | Seconds (behavior-based naming) |
+| Detect design patterns | Expert knowledge required | Cross-reference against Standards |
+| Produce architecture diagram | Half a day | Automatic from module map |
+| Generate test suite from behavior | Days | Hours (inputs/outputs observed) |
+| Produce modernization plan | Consultant engagement | Structured agent output |
+
+### Boundaries and ethics
+
+- RE of third-party software: user is responsible for license and legal compliance
+- Pipeline flags GPL/proprietary licenses before any RE output is used in a new project
+- Secrets found during RE are never stored — flagged and discarded immediately
+- Binary RE (decompilation) produces reconstructed intent, not decompiled source — avoids direct IP reproduction
+
+---
+
+## Extended capabilities roadmap
+
+Reverse engineering, digestion, and porting unlock a family of higher-order capabilities. These are the natural next steps once those foundations exist.
+
+### 1. Architecture synthesis
+
+From multiple digested or RE'd repos, Pipeline synthesizes a new architecture combining the best patterns from each source.
+
+```
+pipeline_arch_synthesize(sources[], target_stack, constraints?)
+  → ingests N digests/RE outputs
+  → identifies: best-in-class pattern per concern (auth, data, queue, API, etc.)
+  → produces: composite architecture spec + rationale
+  → agent generates scaffold from spec
+```
+
+Example: synthesize auth from repo A, queue handling from repo B, API design from repo C → new project inherits the best of all three.
+
+### 2. Dependency archaeology
+
+Understand what your dependencies actually do — not what their docs say.
+
+```
+pipeline_dep_archeology(package_name, version?)
+  → RE the dependency itself
+  → produces: actual behavior contract, what it really does at runtime
+  → flags: hidden behaviors, undocumented side effects, security surface
+  → compares: documented API vs actual behavior
+```
+
+Critical when adopting a new library — especially in AI-generated code where agents pull in packages they "know" but haven't verified.
+
+### 3. Specification generation
+
+From any source (codebase, running service, RE output) → produce formal specifications agents can validate against.
+
+```
+pipeline_spec_generate(source, format?)
+  → format: "openapi" | "jsonschema" | "protobuf" | "asyncapi" | "typespec"
+  → produces: machine-readable spec from observed behavior
+  → registers spec in .pipeline/specs/ — used by contract testing stage
+  → feeds into pipeline_re_reconstruct_api as structured output
+```
+
+Once a spec exists, Pipeline's Stage 3 (integration) runs contract tests against it automatically.
+
+### 4. Vulnerability surface mapping
+
+RE-powered security analysis beyond what static scanners catch.
+
+```
+pipeline_security_map(target)
+  → RE the attack surface: exposed endpoints, input boundaries, trust boundaries
+  → maps: data flows that cross trust boundaries
+  → identifies: injection points, auth gaps, missing validation
+  → produces: threat model skeleton (STRIDE) for agent to complete
+  → feeds into security gate in Pipeline stages
+```
+
+This is distinct from CVE scanning (Trivy already does that). This is structural security analysis.
+
+### 5. Test generation from behavior
+
+Without writing a single test manually — observe behavior, generate tests that encode it.
+
+```
+pipeline_testgen_behavioral(target, duration?)
+  → runs target (or observes live system) for duration
+  → records: inputs, outputs, state transitions, error conditions
+  → generates: test suite that encodes observed behavior as assertions
+  → agent reviews + promotes to permanent test suite
+  → runs through Pipeline stage 1 (unit) for validation
+```
+
+Particularly powerful for legacy systems with no tests — RE the behavior, encode it, then refactor safely.
+
+### 6. Migration planning
+
+From RE output → phased, executable migration plan.
+
+```
+pipeline_migration_plan(source_digest, target_stack, constraints?)
+  → constraints: "no_downtime" | "incremental" | "big_bang" | "strangler_fig"
+  → produces:
+      Phase map with dependencies between phases
+      Risk assessment per phase
+      Rollback plan per phase
+      Effort estimate per phase
+      Pipeline stage configuration per phase
+  → each phase is itself a pipeline.yaml-compatible task
+```
+
+The migration plan is executable — each phase runs through Pipeline's full stage suite before the next begins.
+
+### 7. Knowledge export
+
+Everything Pipeline learns about a project — memory, digests, RE outputs, specs — exported as a portable knowledge package.
+
+```
+pipeline_knowledge_export(project, format?)
+  → format: "markdown" | "json" | "vector_db" | "llm_context"
+  → produces: compressed knowledge dump any agent can ingest
+  → use case: onboard new team member, switch agents, archive project
+  → llm_context format: pre-chunked, pre-embedded, ready to inject into any model's context
+```
+
+Reverse: `pipeline_knowledge_import` — new project inherits knowledge from a related project.
+
+### 8. Compliance checking
+
+Given a codebase + a compliance framework → gap analysis.
+
+```
+pipeline_compliance_check(target, framework)
+  → framework: "standards" | "owasp" | "pci_dss" | "gdpr" | "hipaa" | "iso27001"
+  → RE the codebase against the framework's requirements
+  → produces: compliant items · gaps · critical violations · remediation plan
+  → agent can auto-remediate gaps that have known fixes
+  → feeds into Pipeline's quality gate as a compliance score
+```
+
+For "standards" framework — checks against your own Standards repo. Most immediate use case.
+
+---
+
+## Capability relationships
+
+How all Pipeline capabilities connect:
+
+```
+ANALYZE                    TRANSFORM                  VALIDATE
+───────────────────────    ─────────────────────────  ──────────────────────
+pipeline_re_analyze    →   pipeline_repo_port      →  pipeline stages (CI)
+pipeline_repo_digest   →   pipeline_arch_synthesize→  pipeline_compliance_check
+pipeline_dep_archeology→   pipeline_migration_plan  →  pipeline_testgen_behavioral
+pipeline_re_reconstruct→   pipeline_spec_generate   →  pipeline_security_map
+                                    ↓
+                           pipeline_knowledge_export
+                                    ↓
+                           Any agent, any session, any project
+```
+
+Everything in the analyze layer feeds the transform layer. Everything in the transform layer is validated by Pipeline's own stage runner. Knowledge export makes every output portable across agents and sessions.
+
+---
