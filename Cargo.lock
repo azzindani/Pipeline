@@ -1026,6 +1026,13 @@ version = "0.0.1"
 [[package]]
 name = "pipeline-docker"
 version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "pipeline-github"
@@ -1046,6 +1053,7 @@ dependencies = [
  "async-trait",
  "pipeline-config",
  "pipeline-core",
+ "pipeline-docker",
  "pipeline-memory",
  "pipeline-stages",
  "serde",

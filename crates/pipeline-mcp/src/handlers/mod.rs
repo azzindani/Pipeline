@@ -1,5 +1,6 @@
 //! Per-tool handler modules · one async `handle(req, state)` each.
 
+pub mod docker;
 pub mod memory;
 pub mod meta;
 pub mod plan;
