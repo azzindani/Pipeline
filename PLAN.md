@@ -54,11 +54,11 @@ Listing 140 individual MCP tools to a model = listing tax + context rot. Local 7
 | 2 | `pipeline_plan` | Idea intake · feasibility · PRD · features · milestones · ADRs · risks | 21 |
 | 3 | `pipeline_standards` | Fetch · select · apply · check | 7 |
 | 4 | `pipeline_project` | Init · scaffold · templates | 4 |
-| 5 | `pipeline_env` | Devcontainer · deps · runtime · tooling · secrets | 8 |
+| 5 | `pipeline_env` | Devcontainer · deps · runtime · tooling · secrets | 10 |
 | 6 | `pipeline_docker` | Build · run · compose · image · dockerfile | 16 |
 | 7 | `pipeline_run` | Stage execution · preflight · commit · push | 8 |
 | 8 | `pipeline_test` | Generate · run · coverage · mutation · property | 8 |
-| 9 | `pipeline_e2e` | Playwright · browser control · visual · a11y | 9 |
+| 9 | `pipeline_e2e` | Playwright · browser control · visual · a11y | 10 |
 | 10 | `pipeline_simulate` | Persona · journey · use case · load · chaos | 6 |
 | 11 | `pipeline_deploy` | CI/CD gen · deploy · rollback · canary · health | 9 |
 | 12 | `pipeline_repo` | Register · digest · extract · port · compare · RE | 16 |
@@ -70,7 +70,7 @@ Listing 140 individual MCP tools to a model = listing tax + context rot. Local 7
 | 18 | `pipeline_report` | Dashboard · velocity · burndown · last | 5 |
 | 19 | `pipeline_meta` | Explain · config · self-check · version | 5 |
 
-Total: 19 tools · 169 actions. Agent sees 19 schemas; each tool's description lists its actions inline so the agent picks one without a second tool call.
+Total: 19 tools · 172 actions. Agent sees 19 schemas; each tool's description lists its actions inline so the agent picks one without a second tool call.
 
 ### 3.3 Action dispatch pattern
 

@@ -1,0 +1,32 @@
+# Pipeline dogfoods itself · this file is the contract Pipeline runs against its own crates.
+# Schema: crates/pipeline-config/src/lib.rs · CLAUDE.md §"pipeline.yaml schema"
+
+project: pipeline
+version: 0.0.1
+
+stack:
+  runtime: rust
+  services: []
+
+stages:
+  fast:
+    - static
+    - unit
+  full:
+    - static
+    - unit
+    - container
+    - integration
+  preflight:
+    - static
+    - unit
+    - container
+    - integration
+    - security
+
+gates:
+  coverage: 70
+  image_size_mb: 200
+  critical_vulns: 0
+
+# deploy + maintenance wire in at v1 · see PLAN.md

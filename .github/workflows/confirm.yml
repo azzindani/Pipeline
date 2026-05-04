@@ -1,0 +1,36 @@
+# GitHub Actions · thin confirmation only.
+# Reruns Stage 0 (static) + Stage 1 (unit). Docker-heavy stages already passed locally.
+# Source of truth is local preflight; this is a parity check.
+# See CLAUDE.md §"Phase 4" and PLAN.md §7.
+
+name: confirm
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  confirm:
+    name: stage 0 + 1
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace --all-features
