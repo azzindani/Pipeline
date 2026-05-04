@@ -371,6 +371,42 @@ impl Memory {
         .await?;
         Ok(row.map(|(v,)| v))
     }
+
+    /// Enumerate every `(key, value)` pair for `(project_id, scope)`,
+    /// ordered by `created_at DESC`.
+    pub async fn list_scope(
+        &self,
+        project_id: &str,
+        scope: &str,
+    ) -> Result<Vec<(String, String)>, MemoryError> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT key, value FROM memory_kv
+             WHERE project_id = ? AND scope = ?
+             ORDER BY created_at DESC",
+        )
+        .bind(project_id)
+        .bind(scope)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Delete a single `(scope, key)` entry. Returns `true` if a row was removed.
+    pub async fn forget(
+        &self,
+        project_id: &str,
+        scope: &str,
+        key: &str,
+    ) -> Result<bool, MemoryError> {
+        let result =
+            sqlx::query("DELETE FROM memory_kv WHERE project_id = ? AND scope = ? AND key = ?")
+                .bind(project_id)
+                .bind(scope)
+                .bind(key)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
 }
 
 /// Naive SQL splitter · strips line comments · splits on `;`.
@@ -574,5 +610,32 @@ mod tests {
             .unwrap();
         let v2 = m.recall("p1", "config", "JWT_SECRET_REF").await.unwrap();
         assert_eq!(v2.as_deref(), Some("vault://v2"));
+    }
+
+    #[tokio::test]
+    async fn list_scope_and_forget() {
+        let m = fresh().await;
+        m.remember("p1", "feature", "f1", r#"{"name":"login"}"#)
+            .await
+            .unwrap();
+        m.remember("p1", "feature", "f2", r#"{"name":"signup"}"#)
+            .await
+            .unwrap();
+        m.remember("p1", "milestone", "POC", r#"{"status":"in_progress"}"#)
+            .await
+            .unwrap();
+
+        let features = m.list_scope("p1", "feature").await.unwrap();
+        assert_eq!(features.len(), 2);
+        let keys: Vec<&str> = features.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"f1"));
+        assert!(keys.contains(&"f2"));
+
+        let milestones = m.list_scope("p1", "milestone").await.unwrap();
+        assert_eq!(milestones.len(), 1);
+
+        assert!(m.forget("p1", "feature", "f1").await.unwrap());
+        assert!(!m.forget("p1", "feature", "f1").await.unwrap()); // already gone
+        assert_eq!(m.list_scope("p1", "feature").await.unwrap().len(), 1);
     }
 }

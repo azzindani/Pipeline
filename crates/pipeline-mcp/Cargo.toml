@@ -17,6 +17,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+uuid = { workspace = true }
 pipeline-core = { path = "../pipeline-core" }
 pipeline-config = { path = "../pipeline-config" }
 pipeline-memory = { path = "../pipeline-memory" }
