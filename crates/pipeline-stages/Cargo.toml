@@ -11,3 +11,11 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+pipeline-core = { path = "../pipeline-core" }
+pipeline-config = { path = "../pipeline-config" }
