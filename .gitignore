@@ -1,0 +1,26 @@
+# Rust
+/target
+**/target
+Cargo.lock.bak
+*.rs.bk
+
+# Pipeline runtime data (ignore by default; uncomment to commit shared memory)
+# .pipeline/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Env
+.env
+.env.local
+*.pem
+*.key
+
+# Build artifacts
+*.log
+dist/
+build/
