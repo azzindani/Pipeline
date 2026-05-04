@@ -1,32 +1,30 @@
 //! Pipeline MCP server · 19 super tools dispatching by `action`.
 //!
-//! Day-1 scope: tool registry + request/response envelope + stub `serve_stdio`
-//! that prints the tool list to stderr. Real `rmcp` transport wires in Day 2.
+//! Hand-rolled JSON-RPC 2.0 over stdio. Implements `initialize` ·
+//! `tools/list` · `tools/call`. Tool calls deserialize into `ToolRequest`
+//! and route through `dispatch::call_tool` which fans out to per-tool
+//! handlers in `handlers/`.
 //!
 //! Surface design rationale lives in `PLAN.md` §3.
 
+#![allow(clippy::doc_markdown, clippy::manual_let_else)] // domain prose · early-return readability
+
+mod dispatch;
+mod handlers;
 mod registry;
+mod server;
 mod tools;
 
+pub use dispatch::call_tool;
 pub use registry::{ToolDescriptor, registry};
+pub use server::ServerState;
 pub use tools::{ToolName, ToolRequest, ToolResponse};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Start the MCP server on stdio transport.
-///
-/// Day-1 implementation: prints registered tools to stderr and exits cleanly.
-/// Day-2 wires `rmcp` for real protocol handling.
-#[allow(clippy::unused_async)] // signature locked for Day-2 rmcp wiring
+/// Start the MCP server on stdio transport · blocks until stdin closes.
 pub async fn serve_stdio() -> Result<(), McpError> {
-    let tools = registry();
-    eprintln!("pipeline-mcp v{VERSION} · stdio");
-    eprintln!("registered tools: {}", tools.len());
-    for t in &tools {
-        eprintln!("  - {} ({} actions)", t.name.as_str(), t.action_count());
-    }
-    eprintln!("[stub] rmcp transport wires in Day 2");
-    Ok(())
+    server::run_stdio().await
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -35,4 +33,6 @@ pub enum McpError {
     Transport(String),
     #[error("serde: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 }
