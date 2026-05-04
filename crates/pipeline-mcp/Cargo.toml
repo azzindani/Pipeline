@@ -22,3 +22,4 @@ pipeline-core = { path = "../pipeline-core" }
 pipeline-config = { path = "../pipeline-config" }
 pipeline-memory = { path = "../pipeline-memory" }
 pipeline-stages = { path = "../pipeline-stages" }
+pipeline-docker = { path = "../pipeline-docker" }

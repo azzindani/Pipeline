@@ -1,0 +1,10 @@
+target/
+.git/
+.pipeline/
+.github/
+*.md
+.vscode/
+.idea/
+.env
+.env.local
+**/*.log
