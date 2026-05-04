@@ -51,7 +51,7 @@ Listing 140 individual MCP tools to a model = listing tax + context rot. Local 7
 | # | Tool | Domain | Action count |
 |---|---|---|---|
 | 1 | `pipeline_session` | Lock · context · handover | 11 |
-| 2 | `pipeline_plan` | PRD · features · milestones · ADRs · risks | 14 |
+| 2 | `pipeline_plan` | Idea intake · feasibility · PRD · features · milestones · ADRs · risks | 21 |
 | 3 | `pipeline_standards` | Fetch · select · apply · check | 7 |
 | 4 | `pipeline_project` | Init · scaffold · templates | 4 |
 | 5 | `pipeline_env` | Devcontainer · deps · runtime · tooling · secrets | 8 |
@@ -70,7 +70,7 @@ Listing 140 individual MCP tools to a model = listing tax + context rot. Local 7
 | 18 | `pipeline_report` | Dashboard · velocity · burndown · last | 5 |
 | 19 | `pipeline_meta` | Explain · config · self-check · version | 5 |
 
-Total: 19 tools · 162 actions. Agent sees 19 schemas; each tool's description lists its actions inline so the agent picks one without a second tool call.
+Total: 19 tools · 169 actions. Agent sees 19 schemas; each tool's description lists its actions inline so the agent picks one without a second tool call.
 
 ### 3.3 Action dispatch pattern
 
@@ -130,7 +130,25 @@ Local models handle this well · Claude handles it trivially.
 `lock(path)` · `unlock` · `steal(path)` · `start` · `checkpoint(note?)` · `end(outcome, summary?)` · `handover` · `context(scope?)` · `file_context(path)` · `task_context(description)` · `agent_register(id, capabilities[])`
 
 ### 4.2 `pipeline_plan`
-`idea_capture(text)` · `create(type)` · `prd_write` · `prd_read` · `prd_update(patch)` · `features_add(name, description, ac[])` · `features_list` · `features_update(id, patch)` · `features_track(id, status)` · `acceptance_define(feature_id, criteria[])` · `milestone_create(name, exit_criteria[])` · `milestone_progress(name)` · `progress` · `decision_log(title, context, decision, alternatives[])` · `risk_add(title, likelihood, impact, mitigation)` · `risk_list` · `estimate(feature_id)`
+`idea_capture(text)` · `link_ingest(urls[])` · `research_notes_list` · `research_notes_show(id)` · `feasibility(sources)` · `create(type)` · `prd_write` · `prd_read` · `prd_update(patch)` · `features_add(name, description, ac[])` · `features_list` · `features_update(id, patch)` · `features_track(id, status)` · `acceptance_define(feature_id, criteria[])` · `milestone_create(name, exit_criteria[])` · `milestone_progress(name)` · `progress` · `decision_log(title, context, decision, alternatives[])` · `risk_add(title, likelihood, impact, mitigation)` · `risk_list` · `estimate(feature_id)`
+
+**`link_ingest(urls[])`** — accepts arbitrary URLs · classifies each as: blog · article · paper · video · docs · gist · package · social · github · gitlab · bitbucket · self-hosted-git · unknown. For text sources extracts content via headless browser (uses `pipeline_e2e.browser_launch` internals) · for PDFs extracts text · for videos pulls transcript · for git URLs delegates to `pipeline_repo.register`. Stores normalized notes in `.pipeline/research/` · embeds for semantic recall.
+
+**`feasibility(sources)`** — `sources` shape: `{ text?, links[]?, repos[]?, capabilities[]? }`. Pipeline cross-references against: standards catalog · digested repos · memory of prior projects · current project capabilities. Returns:
+```json
+{
+  "verdict": "yes" | "yes_with_caveats" | "needs_X" | "no",
+  "identified_stack": ["postgres", "rust|go", "..."],
+  "core_capabilities": ["auth", "rate-limit", "..."],
+  "gaps": ["multi-tenant isolation strategy unclear"],
+  "prior_art": [{ "repo_alias": "ref", "capability": "rate-limit" }],
+  "plan_skeleton": { "features": [...], "milestones": [...] },
+  "effort_estimate": { "poc": "2w", "mvp": "6w", "v1": "12w" },
+  "risks": [{ "title": "...", "mitigation": "..." }],
+  "next_suggested": ["pipeline_plan.create(type=...)"]
+}
+```
+Output is structured · feeds directly into `plan.create` and `plan.prd_write` as seed data.
 
 ### 4.3 `pipeline_standards`
 `list` · `show(category)` · `recommend(stack, project_type)` · `apply(category)` · `check` · `fetch` · `diff(before, after)`
@@ -162,6 +180,16 @@ Project types: `web-spa` · `web-ssr` · `mobile-rn` · `mobile-flutter` · `des
 
 ### 4.12 `pipeline_repo`
 `register(url, alias)` · `list` · `remove(alias)` · `digest(alias)` · `list_capabilities(alias)` · `extract(alias, capability, target_path?)` · `compare(a, b, axis)` — axis: arch|features|standards · `port(alias, target_lang, scope?)` · `port_validate(path)` · `apply_standards(alias)` · `capability_graph` · `re_analyze(target, type?)` — type: codebase|binary|service|docker|infra · `re_status(job_id)` · `re_report(job_id)` · `re_reconstruct(kind, target)` — kind: api|schema|dockerfile · `re_modernize(job_id, target_stack?)`
+
+**`register(url, alias)`** accepted URL formats:
+- `https://github.com/owner/repo` · `https://github.com/owner/repo.git`
+- `git@github.com:owner/repo.git` · `ssh://git@host/path/repo.git`
+- `git://host/path/repo.git`
+- Shorthand: `owner/repo` (assumes github.com)
+- GitLab · Bitbucket · self-hosted git via full https/ssh URL
+- Local path: `file:///abs/path` or `./relative/path` for repos already on disk
+
+Auth: SSH key picked up from agent host (`~/.ssh/`) · HTTPS token from `pipeline_env.secrets_inject` scope · never stored in registry or digest.
 
 ### 4.13 `pipeline_docs`
 `generate(kind)` — kind: api|arch|readme|runbook|onboarding · `update_from_code` · `changelog(from, to)` · `diagram(kind)` — kind: arch|sequence|er|c4 · `publish(target)` · `spec_generate(source, format)` — format: openapi|jsonschema|protobuf|asyncapi|typespec
@@ -210,7 +238,7 @@ Exit: Pipeline runs `pipeline_run.stage(fast)` against its own crates and Pipeli
 | `pipeline_project` | init · scaffold · template_list | pipeline-cli · pipeline-config |
 | `pipeline_env` | create · deps_install · deps_audit · runtime_provision · secrets_setup | pipeline-core |
 | `pipeline_standards` | fetch · list · show · recommend · apply · check | pipeline-core (new: pipeline-standards) |
-| `pipeline_plan` | idea_capture · create · prd_* · features_* · acceptance_define · milestone_* · progress | pipeline-memory · pipeline-mcp |
+| `pipeline_plan` | idea_capture · link_ingest · research_notes_* · feasibility · create · prd_* · features_* · acceptance_define · milestone_* · progress | pipeline-memory · pipeline-mcp |
 | `pipeline_run` | preflight · commit · push · fix_suggestion · explain | pipeline-core · pipeline-github |
 | `pipeline_e2e` | run · record · trace · browser_launch · browser_close | pipeline-stages (new: pipeline-e2e) |
 | `pipeline_docker` | image_scan · dockerfile_generate · dockerfile_lint | pipeline-docker |
@@ -357,6 +385,51 @@ data.seed(persona="lab tech", count=1000)
 e2e.record(url) → captures journey as Playwright spec
 simulate.journey_simulate(journey, count=50) → load profile
 observe.perf_compare(baseline)
+```
+
+### F. Feasibility from mixed links + repos ("can I build this?")
+```
+session.lock(./new-idea-workspace)
+plan.link_ingest(urls=[
+  "https://blog.example.com/usage-based-pricing-engine-architecture",
+  "https://arxiv.org/abs/2401.xxxxx",
+  "https://www.youtube.com/watch?v=abc123",
+  "https://docs.stripe.com/billing/subscriptions/usage-based"
+])
+repo.register("https://github.com/lago-money/lago.git", "lago")
+repo.register("openmeterio/openmeter", "openmeter")          # shorthand
+repo.digest("lago") + repo.digest("openmeter")
+plan.feasibility(sources={
+  text: "B2B SaaS usage-based pricing engine, multi-tenant, Stripe-integrated",
+  links: <ingested above>,
+  repos: ["lago", "openmeter"]
+})
+→ verdict: "yes_with_caveats"
+→ identified_stack: ["postgres", "rust", "stripe API", "kafka|nats"]
+→ core_capabilities: ["metering", "rating", "invoicing", "tenant-isolation"]
+→ gaps: ["real-time aggregation budget", "rating engine determinism"]
+→ prior_art: [{"lago": "rating-engine"}, {"openmeter": "metering"}]
+→ effort_estimate: {poc: "2w", mvp: "8w", v1: "16w"}
+plan.create(type="microservice-rust")
+plan.prd_write(<seeded from feasibility skeleton>)
+plan.features_add(× from skeleton) + acceptance_define(each)
+plan.decision_log("rating engine: build vs extract from lago",
+  decision="extract via repo.port(scope=capability:rating-engine)")
+repo.port("lago", target_lang="rust", scope="capability:rating-engine")
+project.init("pricing-engine", "microservice-rust", "rust")
+→ POC starts
+```
+
+### G. "Is this GitHub repo something I can build on?"
+```
+repo.register("https://github.com/some/promising-tool.git", "ptool")
+repo.apply_standards("ptool") → standards compliance report
+repo.digest("ptool")
+repo.list_capabilities("ptool")
+plan.feasibility(sources={ repos: ["ptool"], text: "fork as base for X" })
+→ verdict + license check + secret scan + gap report
+→ if green: repo.extract or repo.port to seed a new project
+→ if red: feasibility surfaces blockers (license, missing capabilities, dead deps)
 ```
 
 ### E. RE an undocumented service
