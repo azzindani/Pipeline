@@ -6,6 +6,7 @@ pub mod plan;
 pub mod report;
 pub mod run;
 pub mod session;
+pub mod standards;
 
 use crate::server::ServerState;
 use std::path::PathBuf;
