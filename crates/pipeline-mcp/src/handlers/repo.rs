@@ -1,0 +1,462 @@
+//! `pipeline_repo` handler · register · list · remove · digest.
+//!
+//! Registry: `.pipeline/repos/registry.json` (array of {alias, url, kind, added_at}).
+//! Clones land in `.pipeline/repos/<alias>/` on first `digest` (lazy).
+//!
+//! Day-5 ships register/list/remove/digest. extract · port · port_validate ·
+//! compare · capability_graph · re_* return not_implemented (need digest →
+//! semantic embedding plus stack-aware codegen · MVP+ work).
+
+#![allow(clippy::doc_markdown)]
+
+use crate::server::ServerState;
+use crate::tools::{ToolName, ToolRequest, ToolResponse};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::process::Command;
+
+const REGISTRY_DIR: &str = ".pipeline/repos";
+const REGISTRY_FILE: &str = ".pipeline/repos/registry.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Registry {
+    pub repos: Vec<RegistryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryEntry {
+    pub alias: String,
+    pub url: String,
+    pub kind: String, // git | local
+    pub added_at: String,
+    #[serde(default)]
+    pub cloned: bool,
+}
+
+pub async fn handle(req: ToolRequest, _state: Arc<ServerState>) -> ToolResponse {
+    match req.action.as_str() {
+        "register" => register(&req.args).await,
+        "list" => list().await,
+        "remove" => remove(&req.args).await,
+        "digest" => digest(&req.args).await,
+        "list_capabilities" | "extract" | "compare" | "port" | "port_validate"
+        | "apply_standards" | "capability_graph" | "re_analyze" | "re_status" | "re_report"
+        | "re_reconstruct" | "re_modernize" => {
+            ToolResponse::not_implemented(ToolName::Repo, &req.action)
+        }
+        other => err(format!("unknown action 'pipeline_repo.{other}'")),
+    }
+}
+
+async fn register(args: &Value) -> ToolResponse {
+    let url = match args.get("url").and_then(Value::as_str) {
+        Some(u) => u.to_owned(),
+        None => return err("missing 'url'".into()),
+    };
+    let alias = match args.get("alias").and_then(Value::as_str) {
+        Some(a) => a.to_owned(),
+        None => match infer_alias(&url) {
+            Some(a) => a,
+            None => return err("missing 'alias' and could not infer from url".into()),
+        },
+    };
+
+    let mut reg = match read_registry().await {
+        Ok(r) => r,
+        Err(e) => return err(e),
+    };
+    if reg.repos.iter().any(|r| r.alias == alias) {
+        return err(format!("alias '{alias}' already registered"));
+    }
+    reg.repos.push(RegistryEntry {
+        alias: alias.clone(),
+        url: url.clone(),
+        kind: kind_of(&url),
+        added_at: pipeline_memory::now_rfc3339(),
+        cloned: false,
+    });
+    if let Err(e) = write_registry(&reg).await {
+        return err(e);
+    }
+
+    ToolResponse {
+        ok: true,
+        data: json!({"alias": alias, "url": url}),
+        next_suggested: vec!["pipeline_repo.digest".into(), "pipeline_repo.list".into()],
+        memory_refs: vec![format!("repo:{alias}")],
+        error: None,
+    }
+}
+
+async fn list() -> ToolResponse {
+    match read_registry().await {
+        Ok(r) => ToolResponse::ok(json!({"repos": r.repos})),
+        Err(e) => err(e),
+    }
+}
+
+async fn remove(args: &Value) -> ToolResponse {
+    let alias = match args.get("alias").and_then(Value::as_str) {
+        Some(a) => a.to_owned(),
+        None => return err("missing 'alias'".into()),
+    };
+    let delete_clone = args
+        .get("delete_clone")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let mut reg = match read_registry().await {
+        Ok(r) => r,
+        Err(e) => return err(e),
+    };
+    let before = reg.repos.len();
+    reg.repos.retain(|r| r.alias != alias);
+    if reg.repos.len() == before {
+        return err(format!("alias '{alias}' not registered"));
+    }
+    if let Err(e) = write_registry(&reg).await {
+        return err(e);
+    }
+
+    if delete_clone {
+        let dir = clone_dir(&alias);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+    ToolResponse::ok(json!({"removed": alias, "delete_clone": delete_clone}))
+}
+
+async fn digest(args: &Value) -> ToolResponse {
+    let alias = match args.get("alias").and_then(Value::as_str) {
+        Some(a) => a.to_owned(),
+        None => return err("missing 'alias'".into()),
+    };
+    let mut reg = match read_registry().await {
+        Ok(r) => r,
+        Err(e) => return err(e),
+    };
+    let idx = match reg.repos.iter().position(|r| r.alias == alias) {
+        Some(i) => i,
+        None => return err(format!("alias '{alias}' not registered")),
+    };
+    let url = reg.repos[idx].url.clone();
+    let kind = reg.repos[idx].kind.clone();
+
+    let dir = clone_dir(&alias);
+    let already_cloned = tokio::fs::try_exists(&dir).await.unwrap_or(false);
+
+    // Clone (or skip if already cloned · or directly use local path).
+    if kind == "local" {
+        // local path · do not clone · digest in place
+    } else if !already_cloned {
+        if let Err(e) = clone_repo(&url, &dir).await {
+            return err(format!("git clone: {e}"));
+        }
+        reg.repos[idx].cloned = true;
+        if let Err(e) = write_registry(&reg).await {
+            return err(e);
+        }
+    }
+
+    let walk_root = if kind == "local" {
+        PathBuf::from(strip_local_prefix(&url))
+    } else {
+        dir.clone()
+    };
+
+    let summary = match walk_summary(&walk_root).await {
+        Ok(s) => s,
+        Err(e) => return err(format!("walk: {e}")),
+    };
+
+    // Persist digest blob alongside the registry.
+    let digest_path = digest_file(&alias);
+    if let Some(parent) = digest_path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    let blob = json!({
+        "alias": alias,
+        "url": url,
+        "digested_at": pipeline_memory::now_rfc3339(),
+        "summary": summary,
+    });
+    if let Err(e) = tokio::fs::write(&digest_path, blob.to_string()).await {
+        return err(format!("write digest: {e}"));
+    }
+
+    ToolResponse {
+        ok: true,
+        data: blob,
+        next_suggested: vec![
+            "pipeline_repo.list_capabilities".into(),
+            "pipeline_repo.extract".into(),
+        ],
+        memory_refs: vec![format!("digest:{alias}")],
+        error: None,
+    }
+}
+
+// ---------- registry I/O ----------
+
+async fn read_registry() -> Result<Registry, String> {
+    let path = registry_path();
+    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        return Ok(Registry::default());
+    }
+    let text = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| format!("read registry: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("parse registry: {e}"))
+}
+
+async fn write_registry(reg: &Registry) -> Result<(), String> {
+    let path = registry_path();
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("create_dir_all: {e}"))?;
+    }
+    let text = serde_json::to_string_pretty(reg).map_err(|e| format!("serialize registry: {e}"))?;
+    tokio::fs::write(&path, text)
+        .await
+        .map_err(|e| format!("write registry: {e}"))
+}
+
+fn registry_path() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(REGISTRY_FILE)
+}
+
+fn clone_dir(alias: &str) -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(REGISTRY_DIR)
+        .join(alias)
+}
+
+fn digest_file(alias: &str) -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".pipeline/digests")
+        .join(format!("{alias}.json"))
+}
+
+// ---------- helpers ----------
+
+fn kind_of(url: &str) -> String {
+    if url.starts_with("file://") || url.starts_with("./") || url.starts_with('/') {
+        "local".into()
+    } else {
+        "git".into()
+    }
+}
+
+fn strip_local_prefix(s: &str) -> String {
+    s.strip_prefix("file://").unwrap_or(s).to_owned()
+}
+
+fn infer_alias(url: &str) -> Option<String> {
+    // owner/repo → repo · https://host/path/repo(.git) → repo
+    let trimmed = url.trim_end_matches('/').trim_end_matches(".git");
+    let last = trimmed.rsplit('/').next()?;
+    if last.is_empty() {
+        return None;
+    }
+    // Replace any non-alnum chars with underscore.
+    let alias: String = last
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if alias.is_empty() { None } else { Some(alias) }
+}
+
+async fn clone_repo(url: &str, dir: &Path) -> Result<(), String> {
+    if let Some(parent) = dir.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let out = Command::new("git")
+        .args(["clone", "--depth", "1", url])
+        .arg(dir)
+        .output()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_owned());
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)] // independent presence flags · simple shape wins
+struct WalkSummary {
+    total_files: usize,
+    languages: BTreeMap<String, usize>,
+    top_dirs: Vec<String>,
+    has_dockerfile: bool,
+    has_compose: bool,
+    has_readme: bool,
+    has_license: bool,
+}
+
+async fn walk_summary(root: &Path) -> Result<WalkSummary, String> {
+    use tokio::fs;
+    let mut total_files = 0usize;
+    let mut languages: BTreeMap<String, usize> = BTreeMap::new();
+    let mut top_dirs: Vec<String> = Vec::new();
+    let mut has_dockerfile = false;
+    let mut has_compose = false;
+    let mut has_readme = false;
+    let mut has_license = false;
+
+    // Top-level scan first · drives top_dirs.
+    let mut rd = fs::read_dir(root).await.map_err(|e| e.to_string())?;
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        let meta = match entry.metadata().await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if name.starts_with('.') || name == "target" || name == "node_modules" {
+            continue;
+        }
+        if meta.is_dir() {
+            top_dirs.push(name.clone());
+        }
+        if name == "Dockerfile" {
+            has_dockerfile = true;
+        }
+        if name == "docker-compose.yml" || name == "compose.yml" {
+            has_compose = true;
+        }
+        if name.starts_with("README") {
+            has_readme = true;
+        }
+        if name.starts_with("LICENSE") {
+            has_license = true;
+        }
+        // Recurse for language counts (BFS, capped depth to keep cheap).
+        recurse_lang_count(&path, &mut total_files, &mut languages, 0, 4).await;
+    }
+    top_dirs.sort();
+    Ok(WalkSummary {
+        total_files,
+        languages,
+        top_dirs,
+        has_dockerfile,
+        has_compose,
+        has_readme,
+        has_license,
+    })
+}
+
+#[allow(clippy::manual_async_fn)]
+fn recurse_lang_count<'a>(
+    path: &'a Path,
+    total: &'a mut usize,
+    langs: &'a mut BTreeMap<String, usize>,
+    depth: u32,
+    max_depth: u32,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        if depth > max_depth {
+            return;
+        }
+        if let Ok(meta) = tokio::fs::metadata(path).await {
+            if meta.is_file() {
+                *total += 1;
+                if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                    let lang = match ext {
+                        "rs" => "rust",
+                        "py" => "python",
+                        "ts" | "tsx" => "typescript",
+                        "js" | "jsx" => "javascript",
+                        "go" => "go",
+                        "java" => "java",
+                        "kt" => "kotlin",
+                        "rb" => "ruby",
+                        "swift" => "swift",
+                        "c" | "h" => "c",
+                        "cpp" | "hpp" | "cc" | "cxx" => "cpp",
+                        "yaml" | "yml" => "yaml",
+                        "json" => "json",
+                        "md" => "markdown",
+                        "sh" => "shell",
+                        _ => return,
+                    };
+                    *langs.entry(lang.to_owned()).or_insert(0) += 1;
+                }
+                return;
+            }
+            if meta.is_dir() {
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default();
+                if name == "target"
+                    || name == "node_modules"
+                    || name == ".git"
+                    || name == "dist"
+                    || name == "build"
+                {
+                    return;
+                }
+                if let Ok(mut rd) = tokio::fs::read_dir(path).await {
+                    while let Ok(Some(entry)) = rd.next_entry().await {
+                        recurse_lang_count(&entry.path(), total, langs, depth + 1, max_depth).await;
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn err(msg: String) -> ToolResponse {
+    ToolResponse {
+        ok: false,
+        data: json!({}),
+        next_suggested: vec![],
+        memory_refs: vec![],
+        error: Some(msg),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn infer_alias_from_https_url() {
+        assert_eq!(
+            infer_alias("https://github.com/owner/repo.git").as_deref(),
+            Some("repo")
+        );
+        assert_eq!(
+            infer_alias("https://github.com/owner/repo").as_deref(),
+            Some("repo")
+        );
+        assert_eq!(
+            infer_alias("git@github.com:owner/cool-repo.git").as_deref(),
+            Some("cool-repo")
+        );
+    }
+
+    #[test]
+    fn kind_of_distinguishes_local_vs_git() {
+        assert_eq!(kind_of("https://x"), "git");
+        assert_eq!(kind_of("file:///tmp/x"), "local");
+        assert_eq!(kind_of("./relative"), "local");
+        assert_eq!(kind_of("/abs/path"), "local");
+    }
+}

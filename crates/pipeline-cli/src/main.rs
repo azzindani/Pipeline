@@ -55,9 +55,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Run { profile } => run_profile(&profile).await?,
         Command::Dev => println!("[stub] dev (mcp + watch) · POC week 1"),
         Command::Watch => println!("[stub] watch · POC week 1"),
-        Command::Init { name, kind } => {
-            println!("[stub] init project '{name}' (type: {kind:?}) · MVP week 4");
-        }
+        Command::Init { name, kind } => init_project(&name, kind.as_deref()).await?,
         Command::Report => report().await?,
         Command::Config => print_config()?,
     }
@@ -191,6 +189,24 @@ fn load_config(root: &Path) -> anyhow::Result<pipeline_config::PipelineConfig> {
 async fn open_memory(root: &Path) -> anyhow::Result<Memory> {
     let db_path: PathBuf = root.join(".pipeline").join("memory.db");
     Ok(Memory::open(&db_path).await?)
+}
+
+#[allow(clippy::unused_async)] // signature mirrors other CLI subcommands · async-ready for future remote registry lookups
+async fn init_project(name: &str, kind: Option<&str>) -> anyhow::Result<()> {
+    let parent = std::env::current_dir()?;
+    let template = kind.unwrap_or("custom");
+    let outcome = pipeline_mcp::templates::init_project(&parent, name, template, "")
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    println!(
+        "scaffolded '{}' · template={} · stack={} · {} files",
+        outcome.name,
+        outcome.template,
+        outcome.stack,
+        outcome.files_written.len()
+    );
+    println!("  root: {}", outcome.root.display());
+    println!("next: cd {} && pipeline run fast", outcome.name);
+    Ok(())
 }
 
 const fn status_label(s: StageStatus) -> &'static str {

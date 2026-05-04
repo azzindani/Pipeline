@@ -4,10 +4,13 @@ pub mod docker;
 pub mod memory;
 pub mod meta;
 pub mod plan;
+pub mod project;
+pub mod repo;
 pub mod report;
 pub mod run;
 pub mod session;
 pub mod standards;
+pub mod test;
 
 use crate::server::ServerState;
 use std::path::PathBuf;

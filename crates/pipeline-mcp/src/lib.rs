@@ -13,6 +13,7 @@ mod dispatch;
 mod handlers;
 mod registry;
 mod server;
+pub mod templates;
 mod tools;
 
 pub use dispatch::call_tool;
