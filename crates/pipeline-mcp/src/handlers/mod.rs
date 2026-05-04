@@ -2,6 +2,7 @@
 
 pub mod memory;
 pub mod meta;
+pub mod plan;
 pub mod report;
 pub mod run;
 pub mod session;

@@ -18,11 +18,12 @@ pub async fn call_tool(name: &str, req: ToolRequest, state: Arc<ServerState>) ->
 
     match tool {
         ToolName::Session => handlers::session::handle(req, state).await,
+        ToolName::Plan => handlers::plan::handle(req, state).await,
         ToolName::Run => handlers::run::handle(req, state).await,
         ToolName::Meta => handlers::meta::handle(req, state).await,
         ToolName::Memory => handlers::memory::handle(req, state).await,
         ToolName::Report => handlers::report::handle(req, state).await,
-        // Day-2 implements 5 of 19 tools end-to-end · the other 14 surface
+        // Day-3 implements 6 of 19 tools end-to-end · the other 13 surface
         // not_implemented but stay schema-listed for agent discoverability.
         other => ToolResponse::not_implemented(other, &req.action),
     }
