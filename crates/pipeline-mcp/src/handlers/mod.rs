@@ -1,14 +1,22 @@
 //! Per-tool handler modules · one async `handle(req, state)` each.
 
+pub mod data;
+pub mod deploy;
 pub mod docker;
+pub mod docs;
+pub mod e2e;
+pub mod env;
 pub mod memory;
 pub mod meta;
+pub mod observe;
 pub mod plan;
 pub mod project;
 pub mod repo;
 pub mod report;
 pub mod run;
+pub mod security;
 pub mod session;
+pub mod simulate;
 pub mod standards;
 pub mod test;
 

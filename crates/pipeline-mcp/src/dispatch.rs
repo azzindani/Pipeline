@@ -21,16 +21,21 @@ pub async fn call_tool(name: &str, req: ToolRequest, state: Arc<ServerState>) ->
         ToolName::Plan => handlers::plan::handle(req, state).await,
         ToolName::Standards => handlers::standards::handle(req, state).await,
         ToolName::Project => handlers::project::handle(req, state).await,
+        ToolName::Env => handlers::env::handle(req, state).await,
         ToolName::Docker => handlers::docker::handle(req, state).await,
         ToolName::Run => handlers::run::handle(req, state).await,
         ToolName::Test => handlers::test::handle(req, state).await,
+        ToolName::E2e => handlers::e2e::handle(req, state).await,
+        ToolName::Simulate => handlers::simulate::handle(req, state).await,
+        ToolName::Deploy => handlers::deploy::handle(req, state).await,
         ToolName::Repo => handlers::repo::handle(req, state).await,
-        ToolName::Meta => handlers::meta::handle(req, state).await,
+        ToolName::Docs => handlers::docs::handle(req, state).await,
+        ToolName::Data => handlers::data::handle(req, state).await,
+        ToolName::Observe => handlers::observe::handle(req, state).await,
+        ToolName::Security => handlers::security::handle(req, state).await,
         ToolName::Memory => handlers::memory::handle(req, state).await,
         ToolName::Report => handlers::report::handle(req, state).await,
-        // Day-5 implements 11 of 19 tools end-to-end · the other 8 surface
-        // not_implemented but stay schema-listed for agent discoverability.
-        other => ToolResponse::not_implemented(other, &req.action),
+        ToolName::Meta => handlers::meta::handle(req, state).await,
     }
 }
 
