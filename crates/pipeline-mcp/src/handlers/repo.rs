@@ -42,8 +42,12 @@ pub async fn handle(req: ToolRequest, _state: Arc<ServerState>) -> ToolResponse 
         "list" => list().await,
         "remove" => remove(&req.args).await,
         "digest" => digest(&req.args).await,
-        "list_capabilities" | "extract" | "compare" | "port" | "port_validate"
-        | "apply_standards" | "capability_graph" | "re_analyze" | "re_status" | "re_report"
+        "list_capabilities" => list_capabilities(&req.args).await,
+        "extract" => extract(&req.args).await,
+        "compare" => compare(&req.args).await,
+        "port" => port(&req.args).await,
+        "port_validate" => port_validate(&req.args).await,
+        "apply_standards" | "capability_graph" | "re_analyze" | "re_status" | "re_report"
         | "re_reconstruct" | "re_modernize" => {
             ToolResponse::not_implemented(ToolName::Repo, &req.action)
         }
@@ -420,6 +424,409 @@ fn recurse_lang_count<'a>(
             }
         }
     })
+}
+
+// ---------- list_capabilities · extract · compare · port · port_validate ----------
+
+async fn read_digest(alias: &str) -> Result<Value, String> {
+    let path = digest_file(alias);
+    let text = tokio::fs::read_to_string(&path).await.map_err(|e| {
+        format!("digest for '{alias}' not found · call pipeline_repo.digest first ({e})")
+    })?;
+    serde_json::from_str(&text).map_err(|e| format!("corrupt digest: {e}"))
+}
+
+/// Heuristic capability list: top-level dirs that look like code (have at
+/// least one source file) plus a few well-known capability markers found
+/// at any depth (auth, queue, retry, ratelimit, ...).
+async fn list_capabilities(args: &Value) -> ToolResponse {
+    let alias = match args.get("alias").and_then(Value::as_str) {
+        Some(a) => a.to_owned(),
+        None => return err("missing 'alias'".into()),
+    };
+    let digest = match read_digest(&alias).await {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let dir = clone_dir(&alias);
+    let mut capabilities: Vec<Value> = Vec::new();
+
+    if let Some(top) = digest
+        .pointer("/summary/top_dirs")
+        .and_then(Value::as_array)
+    {
+        for v in top {
+            if let Some(name) = v.as_str() {
+                let path = dir.join(name);
+                let has_code = directory_has_source(&path).await;
+                if has_code {
+                    capabilities.push(json!({
+                        "name": name,
+                        "kind": "directory",
+                        "location": format!("{name}/"),
+                    }));
+                }
+            }
+        }
+    }
+    // Keyword markers in file names · cheap.
+    let markers = [
+        ("auth", "authentication"),
+        ("queue", "queue worker"),
+        ("retry", "retry strategy"),
+        ("ratelimit", "rate limiting"),
+        ("rate_limit", "rate limiting"),
+        ("webhook", "webhook handler"),
+        ("billing", "billing"),
+        ("metering", "metering"),
+        ("rating", "rating engine"),
+        ("scheduler", "scheduling"),
+    ];
+    let names = collect_filenames(&dir).await;
+    for (token, label) in markers {
+        if names.iter().any(|n| n.to_ascii_lowercase().contains(token)) {
+            capabilities.push(json!({
+                "name": label,
+                "kind": "marker",
+                "location": format!("files matching *{token}*"),
+            }));
+        }
+    }
+
+    ToolResponse {
+        ok: true,
+        data: json!({"alias": alias, "capabilities": capabilities}),
+        next_suggested: vec!["pipeline_repo.extract".into()],
+        memory_refs: vec![format!("digest:{alias}")],
+        error: None,
+    }
+}
+
+async fn directory_has_source(dir: &Path) -> bool {
+    let exts = ["rs", "py", "ts", "tsx", "js", "go", "java", "rb", "kt"];
+    let mut rd = match tokio::fs::read_dir(dir).await {
+        Ok(rd) => rd,
+        Err(_) => return false,
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        if let Some(ext) = entry.path().extension().and_then(|s| s.to_str()) {
+            if exts.contains(&ext.to_ascii_lowercase().as_str()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+async fn collect_filenames(root: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    let mut budget: u32 = 4_000;
+    while let Some(dir) = stack.pop() {
+        if budget == 0 {
+            break;
+        }
+        let mut rd = match tokio::fs::read_dir(&dir).await {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.')
+                || name == "target"
+                || name == "node_modules"
+                || name == "dist"
+                || name == "build"
+            {
+                continue;
+            }
+            let path = entry.path();
+            if let Ok(meta) = entry.metadata().await {
+                if meta.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.push(name);
+                }
+            }
+            budget -= 1;
+            if budget == 0 {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Copy `<repo>/<source>` into `<cwd>/<target>` (or `<cwd>/extracted/<source>`
+/// if target omitted). Idempotent: refuses to overwrite an existing target.
+async fn extract(args: &Value) -> ToolResponse {
+    let alias = match args.get("alias").and_then(Value::as_str) {
+        Some(a) => a.to_owned(),
+        None => return err("missing 'alias'".into()),
+    };
+    let capability = match args
+        .get("capability")
+        .or_else(|| args.get("source"))
+        .and_then(Value::as_str)
+    {
+        Some(c) => c.to_owned(),
+        None => return err("missing 'capability' (path within the source repo)".into()),
+    };
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    let target_rel = match args.get("target_path").and_then(Value::as_str) {
+        Some(s) => PathBuf::from(s),
+        None => cwd.join("extracted").join(&capability),
+    };
+
+    let src_root = clone_dir(&alias);
+    let src = src_root.join(&capability);
+    if !tokio::fs::try_exists(&src).await.unwrap_or(false) {
+        return err(format!(
+            "source '{}' missing in cloned repo · call pipeline_repo.digest first",
+            src.display()
+        ));
+    }
+    if tokio::fs::try_exists(&target_rel).await.unwrap_or(false) {
+        return err(format!(
+            "refusing to overwrite existing target {}",
+            target_rel.display()
+        ));
+    }
+    if let Some(parent) = target_rel.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return err(format!("mkdir: {e}"));
+        }
+    }
+    let count = match copy_recursive(&src, &target_rel).await {
+        Ok(n) => n,
+        Err(e) => return err(e),
+    };
+
+    ToolResponse {
+        ok: true,
+        data: json!({
+            "alias": alias,
+            "capability": capability,
+            "source": src.display().to_string(),
+            "target": target_rel.display().to_string(),
+            "files_copied": count,
+        }),
+        next_suggested: vec![
+            "pipeline_repo.port_validate".into(),
+            "pipeline_run.stage(fast)".into(),
+        ],
+        memory_refs: vec![format!("digest:{alias}")],
+        error: None,
+    }
+}
+
+async fn copy_recursive(src: &Path, dst: &Path) -> Result<usize, String> {
+    let meta = tokio::fs::metadata(src)
+        .await
+        .map_err(|e| format!("stat {}: {e}", src.display()))?;
+    if meta.is_file() {
+        if let Some(parent) = dst.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        tokio::fs::copy(src, dst).await.map_err(|e| e.to_string())?;
+        return Ok(1);
+    }
+    tokio::fs::create_dir_all(dst)
+        .await
+        .map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
+    let mut count = 0usize;
+    let mut stack: Vec<(PathBuf, PathBuf)> = vec![(src.to_path_buf(), dst.to_path_buf())];
+    while let Some((s, d)) = stack.pop() {
+        let mut rd = tokio::fs::read_dir(&s)
+            .await
+            .map_err(|e| format!("read {}: {e}", s.display()))?;
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let name = entry.file_name();
+            let from = entry.path();
+            let to = d.join(&name);
+            let m = entry.metadata().await.map_err(|e| e.to_string())?;
+            if m.is_dir() {
+                tokio::fs::create_dir_all(&to)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                stack.push((from, to));
+            } else if m.is_file() {
+                tokio::fs::copy(&from, &to)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// Compare two digested repos along a chosen axis: features | arch | standards.
+/// Day-8b returns side-by-side language breakdowns and presence flags.
+async fn compare(args: &Value) -> ToolResponse {
+    let a = match args.get("a").and_then(Value::as_str) {
+        Some(s) => s.to_owned(),
+        None => return err("missing 'a' (alias)".into()),
+    };
+    let b = match args.get("b").and_then(Value::as_str) {
+        Some(s) => s.to_owned(),
+        None => return err("missing 'b' (alias)".into()),
+    };
+    let axis = args.get("axis").and_then(Value::as_str).unwrap_or("arch");
+    let da = match read_digest(&a).await {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let db = match read_digest(&b).await {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+
+    let summary_a = da.get("summary").cloned().unwrap_or(json!({}));
+    let summary_b = db.get("summary").cloned().unwrap_or(json!({}));
+    ToolResponse {
+        ok: true,
+        data: json!({
+            "axis": axis,
+            "a": {"alias": a, "summary": summary_a},
+            "b": {"alias": b, "summary": summary_b},
+            "note": "Day-8b · structural side-by-side · semantic compare lands MVP",
+        }),
+        next_suggested: vec!["pipeline_repo.list_capabilities".into()],
+        memory_refs: vec![format!("digest:{a}"), format!("digest:{b}")],
+        error: None,
+    }
+}
+
+/// Emit a port plan from `alias` to `target_lang`. Day-8b returns a
+/// per-file mapping with target extensions and language-specific notes;
+/// actual translation is agent-driven.
+async fn port(args: &Value) -> ToolResponse {
+    let alias = match args.get("alias").and_then(Value::as_str) {
+        Some(s) => s.to_owned(),
+        None => return err("missing 'alias'".into()),
+    };
+    let target_lang = match args.get("target_lang").and_then(Value::as_str) {
+        Some(s) => s.to_lowercase(),
+        None => return err("missing 'target_lang' (rust|python|typescript|go)".into()),
+    };
+    let scope = args.get("scope").and_then(Value::as_str).unwrap_or("full");
+    let digest = match read_digest(&alias).await {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+
+    let target_ext = match target_lang.as_str() {
+        "rust" => "rs",
+        "python" => "py",
+        "typescript" | "ts" => "ts",
+        "go" => "go",
+        other => return err(format!("unsupported target_lang '{other}'")),
+    };
+
+    let langs = digest
+        .pointer("/summary/languages")
+        .cloned()
+        .unwrap_or(json!({}));
+    let mut translation_paths: Vec<Value> = Vec::new();
+    if let Some(obj) = langs.as_object() {
+        for (lang, count) in obj {
+            translation_paths.push(json!({
+                "from": lang,
+                "to": target_lang,
+                "files_at_source": count,
+                "confidence": port_confidence(lang.as_str(), &target_lang),
+            }));
+        }
+    }
+
+    ToolResponse {
+        ok: true,
+        data: json!({
+            "alias": alias,
+            "target_lang": target_lang,
+            "target_ext": target_ext,
+            "scope": scope,
+            "translation_paths": translation_paths,
+            "next_actions": [
+                "agent walks each source file in scope",
+                "translates module-by-module preserving public API",
+                "calls pipeline_repo.port_validate(path) on each module",
+                "fixes failures using pipeline_run.fix_suggestion",
+            ],
+        }),
+        next_suggested: vec!["pipeline_repo.port_validate".into()],
+        memory_refs: vec![format!("digest:{alias}")],
+        error: None,
+    }
+}
+
+#[allow(clippy::match_same_arms)] // arms intentionally split to document each translation pair
+fn port_confidence(from: &str, to: &str) -> &'static str {
+    match (from, to) {
+        ("python", "rust" | "go" | "typescript" | "ts") | ("go", "rust") => "high",
+        (_, "python") => "high",
+        ("typescript" | "ts", "rust") | ("rust", "go") => "medium",
+        _ => "medium",
+    }
+}
+
+/// Run pipeline_run.stage(fast) inside a target path · validates ported code.
+async fn port_validate(args: &Value) -> ToolResponse {
+    let path = match args.get("path").and_then(Value::as_str) {
+        Some(p) => p.to_owned(),
+        None => return err("missing 'path'".into()),
+    };
+    let p = PathBuf::from(&path);
+    if !tokio::fs::try_exists(&p).await.unwrap_or(false) {
+        return err(format!("path not found: {path}"));
+    }
+    let pipeline_yaml = p.join("pipeline.yaml");
+    if !tokio::fs::try_exists(&pipeline_yaml).await.unwrap_or(false) {
+        return err(format!(
+            "no pipeline.yaml at {path} · call pipeline_project.init or copy one in"
+        ));
+    }
+    // Shell out to `pipeline run fast` from the path · simplest reuse.
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pipeline"));
+    let output = match tokio::process::Command::new(&exe)
+        .args(["run", "fast"])
+        .current_dir(&p)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => return err(format!("spawn pipeline: {e}")),
+    };
+    let ok = output.status.success();
+    ToolResponse {
+        ok,
+        data: json!({
+            "path": path,
+            "exit_code": output.status.code().unwrap_or(-1),
+            "stdout": String::from_utf8_lossy(&output.stdout).into_owned(),
+            "stderr": String::from_utf8_lossy(&output.stderr).into_owned(),
+        }),
+        next_suggested: if ok {
+            vec!["pipeline_run.preflight".into()]
+        } else {
+            vec!["pipeline_memory.suggest_fix".into()]
+        },
+        memory_refs: vec![],
+        error: if ok {
+            None
+        } else {
+            Some(format!(
+                "port_validate exit {}",
+                output.status.code().unwrap_or(-1)
+            ))
+        },
+    }
 }
 
 fn err(msg: String) -> ToolResponse {
