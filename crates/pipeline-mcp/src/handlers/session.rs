@@ -13,11 +13,114 @@ pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
         "steal" => steal(req.args, state).await,
         "end" => end(req.args, state).await,
         "handover" => handover(state).await,
-        "start" | "checkpoint" | "context" | "file_context" | "task_context" | "agent_register" => {
+        "start" => start(req.args, state).await,
+        "checkpoint" => checkpoint(req.args, state).await,
+        "agent_register" => agent_register(req.args, state).await,
+        "context" | "file_context" | "task_context" => {
             ToolResponse::not_implemented(ToolName::Session, &req.action)
         }
         other => unknown(other),
     }
+}
+
+/// Start a session WITHOUT taking the exclusive lock · returns an ephemeral
+/// session id keyed against the current project. Agents that want strict
+/// concurrency should use `lock` instead.
+async fn start(args: Value, state: Arc<ServerState>) -> ToolResponse {
+    let cfg = match load_config_in_cwd() {
+        Ok(c) => c,
+        Err(e) => return err(format!("config: {e}")),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(format!("memory: {e}")),
+    };
+    if let Err(e) = mem
+        .upsert_project(&cfg.project, &cfg.project, &cfg.stack.runtime)
+        .await
+    {
+        return err(e.to_string());
+    }
+    // Prefer per-call agent_id; fall back to whatever was registered earlier
+    // in this MCP connection; finally fall back to "anonymous".
+    let agent_id = match args.get("agent_id").and_then(Value::as_str) {
+        Some(a) => a.to_owned(),
+        None => state
+            .agent_id
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| "anonymous".into()),
+    };
+    let goal = args.get("goal").and_then(Value::as_str);
+
+    let started_at = pipeline_memory::now_rfc3339();
+    *state.project_id.lock().await = Some(cfg.project.clone());
+    ToolResponse::ok(json!({
+        "project": cfg.project,
+        "agent_id": agent_id,
+        "goal": goal,
+        "started_at": started_at,
+        "lock_held": false,
+    }))
+}
+
+/// Persist a free-form note keyed by an auto-generated checkpoint id.
+async fn checkpoint(args: Value, state: Arc<ServerState>) -> ToolResponse {
+    let note = args.get("note").and_then(Value::as_str).unwrap_or("");
+    let cfg = match load_config_in_cwd() {
+        Ok(c) => c,
+        Err(e) => return err(format!("config: {e}")),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(format!("memory: {e}")),
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    let blob = json!({
+        "id": id,
+        "note": note,
+        "ts": pipeline_memory::now_rfc3339(),
+        "agent_id": state.agent_id.lock().await.clone(),
+    });
+    if let Err(e) = mem
+        .remember(&cfg.project, "checkpoint", &id, &blob.to_string())
+        .await
+    {
+        return err(e.to_string());
+    }
+    ToolResponse {
+        ok: true,
+        data: blob,
+        next_suggested: vec!["pipeline_session.handover".into()],
+        memory_refs: vec![format!("checkpoint:{id}")],
+        error: None,
+    }
+}
+
+/// Register agent identity + capabilities for this MCP connection.
+/// Subsequent session ops inherit `agent_id`.
+async fn agent_register(args: Value, state: Arc<ServerState>) -> ToolResponse {
+    let agent_id = match args.get("agent_id").and_then(Value::as_str) {
+        Some(a) => a.to_owned(),
+        None => return err("missing 'agent_id'".into()),
+    };
+    let caps: Vec<String> = args
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    *state.agent_id.lock().await = Some(agent_id.clone());
+    *state.agent_capabilities.lock().await = caps.clone();
+    ToolResponse::ok(json!({
+        "agent_id": agent_id,
+        "capabilities": caps,
+        "registered_at": pipeline_memory::now_rfc3339(),
+    }))
 }
 
 async fn lock(args: Value, state: Arc<ServerState>) -> ToolResponse {
