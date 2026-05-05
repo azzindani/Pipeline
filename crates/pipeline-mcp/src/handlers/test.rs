@@ -14,7 +14,7 @@
 
 use crate::handlers::{ensure_memory, load_config_in_cwd};
 use crate::server::ServerState;
-use crate::tools::{ToolName, ToolRequest, ToolResponse};
+use crate::tools::{ToolRequest, ToolResponse};
 use serde_json::{Value, json};
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -27,9 +27,10 @@ pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
         "generate" => generate(&req.args).await,
         "ac_to_test" => ac_to_test(&req.args, state).await,
         "coverage" => coverage(&req.args).await,
-        "mutation_run" | "property_generate" | "validation_create" | "flake_detect" => {
-            ToolResponse::not_implemented(ToolName::Test, &req.action)
-        }
+        "mutation_run" => mutation_run(&req.args).await,
+        "property_generate" => property_generate(&req.args).await,
+        "validation_create" => validation_create(&req.args).await,
+        "flake_detect" => flake_detect(&req.args, state).await,
         other => err(format!("unknown action 'pipeline_test.{other}'")),
     }
 }
@@ -354,6 +355,154 @@ fn truncate(s: &str, max: usize) -> String {
         write!(t, "\n... [truncated · {} more bytes]", s.len() - max).ok();
         t
     }
+}
+
+async fn mutation_run(args: &Value) -> ToolResponse {
+    let stack = args.get("stack").and_then(Value::as_str).unwrap_or("rust");
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    let (program, cmd_args): (&str, Vec<&str>) = match stack {
+        "rust" => ("cargo", vec!["mutants"]),
+        "python" | "python-uv" => ("mutmut", vec!["run"]),
+        "node" | "ts" | "typescript" => ("npx", vec!["stryker", "run"]),
+        other => return err(format!("unsupported stack '{other}'")),
+    };
+    let output = match Command::new(program)
+        .args(&cmd_args)
+        .current_dir(&cwd)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => return err(format!("{program}: {e} · is it installed?")),
+    };
+    let ok = output.status.success();
+    ToolResponse {
+        ok,
+        data: json!({
+            "stack": stack,
+            "exit_code": output.status.code().unwrap_or(-1),
+            "stdout": truncate(&String::from_utf8_lossy(&output.stdout), 16_000),
+            "stderr": truncate(&String::from_utf8_lossy(&output.stderr), 16_000),
+        }),
+        next_suggested: vec![],
+        memory_refs: vec![],
+        error: if ok {
+            None
+        } else {
+            Some(format!(
+                "mutation_run({stack}) exit {}",
+                output.status.code().unwrap_or(-1)
+            ))
+        },
+    }
+}
+
+#[allow(clippy::unused_async)]
+async fn property_generate(args: &Value) -> ToolResponse {
+    let target = match args.get("target").and_then(Value::as_str) {
+        Some(t) => t.to_owned(),
+        None => return err("missing 'target' (function name)".into()),
+    };
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    let path = cwd
+        .join("tests")
+        .join(format!("prop_{}.rs", slugify(&target)));
+    if path.exists() {
+        return err(format!("refusing to overwrite {}", path.display()));
+    }
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return err(format!("mkdir: {e}"));
+        }
+    }
+    let body = format!(
+        "//! Property tests scaffolded by pipeline_test.property_generate · target = {target}.\n//! Add `proptest = \"1\"` to [dev-dependencies] in Cargo.toml.\n\nuse proptest::prelude::*;\n\nproptest! {{\n    #[test]\n    fn {fn_name}(input in any::<u64>()) {{\n        // TODO: invariant for {target}(input)\n        let _ = input;\n    }}\n}}\n",
+        fn_name = slugify(&target),
+    );
+    if let Err(e) = std::fs::write(&path, body) {
+        return err(format!("write: {e}"));
+    }
+    ToolResponse::ok(json!({"path": path.display().to_string(), "target": target}))
+}
+
+#[allow(clippy::unused_async)]
+async fn validation_create(args: &Value) -> ToolResponse {
+    let spec = args
+        .get("spec")
+        .and_then(Value::as_str)
+        .unwrap_or("contract");
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    let dir = cwd.join("validation");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return err(format!("mkdir: {e}"));
+    }
+    let path = dir.join(format!("{}.sh", slugify(spec)));
+    if path.exists() {
+        return err(format!("refusing to overwrite {}", path.display()));
+    }
+    let body = format!(
+        "#!/usr/bin/env bash\n# Validation script scaffolded by pipeline_test.validation_create · spec={spec}\nset -euo pipefail\n\necho \"validating {spec}...\"\n# TODO: actual checks · curl + jq + diff against spec/{spec}.json\nexit 0\n"
+    );
+    if let Err(e) = std::fs::write(&path, body) {
+        return err(format!("write: {e}"));
+    }
+    // chmod +x · best-effort.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&path) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o755);
+            let _ = std::fs::set_permissions(&path, perms);
+        }
+    }
+    ToolResponse::ok(json!({"spec": spec, "path": path.display().to_string()}))
+}
+
+async fn flake_detect(args: &Value, state: Arc<ServerState>) -> ToolResponse {
+    let _ = args;
+    // Heuristic: stage that has both pass and fail in run history is flaky.
+    let cfg = match load_config_in_cwd() {
+        Ok(c) => c,
+        Err(e) => return err(format!("config: {e}")),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(format!("memory: {e}")),
+    };
+    let runs = mem.run_history(&cfg.project, 200).await.unwrap_or_default();
+    let mut by_stage: std::collections::BTreeMap<String, (u32, u32)> =
+        std::collections::BTreeMap::new();
+    for r in &runs {
+        let entry = by_stage.entry(r.stage.clone()).or_insert((0, 0));
+        if r.status == "pass" {
+            entry.0 += 1;
+        } else if r.status == "fail" {
+            entry.1 += 1;
+        }
+    }
+    let flaky: Vec<Value> = by_stage
+        .iter()
+        .filter(|(_, (p, f))| *p > 0 && *f > 0)
+        .map(|(stage, (p, f))| {
+            let pct = (f64::from(*f) / f64::from(*p + *f)) * 100.0;
+            json!({"stage": stage, "pass": p, "fail": f, "fail_rate": pct})
+        })
+        .collect();
+    ToolResponse::ok(json!({
+        "stages_seen": by_stage.len(),
+        "flaky": flaky,
+        "tip": if flaky.is_empty() { "no flaky stages detected" } else { "investigate · pin seeds / time-of-day / env vars" },
+    }))
 }
 
 fn err(msg: String) -> ToolResponse {

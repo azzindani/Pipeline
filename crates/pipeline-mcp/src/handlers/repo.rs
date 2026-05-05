@@ -10,7 +10,7 @@
 #![allow(clippy::doc_markdown)]
 
 use crate::server::ServerState;
-use crate::tools::{ToolName, ToolRequest, ToolResponse};
+use crate::tools::{ToolRequest, ToolResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -47,10 +47,13 @@ pub async fn handle(req: ToolRequest, _state: Arc<ServerState>) -> ToolResponse 
         "compare" => compare(&req.args).await,
         "port" => port(&req.args).await,
         "port_validate" => port_validate(&req.args).await,
-        "apply_standards" | "capability_graph" | "re_analyze" | "re_status" | "re_report"
-        | "re_reconstruct" | "re_modernize" => {
-            ToolResponse::not_implemented(ToolName::Repo, &req.action)
-        }
+        "apply_standards" => apply_standards(&req.args).await,
+        "capability_graph" => capability_graph().await,
+        "re_analyze" => re_analyze(&req.args).await,
+        "re_status" => re_status(&req.args).await,
+        "re_report" => re_report(&req.args).await,
+        "re_reconstruct" => re_reconstruct(&req.args).await,
+        "re_modernize" => re_modernize(&req.args).await,
         other => err(format!("unknown action 'pipeline_repo.{other}'")),
     }
 }
@@ -827,6 +830,250 @@ async fn port_validate(args: &Value) -> ToolResponse {
             ))
         },
     }
+}
+
+async fn apply_standards(args: &Value) -> ToolResponse {
+    let alias = match args.get("alias").and_then(Value::as_str) {
+        Some(a) => a.to_owned(),
+        None => return err("missing 'alias'".into()),
+    };
+    let digest = match read_digest(&alias).await {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    let s = digest.get("summary").cloned().unwrap_or(json!({}));
+    let mut report = serde_json::Map::new();
+    report.insert(
+        "has_dockerfile".into(),
+        s.get("has_dockerfile").cloned().unwrap_or(json!(false)),
+    );
+    report.insert(
+        "has_compose".into(),
+        s.get("has_compose").cloned().unwrap_or(json!(false)),
+    );
+    report.insert(
+        "has_readme".into(),
+        s.get("has_readme").cloned().unwrap_or(json!(false)),
+    );
+    report.insert(
+        "has_license".into(),
+        s.get("has_license").cloned().unwrap_or(json!(false)),
+    );
+    let total = report.len();
+    let passing = report
+        .values()
+        .filter(|v| v.as_bool() == Some(true))
+        .count();
+    #[allow(clippy::cast_precision_loss)]
+    let score = (passing as f64 / total as f64) * 100.0;
+    ToolResponse::ok(json!({
+        "alias": alias,
+        "compliance": report,
+        "score_percent": score,
+        "tip": "presence-only · semantic standards check lands MVP via pipeline_standards.check",
+    }))
+}
+
+async fn capability_graph() -> ToolResponse {
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    let dir = cwd.join(".pipeline/digests");
+    if !tokio::fs::try_exists(&dir).await.unwrap_or(false) {
+        return ToolResponse::ok(json!({"nodes": [], "edges": []}));
+    }
+    let mut rd = match tokio::fs::read_dir(&dir).await {
+        Ok(rd) => rd,
+        Err(e) => return err(format!("read_dir: {e}")),
+    };
+    let mut nodes: Vec<Value> = Vec::new();
+    let mut edges: Vec<Value> = Vec::new();
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let body = match tokio::fs::read_to_string(&path).await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let v: Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let alias = v
+            .get("alias")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        nodes.push(json!({
+            "alias": alias,
+            "languages": v.pointer("/summary/languages").cloned().unwrap_or(json!({})),
+        }));
+        if let Some(top) = v.pointer("/summary/top_dirs").and_then(Value::as_array) {
+            for t in top {
+                if let Some(name) = t.as_str() {
+                    edges.push(json!({"alias": alias, "capability": name}));
+                }
+            }
+        }
+    }
+    ToolResponse::ok(json!({
+        "nodes": nodes,
+        "edges": edges,
+        "node_count": nodes.len(),
+        "edge_count": edges.len(),
+    }))
+}
+
+async fn re_analyze(args: &Value) -> ToolResponse {
+    let target = match args.get("target").and_then(Value::as_str) {
+        Some(t) => t.to_owned(),
+        None => return err("missing 'target'".into()),
+    };
+    let kind = args.get("type").and_then(Value::as_str).unwrap_or("auto");
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let dir = cwd.join(".pipeline/re");
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        return err(format!("mkdir: {e}"));
+    }
+    let job_path = dir.join(format!("{job_id}.json"));
+    let blob = json!({
+        "job_id": job_id,
+        "target": target,
+        "type": kind,
+        "status": "queued",
+        "created_at": pipeline_memory::now_rfc3339(),
+        "stages": ["surface", "structure", "intent", "contract", "output"],
+        "stage_index": 0,
+    });
+    if let Err(e) = tokio::fs::write(&job_path, blob.to_string()).await {
+        return err(format!("write: {e}"));
+    }
+    ToolResponse {
+        ok: true,
+        data: blob,
+        next_suggested: vec![
+            "pipeline_repo.re_status".into(),
+            "pipeline_repo.re_report".into(),
+        ],
+        memory_refs: vec![format!("re_job:{job_id}")],
+        error: None,
+    }
+}
+
+async fn re_status(args: &Value) -> ToolResponse {
+    let job_id = match args.get("job_id").and_then(Value::as_str) {
+        Some(j) => j.to_owned(),
+        None => return err("missing 'job_id'".into()),
+    };
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    let path = cwd.join(".pipeline/re").join(format!("{job_id}.json"));
+    let body = match tokio::fs::read_to_string(&path).await {
+        Ok(s) => s,
+        Err(e) => return err(format!("read: {e}")),
+    };
+    let v: Value = serde_json::from_str(&body).unwrap_or(json!({}));
+    ToolResponse::ok(v)
+}
+
+async fn re_report(args: &Value) -> ToolResponse {
+    let job_id = match args.get("job_id").and_then(Value::as_str) {
+        Some(j) => j.to_owned(),
+        None => return err("missing 'job_id'".into()),
+    };
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    let path = cwd.join(".pipeline/re").join(format!("{job_id}.json"));
+    let body = match tokio::fs::read_to_string(&path).await {
+        Ok(s) => s,
+        Err(e) => return err(format!("read: {e}")),
+    };
+    let mut v: Value = serde_json::from_str(&body).unwrap_or(json!({}));
+    // Day-9 stub: mark complete + emit a synthetic report shape that downstream
+    // tools (port, scaffold) can consume. Real RE pipeline lands MVP+.
+    v["status"] = json!("complete");
+    v["module_map"] = json!([]);
+    v["contracts"] = json!([]);
+    v["patterns_detected"] = json!([]);
+    v["reported_at"] = json!(pipeline_memory::now_rfc3339());
+    ToolResponse::ok(v)
+}
+
+async fn re_reconstruct(args: &Value) -> ToolResponse {
+    let kind = match args.get("kind").and_then(Value::as_str) {
+        Some(k) => k.to_owned(),
+        None => return err("missing 'kind' (api|schema|dockerfile)".into()),
+    };
+    let target = args.get("target").and_then(Value::as_str).unwrap_or("");
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    let dir = cwd.join(".pipeline/re/reconstructed");
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        return err(format!("mkdir: {e}"));
+    }
+    let (path, body): (PathBuf, String) = match kind.as_str() {
+        "api" => (
+            dir.join("openapi.yaml"),
+            format!(
+                "# Reconstructed from {target}\nopenapi: 3.1.0\ninfo:\n  title: Reconstructed API\n  version: 0.0.1\npaths: {{}}\n"
+            ),
+        ),
+        "schema" => (
+            dir.join("schema.sql"),
+            format!(
+                "-- Reconstructed schema from {target}\n-- TODO: derive from live DB introspection\n"
+            ),
+        ),
+        "dockerfile" => (
+            dir.join("Dockerfile"),
+            format!(
+                "# Reconstructed from {target}\n# TODO: derive from `docker history`\nFROM debian:bookworm-slim\n"
+            ),
+        ),
+        other => return err(format!("unsupported kind '{other}'")),
+    };
+    if path.exists() {
+        return err(format!("refusing to overwrite {}", path.display()));
+    }
+    if let Err(e) = tokio::fs::write(&path, body).await {
+        return err(format!("write: {e}"));
+    }
+    ToolResponse::ok(json!({"kind": kind, "target": target, "path": path.display().to_string()}))
+}
+
+#[allow(clippy::unused_async)]
+async fn re_modernize(args: &Value) -> ToolResponse {
+    let job_id = args.get("job_id").and_then(Value::as_str).unwrap_or("");
+    let target_stack = args
+        .get("target_stack")
+        .and_then(Value::as_str)
+        .unwrap_or("rust");
+    ToolResponse::ok(json!({
+        "job_id": job_id,
+        "target_stack": target_stack,
+        "phases": [
+            {"name": "audit", "exit": "RE report complete"},
+            {"name": "extract", "exit": "core capabilities identified"},
+            {"name": "translate", "exit": "modules emitted in target stack"},
+            {"name": "validate", "exit": "pipeline_run.preflight green per module"},
+            {"name": "cutover", "exit": "feature parity with strangler fig"},
+        ],
+        "risk_level": "medium",
+        "tip": "Day-9 stub plan · execution lives in agent loop driving repo.port + run.preflight",
+    }))
 }
 
 fn err(msg: String) -> ToolResponse {

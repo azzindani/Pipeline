@@ -5,7 +5,7 @@
 
 use crate::server::ServerState;
 use crate::templates::{self, InitError};
-use crate::tools::{ToolName, ToolRequest, ToolResponse};
+use crate::tools::{ToolRequest, ToolResponse};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,9 +15,8 @@ pub async fn handle(req: ToolRequest, _state: Arc<ServerState>) -> ToolResponse 
     match req.action.as_str() {
         "init" => init(&req.args),
         "template_list" => template_list(),
-        "scaffold" | "template_register" => {
-            ToolResponse::not_implemented(ToolName::Project, &req.action)
-        }
+        "scaffold" => scaffold(&req.args),
+        "template_register" => template_register(&req.args),
         other => err(format!("unknown action 'pipeline_project.{other}'")),
     }
 }
@@ -69,6 +68,91 @@ fn template_list() -> ToolResponse {
         .map(|(name, desc)| json!({"name": name, "description": desc}))
         .collect();
     ToolResponse::ok(json!({"templates": templates}))
+}
+
+fn scaffold(args: &Value) -> ToolResponse {
+    let component = match args.get("component").and_then(Value::as_str) {
+        Some(c) => c.to_owned(),
+        None => return err("missing 'component' (file or module name)".into()),
+    };
+    let kind = args.get("kind").and_then(Value::as_str).unwrap_or("module");
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    let (rel, body) = match kind {
+        "module" => (
+            format!("src/{component}.rs"),
+            format!("//! {component} module · scaffolded by pipeline_project.scaffold\n\n"),
+        ),
+        "test" => (
+            format!("tests/{component}.rs"),
+            format!(
+                "//! {component} test · scaffolded by pipeline_project.scaffold\n\n#[test]\nfn smoke() {{ assert!(true); }}\n"
+            ),
+        ),
+        "bin" => (
+            format!("src/bin/{component}.rs"),
+            format!(
+                "//! {component} binary · scaffolded\n\nfn main() {{ println!(\"hello from {component}\"); }}\n"
+            ),
+        ),
+        other => return err(format!("unknown kind '{other}' · module|test|bin")),
+    };
+    let path = cwd.join(&rel);
+    if path.exists() {
+        return err(format!("refusing to overwrite {}", path.display()));
+    }
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return err(format!("mkdir: {e}"));
+        }
+    }
+    if let Err(e) = std::fs::write(&path, body) {
+        return err(format!("write: {e}"));
+    }
+    ToolResponse::ok(
+        json!({"component": component, "kind": kind, "path": path.display().to_string()}),
+    )
+}
+
+fn template_register(args: &Value) -> ToolResponse {
+    let name = match args.get("name").and_then(Value::as_str) {
+        Some(n) => n.to_owned(),
+        None => return err("missing 'name'".into()),
+    };
+    let source = match args.get("source").and_then(Value::as_str) {
+        Some(s) => s.to_owned(),
+        None => return err("missing 'source' (path or git url)".into()),
+    };
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    let registry_path = cwd.join(".pipeline/templates/registry.json");
+    if let Some(parent) = registry_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return err(format!("mkdir: {e}"));
+        }
+    }
+    let mut registry: Value = if registry_path.exists() {
+        std::fs::read_to_string(&registry_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| json!({"templates": []}))
+    } else {
+        json!({"templates": []})
+    };
+    if let Some(arr) = registry.get_mut("templates").and_then(Value::as_array_mut) {
+        arr.push(json!({"name": name, "source": source, "registered_at": pipeline_memory::now_rfc3339()}));
+    }
+    let pretty = serde_json::to_string_pretty(&registry).unwrap_or_else(|_| "{}".into());
+    if let Err(e) = std::fs::write(&registry_path, pretty) {
+        return err(format!("write: {e}"));
+    }
+    ToolResponse::ok(
+        json!({"name": name, "source": source, "registry": registry_path.display().to_string()}),
+    )
 }
 
 fn err(msg: String) -> ToolResponse {

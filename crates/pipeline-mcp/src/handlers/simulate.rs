@@ -6,7 +6,7 @@
 
 use crate::handlers::{ensure_memory, load_config_in_cwd};
 use crate::server::ServerState;
-use crate::tools::{ToolName, ToolRequest, ToolResponse};
+use crate::tools::{ToolRequest, ToolResponse};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -16,9 +16,9 @@ pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
         "persona_create" => persona_create(&req.args, state).await,
         "journey_define" => journey_define(&req.args, state).await,
         "use_case_define" => use_case_define(&req.args, state).await,
-        "journey_simulate" | "load" | "chaos_inject" => {
-            ToolResponse::not_implemented(ToolName::Simulate, &req.action)
-        }
+        "journey_simulate" => journey_simulate(&req.args, state).await,
+        "load" => load_simulate(&req.args).await,
+        "chaos_inject" => chaos_inject(&req.args).await,
         other => err(format!("unknown action 'pipeline_simulate.{other}'")),
     }
 }
@@ -116,6 +116,149 @@ async fn cfg_project(state: &Arc<ServerState>) -> Result<String, String> {
         return Ok(p);
     }
     load_config_in_cwd().map(|c| c.project)
+}
+
+async fn journey_simulate(args: &Value, state: Arc<ServerState>) -> ToolResponse {
+    let journey_id = match args.get("journey").and_then(Value::as_str) {
+        Some(j) => j.to_owned(),
+        None => return err("missing 'journey' (id)".into()),
+    };
+    let count = args.get("count").and_then(Value::as_u64).unwrap_or(10);
+    let project = match cfg_project(&state).await {
+        Ok(p) => p,
+        Err(e) => return err(e),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(e),
+    };
+    let blob = match mem.recall(&project, "journey", &journey_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return err(format!("journey '{journey_id}' not found")),
+        Err(e) => return err(e.to_string()),
+    };
+    let journey: Value = serde_json::from_str(&blob).unwrap_or(json!({}));
+    let steps = journey
+        .get("steps")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    // Dry-run · agent later wires k6/locust scripts. Returns simulated metrics.
+    ToolResponse::ok(json!({
+        "journey": journey_id,
+        "concurrency": count,
+        "steps_per_run": steps,
+        "simulated_total_steps": count * steps as u64,
+        "note": "Day-9 dry-run · k6/locust execution lands MVP+",
+    }))
+}
+
+async fn load_simulate(args: &Value) -> ToolResponse {
+    let target = match args.get("target").and_then(Value::as_str) {
+        Some(t) => t.to_owned(),
+        None => return err("missing 'target' (URL)".into()),
+    };
+    let profile = args
+        .get("profile")
+        .and_then(Value::as_str)
+        .unwrap_or("smoke");
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    // k6 in Docker · simple baseline script generated inline.
+    let script_dir = cwd.join("load");
+    if let Err(e) = std::fs::create_dir_all(&script_dir) {
+        return err(format!("mkdir: {e}"));
+    }
+    let script = script_dir.join(format!("{profile}.js"));
+    if !script.exists() {
+        let (vus, dur) = match profile {
+            "smoke" => (1, "10s"),
+            "load" => (50, "1m"),
+            "stress" => (200, "2m"),
+            other => return err(format!("unknown profile '{other}' · smoke|load|stress")),
+        };
+        let body = format!(
+            "import http from 'k6/http';\nimport {{ check, sleep }} from 'k6';\nexport const options = {{ vus: {vus}, duration: '{dur}' }};\nexport default function () {{\n  const r = http.get('{target}');\n  check(r, {{ '200 OK': (res) => res.status === 200 }});\n  sleep(0.5);\n}}\n"
+        );
+        if let Err(e) = std::fs::write(&script, body) {
+            return err(format!("write: {e}"));
+        }
+    }
+    let mount = format!("{}:/work", cwd.display());
+    let script_rel = format!("/work/load/{profile}.js");
+    match pipeline_docker::run_image(
+        "grafana/k6:latest",
+        &["run", &script_rel],
+        &[("MOUNT".into(), mount)],
+    )
+    .await
+    {
+        Ok(out) => ToolResponse {
+            ok: out.ok(),
+            data: json!({
+                "target": target,
+                "profile": profile,
+                "script": script.display().to_string(),
+                "stdout": out.stdout,
+                "stderr": out.stderr,
+                "exit_code": out.exit_code,
+            }),
+            next_suggested: vec!["pipeline_observe.perf_compare".into()],
+            memory_refs: vec![],
+            error: if out.ok() {
+                None
+            } else {
+                Some("k6 run failed".into())
+            },
+        },
+        Err(e) => err(e.to_string()),
+    }
+}
+
+async fn chaos_inject(args: &Value) -> ToolResponse {
+    let service = match args.get("service").and_then(Value::as_str) {
+        Some(s) => s.to_owned(),
+        None => return err("missing 'service' (container name or compose service)".into()),
+    };
+    let fault = args.get("fault").and_then(Value::as_str).unwrap_or("kill");
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    // Use docker pause/kill/network · simple chaos primitives.
+    let cmd_args: Vec<&str> = match fault {
+        "kill" => vec!["kill", &service],
+        "pause" => vec!["pause", &service],
+        "unpause" => vec!["unpause", &service],
+        "stop" => vec!["stop", &service],
+        other => return err(format!("unknown fault '{other}' · kill|pause|unpause|stop")),
+    };
+    let output = match tokio::process::Command::new("docker")
+        .args(&cmd_args)
+        .current_dir(&cwd)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => return err(format!("docker: {e}")),
+    };
+    ToolResponse {
+        ok: output.status.success(),
+        data: json!({
+            "service": service,
+            "fault": fault,
+            "exit_code": output.status.code().unwrap_or(-1),
+            "stderr": String::from_utf8_lossy(&output.stderr).into_owned(),
+        }),
+        next_suggested: vec!["pipeline_run.status".into()],
+        memory_refs: vec![],
+        error: if output.status.success() {
+            None
+        } else {
+            Some(format!("chaos {fault} failed"))
+        },
+    }
 }
 
 fn err(msg: String) -> ToolResponse {
