@@ -40,12 +40,11 @@ pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
         "decision_log" => decision_log(req.args, state).await,
         "risk_add" => risk_add(req.args, state).await,
         "risk_list" => risk_list(state).await,
-        // Defer to MVP: needs HTTP/scraping + scoring.
-        "link_ingest"
-        | "feasibility"
-        | "research_notes_list"
-        | "research_notes_show"
-        | "estimate" => ToolResponse::not_implemented(ToolName::Plan, &req.action),
+        "link_ingest" => link_ingest(req.args, state).await,
+        "feasibility" => feasibility(req.args, state).await,
+        "research_notes_list" => research_notes_list(state).await,
+        "research_notes_show" => research_notes_show(req.args, state).await,
+        "estimate" => ToolResponse::not_implemented(ToolName::Plan, &req.action),
         other => err(format!("unknown action 'pipeline_plan.{other}'")),
     }
 }
@@ -543,6 +542,454 @@ async fn risk_list(state: Arc<ServerState>) -> ToolResponse {
         .filter_map(|(_, v)| serde_json::from_str(&v).ok())
         .collect();
     ToolResponse::ok(json!({"risks": risks}))
+}
+
+// ---------- link_ingest + feasibility ----------
+
+async fn link_ingest(args: Value, state: Arc<ServerState>) -> ToolResponse {
+    let urls: Vec<String> = match args.get("urls").and_then(Value::as_array) {
+        Some(a) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect(),
+        None => return err("missing 'urls' (array of strings)".into()),
+    };
+    if urls.is_empty() {
+        return err("'urls' is empty".into());
+    }
+    let project = match cfg_project(&state).await {
+        Ok(p) => p,
+        Err(e) => return err(e),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(e),
+    };
+
+    let client = match reqwest::Client::builder()
+        .user_agent("pipeline-mcp/0.0.1")
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return err(format!("http client: {e}")),
+    };
+
+    let mut notes: Vec<Value> = Vec::new();
+    for url in &urls {
+        let kind = classify_url(url);
+        let id = Uuid::new_v4().to_string();
+        let mut record = serde_json::Map::new();
+        record.insert("id".into(), json!(id));
+        record.insert("url".into(), json!(url));
+        record.insert("kind".into(), json!(kind));
+        record.insert("ts".into(), json!(pipeline_memory::now_rfc3339()));
+
+        if matches!(kind, "github" | "gitlab" | "bitbucket" | "git") {
+            // Don't fetch · agent should call repo.register on these URLs.
+            record.insert(
+                "advice".into(),
+                json!("git URL · call pipeline_repo.register(url) to track + digest"),
+            );
+        } else {
+            match client.get(url).send().await {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    record.insert("http_status".into(), json!(status));
+                    if resp.status().is_success() {
+                        let body = resp.text().await.unwrap_or_default();
+                        let extracted = extract_text(&body);
+                        record.insert("title".into(), json!(extract_title(&body)));
+                        record.insert("excerpt".into(), json!(truncate(&extracted, 4_000)));
+                        record.insert("byte_length".into(), json!(body.len()));
+                    }
+                }
+                Err(e) => {
+                    record.insert("error".into(), json!(e.to_string()));
+                }
+            }
+        }
+        let blob = Value::Object(record);
+        if let Err(e) = mem
+            .remember(&project, "research_note", &id, &blob.to_string())
+            .await
+        {
+            return err(e.to_string());
+        }
+        notes.push(blob);
+    }
+
+    ToolResponse {
+        ok: true,
+        data: json!({"ingested": notes.len(), "notes": notes}),
+        next_suggested: vec![
+            "pipeline_plan.feasibility".into(),
+            "pipeline_plan.research_notes_list".into(),
+        ],
+        memory_refs: notes
+            .iter()
+            .filter_map(|n| {
+                n.get("id")
+                    .and_then(Value::as_str)
+                    .map(|i| format!("note:{i}"))
+            })
+            .collect(),
+        error: None,
+    }
+}
+
+async fn research_notes_list(state: Arc<ServerState>) -> ToolResponse {
+    let project = match cfg_project(&state).await {
+        Ok(p) => p,
+        Err(e) => return err(e),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(e),
+    };
+    let pairs = mem
+        .list_scope(&project, "research_note")
+        .await
+        .unwrap_or_default();
+    let notes: Vec<Value> = pairs
+        .into_iter()
+        .filter_map(|(_, v)| serde_json::from_str::<Value>(&v).ok())
+        .map(|n| {
+            json!({
+                "id": n.get("id"),
+                "url": n.get("url"),
+                "kind": n.get("kind"),
+                "title": n.get("title"),
+                "ts": n.get("ts"),
+            })
+        })
+        .collect();
+    ToolResponse::ok(json!({"notes": notes, "count": notes.len()}))
+}
+
+async fn research_notes_show(args: Value, state: Arc<ServerState>) -> ToolResponse {
+    let id = match args.get("id").and_then(Value::as_str) {
+        Some(s) => s.to_owned(),
+        None => return err("missing 'id'".into()),
+    };
+    let project = match cfg_project(&state).await {
+        Ok(p) => p,
+        Err(e) => return err(e),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(e),
+    };
+    match mem.recall(&project, "research_note", &id).await {
+        Ok(Some(s)) => match serde_json::from_str::<Value>(&s) {
+            Ok(v) => ToolResponse::ok(v),
+            Err(e) => err(format!("corrupt note: {e}")),
+        },
+        Ok(None) => err(format!("note '{id}' not found")),
+        Err(e) => err(e.to_string()),
+    }
+}
+
+#[allow(clippy::too_many_lines)] // single self-contained orchestrator · splitting hurts readability
+async fn feasibility(args: Value, state: Arc<ServerState>) -> ToolResponse {
+    let text = args
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let links: Vec<String> = args
+        .get("links")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let repos: Vec<String> = args
+        .get("repos")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let project = match cfg_project(&state).await {
+        Ok(p) => p,
+        Err(e) => return err(e),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(e),
+    };
+
+    // Gather corpus: input text + ingested research note excerpts for given URLs.
+    let mut corpus = text.to_lowercase();
+    let notes = mem
+        .list_scope(&project, "research_note")
+        .await
+        .unwrap_or_default();
+    let mut prior_art: Vec<Value> = Vec::new();
+    let link_set: std::collections::HashSet<&str> = links.iter().map(String::as_str).collect();
+    for (_, blob) in &notes {
+        if let Ok(v) = serde_json::from_str::<Value>(blob) {
+            let url = v.get("url").and_then(Value::as_str).unwrap_or("");
+            if link_set.is_empty() || link_set.contains(url) {
+                if let Some(excerpt) = v.get("excerpt").and_then(Value::as_str) {
+                    corpus.push(' ');
+                    corpus.push_str(&excerpt.to_lowercase());
+                }
+            }
+        }
+    }
+
+    // Cross-reference repos via existing digests.
+    for alias in &repos {
+        let digest_path = std::env::current_dir()
+            .unwrap_or_default()
+            .join(".pipeline/digests")
+            .join(format!("{alias}.json"));
+        if let Ok(text) = std::fs::read_to_string(&digest_path) {
+            if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                prior_art.push(json!({
+                    "alias": alias,
+                    "summary": v.get("summary").cloned(),
+                }));
+                if let Some(s) = v.get("summary") {
+                    corpus.push(' ');
+                    corpus.push_str(&s.to_string().to_lowercase());
+                }
+            }
+        }
+    }
+
+    let identified_stack = identify_stack(&corpus);
+    let core_capabilities = identify_capabilities(&corpus);
+    let gaps = if core_capabilities.is_empty() {
+        vec!["could not identify core capabilities from inputs".to_owned()]
+    } else if identified_stack.is_empty() {
+        vec!["no concrete stack signals · agent should pick a default".to_owned()]
+    } else {
+        Vec::new()
+    };
+
+    let verdict = match (core_capabilities.len(), prior_art.is_empty()) {
+        (0, _) => "needs_more_input",
+        (_, true) => "yes_with_caveats",
+        _ => "yes",
+    };
+
+    let plan_skeleton = json!({
+        "features": core_capabilities.iter().map(|c| json!({
+            "name": c,
+            "ac": [format!("Implements core {c} behavior"), "Has unit tests · green static stage"],
+        })).collect::<Vec<_>>(),
+        "milestones": [
+            json!({"name": "POC", "exit_criteria": ["pipeline_run.stage(fast) green"]}),
+            json!({"name": "MVP", "exit_criteria": ["pipeline_run.preflight green", "deploy to staging"]}),
+            json!({"name": "v1", "exit_criteria": ["health green for 7 days unattended"]}),
+        ],
+    });
+
+    let n = core_capabilities.len();
+    let effort_estimate = json!({
+        "poc": format!("{}w", n.div_ceil(2) + 1),
+        "mvp": format!("{}w", n + 2),
+        "v1": format!("{}w", n * 2 + 4),
+    });
+
+    ToolResponse {
+        ok: true,
+        data: json!({
+            "verdict": verdict,
+            "identified_stack": identified_stack,
+            "core_capabilities": core_capabilities,
+            "gaps": gaps,
+            "prior_art": prior_art,
+            "plan_skeleton": plan_skeleton,
+            "effort_estimate": effort_estimate,
+            "inputs": {
+                "text_chars": text.len(),
+                "links": links.len(),
+                "repos": repos.len(),
+                "notes_considered": notes.len(),
+            },
+        }),
+        next_suggested: vec![
+            "pipeline_plan.create".into(),
+            "pipeline_plan.prd_write".into(),
+            "pipeline_plan.features_add".into(),
+        ],
+        memory_refs: vec![],
+        error: None,
+    }
+}
+
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // already lowercased above
+fn classify_url(url: &str) -> &'static str {
+    let l = url.to_lowercase();
+    if l.contains("github.com/") || l.ends_with(".git") {
+        "github"
+    } else if l.contains("gitlab.com/") {
+        "gitlab"
+    } else if l.contains("bitbucket.org/") {
+        "bitbucket"
+    } else if l.starts_with("git://") || l.starts_with("git@") {
+        "git"
+    } else if l.contains("arxiv.org/") {
+        "paper"
+    } else if l.contains("youtube.com/") || l.contains("youtu.be/") {
+        "video"
+    } else if l.contains("/docs") || l.contains("docs.") {
+        "docs"
+    } else if l.contains("medium.com/") || l.contains("dev.to/") || l.contains("substack.com/") {
+        "blog"
+    } else if l.contains("npmjs.com/") || l.contains("crates.io/") || l.contains("pypi.org/") {
+        "package"
+    } else if l.contains("twitter.com/") || l.contains("x.com/") {
+        "social"
+    } else {
+        "article"
+    }
+}
+
+fn extract_title(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    if let Some(start) = lower.find("<title") {
+        if let Some(gt) = lower[start..].find('>') {
+            let after = &html[start + gt + 1..];
+            if let Some(end) = after.to_ascii_lowercase().find("</title>") {
+                return after[..end].trim().to_owned();
+            }
+        }
+    }
+    String::new()
+}
+
+fn extract_text(html: &str) -> String {
+    // Strip <script> + <style> blocks, then all tags, then collapse whitespace.
+    let no_script = strip_block(html, "<script", "</script>");
+    let no_style = strip_block(&no_script, "<style", "</style>");
+    let tag_re = regex::Regex::new(r"(?s)<[^>]+>").unwrap();
+    let no_tags = tag_re.replace_all(&no_style, " ").into_owned();
+    let ws_re = regex::Regex::new(r"\s+").unwrap();
+    ws_re.replace_all(&no_tags, " ").trim().to_owned()
+}
+
+fn strip_block(input: &str, open: &str, close: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    let open_l = open.to_ascii_lowercase();
+    let close_l = close.to_ascii_lowercase();
+    let mut out = String::with_capacity(input.len());
+    let mut idx = 0usize;
+    while idx < input.len() {
+        if let Some(found) = lower[idx..].find(&open_l) {
+            let start = idx + found;
+            out.push_str(&input[idx..start]);
+            if let Some(rel_end) = lower[start..].find(&close_l) {
+                idx = start + rel_end + close_l.len();
+            } else {
+                idx = input.len();
+            }
+        } else {
+            out.push_str(&input[idx..]);
+            break;
+        }
+    }
+    out
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_owned()
+    } else {
+        format!("{}...", &s[..max])
+    }
+}
+
+const STACKS: &[(&str, &[&str])] = &[
+    ("rust", &["rust", "cargo", "tokio", "axum", "actix"]),
+    (
+        "python",
+        &["python", "django", "flask", "fastapi", "uv ", "pip "],
+    ),
+    (
+        "typescript",
+        &[
+            "typescript",
+            " ts ",
+            "node.js",
+            "nodejs",
+            "bun",
+            "deno",
+            "react",
+            "next.js",
+        ],
+    ),
+    ("go", &["golang", " go ", "go module"]),
+    ("postgres", &["postgres", "postgresql"]),
+    ("redis", &["redis"]),
+    ("kafka", &["kafka"]),
+    ("nats", &["nats.io", " nats "]),
+    ("mongo", &["mongo", "mongodb"]),
+    ("clickhouse", &["clickhouse"]),
+    ("stripe", &["stripe"]),
+    ("kubernetes", &["kubernetes", "k8s", "kubectl"]),
+    ("docker", &["docker", "container", "compose"]),
+    ("playwright", &["playwright"]),
+];
+
+const CAPABILITIES: &[(&str, &[&str])] = &[
+    (
+        "auth",
+        &["authentication", "auth ", "oauth", "jwt", "login"],
+    ),
+    ("rate-limit", &["rate limit", "rate-limit", "throttling"]),
+    ("billing", &["billing", "invoicing", "subscription"]),
+    ("metering", &["metering", "usage tracking"]),
+    ("rating", &["rating engine", "pricing rule"]),
+    ("queue", &["queue", "message broker", "background job"]),
+    ("webhook", &["webhook"]),
+    (
+        "search",
+        &[
+            "full-text search",
+            "elasticsearch",
+            "opensearch",
+            " search ",
+        ],
+    ),
+    (
+        "multi-tenant",
+        &["multi-tenant", "multi tenant", "tenant isolation"],
+    ),
+    ("analytics", &["analytics", "reporting"]),
+    ("notifications", &["notification", "email send", "sms"]),
+    ("file-upload", &["file upload", "object storage", "s3"]),
+    ("real-time", &["websocket", "real-time", "realtime"]),
+    ("audit-log", &["audit log", "audit trail"]),
+];
+
+fn identify_stack(corpus: &str) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for (name, keywords) in STACKS {
+        if keywords.iter().any(|k| corpus.contains(k)) {
+            out.push(*name);
+        }
+    }
+    out
+}
+
+fn identify_capabilities(corpus: &str) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for (name, keywords) in CAPABILITIES {
+        if keywords.iter().any(|k| corpus.contains(k)) {
+            out.push(*name);
+        }
+    }
+    out
 }
 
 // ---------- helpers ----------
