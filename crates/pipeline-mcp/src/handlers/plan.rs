@@ -17,7 +17,7 @@
 
 use crate::handlers::{ensure_memory, load_config_in_cwd};
 use crate::server::ServerState;
-use crate::tools::{ToolName, ToolRequest, ToolResponse};
+use crate::tools::{ToolRequest, ToolResponse};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -44,7 +44,7 @@ pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
         "feasibility" => feasibility(req.args, state).await,
         "research_notes_list" => research_notes_list(state).await,
         "research_notes_show" => research_notes_show(req.args, state).await,
-        "estimate" => ToolResponse::not_implemented(ToolName::Plan, &req.action),
+        "estimate" => estimate(req.args, state).await,
         other => err(format!("unknown action 'pipeline_plan.{other}'")),
     }
 }
@@ -522,6 +522,79 @@ async fn risk_add(args: Value, state: Arc<ServerState>) -> ToolResponse {
         return err(e.to_string());
     }
     ToolResponse::ok(risk)
+}
+
+async fn estimate(args: Value, state: Arc<ServerState>) -> ToolResponse {
+    // Heuristic: cost from feature.ac_count + complexity tag, scoped to one
+    // feature_id or aggregated across all features.
+    let feature_id = args.get("feature_id").and_then(Value::as_str);
+    let project = match cfg_project(&state).await {
+        Ok(p) => p,
+        Err(e) => return err(e),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(e),
+    };
+
+    let pairs = mem
+        .list_scope(&project, "feature")
+        .await
+        .unwrap_or_default();
+    let features: Vec<Value> = pairs
+        .into_iter()
+        .filter_map(|(_, v)| serde_json::from_str::<Value>(&v).ok())
+        .filter(|f| match feature_id {
+            Some(id) => f.get("id").and_then(Value::as_str) == Some(id),
+            None => true,
+        })
+        .collect();
+
+    if features.is_empty() {
+        return err("no features to estimate · call pipeline_plan.features_add first".into());
+    }
+
+    let mut total_hours: f64 = 0.0;
+    let mut per_feature: Vec<Value> = Vec::new();
+    for f in &features {
+        let ac_count = f.get("ac").and_then(Value::as_array).map_or(0, Vec::len);
+        let complexity = f
+            .get("complexity")
+            .and_then(Value::as_str)
+            .unwrap_or("medium");
+        // Base 4h per AC + complexity multiplier.
+        #[allow(clippy::cast_precision_loss)]
+        let base = ac_count as f64 * 4.0;
+        let mult: f64 = match complexity {
+            "trivial" => 0.5,
+            "small" => 1.0,
+            "large" => 2.5,
+            "epic" => 4.0,
+            // "medium" + unknown both default to 1.5
+            _ => 1.5,
+        };
+        let hours = base * mult + 2.0; // +2h baseline cost for any feature
+        total_hours += hours;
+        per_feature.push(json!({
+            "id": f.get("id"),
+            "name": f.get("name"),
+            "ac_count": ac_count,
+            "complexity": complexity,
+            "hours": hours,
+        }));
+    }
+
+    let days = (total_hours / 6.0).ceil(); // 6 productive hours/day
+    let weeks = (days / 5.0).ceil();
+    ToolResponse::ok(json!({
+        "scope": if feature_id.is_some() { "single_feature" } else { "all_features" },
+        "features_considered": features.len(),
+        "per_feature": per_feature,
+        "total_hours": total_hours,
+        "estimate_days": days,
+        "estimate_weeks": weeks,
+        "model": "4h × ac_count × complexity_mult + 2h baseline · 6h/day · 5d/week",
+    }))
 }
 
 async fn risk_list(state: Arc<ServerState>) -> ToolResponse {

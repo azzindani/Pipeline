@@ -8,7 +8,7 @@
 //! during MVP week 6.
 
 use crate::server::ServerState;
-use crate::tools::{ToolName, ToolRequest, ToolResponse};
+use crate::tools::{ToolRequest, ToolResponse};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,9 +22,9 @@ pub async fn handle(req: ToolRequest, _state: Arc<ServerState>) -> ToolResponse 
         "list" => list().await,
         "show" => show(&req.args).await,
         "recommend" => recommend(&req.args),
-        "apply" | "check" | "diff" => {
-            ToolResponse::not_implemented(ToolName::Standards, &req.action)
-        }
+        "apply" => apply(&req.args).await,
+        "check" => check(&req.args).await,
+        "diff" => diff(&req.args).await,
         other => err(format!("unknown action 'pipeline_standards.{other}'")),
     }
 }
@@ -280,6 +280,149 @@ fn push_unique<T: PartialEq>(v: &mut Vec<T>, item: T) {
     if !v.contains(&item) {
         v.push(item);
     }
+}
+
+async fn apply(args: &Value) -> ToolResponse {
+    let category = match args.get("category").and_then(Value::as_str) {
+        Some(c) => c.to_owned(),
+        None => return err("missing 'category'".into()),
+    };
+    let dir = match standards_dir() {
+        Ok(d) => d,
+        Err(e) => return err(e),
+    };
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    let category_dir = dir.join(&category);
+    if !category_dir.exists() {
+        return err(format!(
+            "category '{category}' not in standards · run pipeline_standards.fetch first"
+        ));
+    }
+    // Strategy: copy any non-doc artifacts (rustfmt.toml, clippy.toml,
+    // .editorconfig, .pre-commit-config.yaml, etc.) from category_dir into
+    // the project root. Skip files that already exist · agent decides
+    // whether to merge.
+    let mut applied: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut rd = match tokio::fs::read_dir(&category_dir).await {
+        Ok(rd) => rd,
+        Err(e) => return err(format!("read_dir: {e}")),
+    };
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "STANDARDS.md" || name == "README.md" {
+            continue;
+        }
+        let src = entry.path();
+        let dst = cwd.join(&name);
+        if dst.exists() {
+            skipped.push(name);
+            continue;
+        }
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        if meta.is_file() && tokio::fs::copy(&src, &dst).await.is_ok() {
+            applied.push(name);
+        }
+    }
+    ToolResponse::ok(json!({
+        "category": category,
+        "applied": applied,
+        "skipped": skipped,
+        "note": "skipped files exist already · agent should merge manually",
+    }))
+}
+
+async fn check(_args: &Value) -> ToolResponse {
+    let dir = match standards_dir() {
+        Ok(d) => d,
+        Err(e) => return err(e),
+    };
+    if !dir.exists() {
+        return err("standards not fetched · call pipeline_standards.fetch first".into());
+    }
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    // Run the existing `static` stage as a proxy: pipeline.yaml standards
+    // compliance ≈ formatting + lints clean. Real per-rule checks land at MVP.
+    let output = match Command::new("cargo")
+        .args(["fmt", "--all", "--", "--check"])
+        .current_dir(&cwd)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => return err(format!("cargo fmt: {e}")),
+    };
+    let fmt_ok = output.status.success();
+    let clippy_out = match Command::new("cargo")
+        .args([
+            "clippy",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
+        .current_dir(&cwd)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => return err(format!("cargo clippy: {e}")),
+    };
+    let clippy_ok = clippy_out.status.success();
+    let overall = fmt_ok && clippy_ok;
+    ToolResponse {
+        ok: overall,
+        data: json!({
+            "fmt": {"ok": fmt_ok, "exit_code": output.status.code().unwrap_or(-1)},
+            "clippy": {"ok": clippy_ok, "exit_code": clippy_out.status.code().unwrap_or(-1)},
+            "note": "Day-9 check ≈ static stage · per-category gap reports land at MVP",
+        }),
+        next_suggested: if overall {
+            vec!["pipeline_run.preflight".into()]
+        } else {
+            vec!["pipeline_run.fix_suggestion".into()]
+        },
+        memory_refs: vec![],
+        error: None,
+    }
+}
+
+async fn diff(args: &Value) -> ToolResponse {
+    let before = args.get("before").and_then(Value::as_str);
+    let after = args.get("after").and_then(Value::as_str).unwrap_or("HEAD");
+    let dir = match standards_dir() {
+        Ok(d) => d,
+        Err(e) => return err(e),
+    };
+    if !dir.exists() {
+        return err("standards not fetched".into());
+    }
+    let range = match before {
+        Some(b) => format!("{b}..{after}"),
+        None => after.to_owned(),
+    };
+    let output = match Command::new("git")
+        .args(["log", "--oneline", "--no-decorate", &range])
+        .current_dir(&dir)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => return err(format!("git log: {e}")),
+    };
+    ToolResponse::ok(json!({
+        "range": range,
+        "log": String::from_utf8_lossy(&output.stdout).into_owned(),
+    }))
 }
 
 fn err(msg: String) -> ToolResponse {

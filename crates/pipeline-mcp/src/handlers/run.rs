@@ -3,7 +3,7 @@
 
 use crate::handlers::{ensure_memory, load_config_in_cwd};
 use crate::server::ServerState;
-use crate::tools::{ToolName, ToolRequest, ToolResponse};
+use crate::tools::{ToolRequest, ToolResponse};
 use pipeline_core::{StageContext, StageProfile, StageStatus};
 use pipeline_memory::NewRun;
 use pipeline_stages::Runner;
@@ -20,7 +20,7 @@ pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
         "status" => status(state).await,
         "fix_suggestion" => fix_suggestion(&req.args, state).await,
         "explain" => explain(&req.args),
-        "logs" => ToolResponse::not_implemented(ToolName::Run, &req.action),
+        "logs" => logs(&req.args, state).await,
         other => err(format!("unknown action 'pipeline_run.{other}'")),
     }
 }
@@ -189,6 +189,41 @@ async fn status(state: Arc<ServerState>) -> ToolResponse {
         "recent_runs": recent.iter().map(|r| json!({
             "stage": r.stage, "status": r.status, "duration_ms": r.duration_ms,
             "created_at": r.created_at,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+async fn logs(args: &Value, state: Arc<ServerState>) -> ToolResponse {
+    let stage_filter = args.get("stage").and_then(Value::as_str);
+    let tail = args.get("tail").and_then(Value::as_i64).unwrap_or(20);
+    let cfg = match load_config_in_cwd() {
+        Ok(c) => c,
+        Err(e) => return err(format!("config: {e}")),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(format!("memory: {e}")),
+    };
+    let runs = mem
+        .run_history(&cfg.project, tail)
+        .await
+        .unwrap_or_default();
+    let filtered: Vec<&pipeline_memory::RunRecord> = runs
+        .iter()
+        .filter(|r| stage_filter.is_none_or(|s| r.stage == s))
+        .collect();
+    ToolResponse::ok(json!({
+        "stage": stage_filter,
+        "tail": tail,
+        "count": filtered.len(),
+        "runs": filtered.iter().map(|r| json!({
+            "id": r.id,
+            "stage": r.stage,
+            "status": r.status,
+            "duration_ms": r.duration_ms,
+            "created_at": r.created_at,
+            "stdout": r.stdout,
+            "stderr": r.stderr,
         })).collect::<Vec<_>>(),
     }))
 }

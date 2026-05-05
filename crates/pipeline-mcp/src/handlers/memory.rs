@@ -2,7 +2,7 @@
 
 use crate::handlers::{ensure_memory, load_config_in_cwd};
 use crate::server::ServerState;
-use crate::tools::{ToolName, ToolRequest, ToolResponse};
+use crate::tools::{ToolRequest, ToolResponse};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -14,7 +14,8 @@ pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
         "suggest_fix" => suggest_fix(req.args, state).await,
         "known_issues" => known_issues(state).await,
         "pattern_report" => pattern_report(state).await,
-        "export" | "import" => ToolResponse::not_implemented(ToolName::Memory, &req.action),
+        "export" => export(req.args, state).await,
+        "import" => import(req.args, state).await,
         other => err(format!("unknown action 'pipeline_memory.{other}'")),
     }
 }
@@ -182,6 +183,169 @@ async fn history(args: Value, state: Arc<ServerState>) -> ToolResponse {
         }
         Err(e) => err(e.to_string()),
     }
+}
+
+async fn export(args: Value, state: Arc<ServerState>) -> ToolResponse {
+    let format = args.get("format").and_then(Value::as_str).unwrap_or("json");
+    let cfg = match load_config_in_cwd() {
+        Ok(c) => c,
+        Err(e) => return err(e),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(e),
+    };
+
+    // Collect all known scopes into a single bundle.
+    let scopes = [
+        "plan",
+        "feature",
+        "milestone",
+        "decision",
+        "risk",
+        "persona",
+        "journey",
+        "use_case",
+        "research_note",
+        "checkpoint",
+        "perf_baseline",
+    ];
+    let mut bundle = serde_json::Map::new();
+    for s in scopes {
+        let pairs = mem.list_scope(&cfg.project, s).await.unwrap_or_default();
+        let entries: Vec<Value> = pairs
+            .into_iter()
+            .filter_map(|(k, v)| {
+                serde_json::from_str::<Value>(&v)
+                    .ok()
+                    .map(|val| json!({"key": k, "value": val}))
+            })
+            .collect();
+        bundle.insert(s.into(), json!(entries));
+    }
+    let runs = mem
+        .run_history(&cfg.project, 1_000)
+        .await
+        .unwrap_or_default();
+    bundle.insert("runs".into(), json!(runs));
+
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let path = cwd.join(".pipeline").join(format!("export.{format}"));
+    if let Some(parent) = path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    let body = match format {
+        "json" => serde_json::to_string_pretty(&bundle).unwrap_or_else(|_| "{}".into()),
+        "markdown" => render_export_markdown(&bundle),
+        "llm_context" => render_export_llm(&bundle),
+        other => {
+            return err(format!(
+                "unsupported format '{other}' · json|markdown|llm_context"
+            ));
+        }
+    };
+    if let Err(e) = tokio::fs::write(&path, &body).await {
+        return err(format!("write: {e}"));
+    }
+    ToolResponse::ok(json!({
+        "format": format,
+        "path": path.display().to_string(),
+        "scopes": scopes.len(),
+        "bytes": body.len(),
+    }))
+}
+
+async fn import(args: Value, state: Arc<ServerState>) -> ToolResponse {
+    let path_str = match args.get("path").and_then(Value::as_str) {
+        Some(p) => p.to_owned(),
+        None => return err("missing 'path' (must be json export)".into()),
+    };
+    let cfg = match load_config_in_cwd() {
+        Ok(c) => c,
+        Err(e) => return err(e),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(e),
+    };
+    let raw = match tokio::fs::read_to_string(&path_str).await {
+        Ok(s) => s,
+        Err(e) => return err(format!("read: {e}")),
+    };
+    let bundle: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => return err(format!("parse: {e}")),
+    };
+
+    let mut imported = 0usize;
+    let mut overwrite = 0usize;
+    if let Some(obj) = bundle.as_object() {
+        for (scope, entries) in obj {
+            if scope == "runs" {
+                continue; // runs are append-only, skip on import
+            }
+            if let Some(arr) = entries.as_array() {
+                for entry in arr {
+                    let (Some(k), Some(v)) =
+                        (entry.get("key").and_then(Value::as_str), entry.get("value"))
+                    else {
+                        continue;
+                    };
+                    if mem
+                        .recall(&cfg.project, scope, k)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some()
+                    {
+                        overwrite += 1;
+                    }
+                    if mem
+                        .remember(&cfg.project, scope, k, &v.to_string())
+                        .await
+                        .is_ok()
+                    {
+                        imported += 1;
+                    }
+                }
+            }
+        }
+    }
+    ToolResponse::ok(json!({
+        "imported": imported,
+        "overwrote": overwrite,
+        "from": path_str,
+    }))
+}
+
+fn render_export_markdown(bundle: &serde_json::Map<String, Value>) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from("# Pipeline memory export\n\n");
+    for (scope, entries) in bundle {
+        writeln!(out, "## {scope}").ok();
+        if let Some(arr) = entries.as_array() {
+            writeln!(out, "{} entries\n", arr.len()).ok();
+        } else {
+            writeln!(out, "{entries}\n").ok();
+        }
+    }
+    out
+}
+
+fn render_export_llm(bundle: &serde_json::Map<String, Value>) -> String {
+    // Pre-chunked, prefixed with scope tags · easy to inject into any model context.
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for (scope, entries) in bundle {
+        if let Some(arr) = entries.as_array() {
+            for entry in arr {
+                writeln!(out, "<{scope}>").ok();
+                writeln!(out, "{}", serde_json::to_string(entry).unwrap_or_default()).ok();
+                writeln!(out, "</{scope}>").ok();
+            }
+        }
+    }
+    out
 }
 
 fn err(msg: String) -> ToolResponse {

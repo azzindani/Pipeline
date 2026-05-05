@@ -2,7 +2,7 @@
 
 use crate::handlers::{ensure_memory, load_config_in_cwd};
 use crate::server::ServerState;
-use crate::tools::{ToolName, ToolRequest, ToolResponse};
+use crate::tools::{ToolRequest, ToolResponse};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -16,9 +16,9 @@ pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
         "start" => start(req.args, state).await,
         "checkpoint" => checkpoint(req.args, state).await,
         "agent_register" => agent_register(req.args, state).await,
-        "context" | "file_context" | "task_context" => {
-            ToolResponse::not_implemented(ToolName::Session, &req.action)
-        }
+        "context" => context(&req.args, state).await,
+        "file_context" => file_context(&req.args, state).await,
+        "task_context" => task_context(&req.args, state).await,
         other => unknown(other),
     }
 }
@@ -231,6 +231,132 @@ async fn handover(state: Arc<ServerState>) -> ToolResponse {
         Ok(pack) => ToolResponse::ok(serde_json::to_value(pack).unwrap_or(json!({}))),
         Err(e) => err(e.to_string()),
     }
+}
+
+async fn context(args: &Value, state: Arc<ServerState>) -> ToolResponse {
+    let scope = args.get("scope").and_then(Value::as_str);
+    let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(20);
+    let cfg = match load_config_in_cwd() {
+        Ok(c) => c,
+        Err(e) => return err(format!("config: {e}")),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(format!("memory: {e}")),
+    };
+    let pack = match mem.handover(&cfg.project).await {
+        Ok(p) => p,
+        Err(e) => return err(e.to_string()),
+    };
+    let mut data = json!({
+        "project": pack.project,
+        "active_session": pack.active_session,
+        "last_run": pack.last_run,
+        "recent_failures": pack.recent_failures,
+    });
+    if let Some(s) = scope {
+        let pairs = mem.list_scope(&cfg.project, s).await.unwrap_or_default();
+        let entries: Vec<Value> = pairs
+            .into_iter()
+            .take(limit.max(0).try_into().unwrap_or(usize::MAX))
+            .filter_map(|(k, v)| {
+                serde_json::from_str::<Value>(&v)
+                    .ok()
+                    .map(|val| json!({"key": k, "value": val}))
+            })
+            .collect();
+        data["scope"] = json!(s);
+        data["entries"] = json!(entries);
+    }
+    ToolResponse::ok(data)
+}
+
+async fn file_context(args: &Value, state: Arc<ServerState>) -> ToolResponse {
+    let path = match args.get("path").and_then(Value::as_str) {
+        Some(p) => p.to_owned(),
+        None => return err("missing 'path'".into()),
+    };
+    let cfg = match load_config_in_cwd() {
+        Ok(c) => c,
+        Err(e) => return err(format!("config: {e}")),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(format!("memory: {e}")),
+    };
+    // Search recent runs for stderr/stdout mentioning the file path.
+    let runs = mem.run_history(&cfg.project, 20).await.unwrap_or_default();
+    let mut hits: Vec<Value> = Vec::new();
+    for r in &runs {
+        let mention = r.stderr.as_deref().is_some_and(|s| s.contains(&path))
+            || r.stdout.as_deref().is_some_and(|s| s.contains(&path));
+        if mention {
+            hits.push(json!({
+                "run_id": r.id,
+                "stage": r.stage,
+                "status": r.status,
+                "created_at": r.created_at,
+            }));
+        }
+    }
+    ToolResponse::ok(json!({
+        "path": path,
+        "mentioned_in_runs": hits.len(),
+        "runs": hits,
+    }))
+}
+
+async fn task_context(args: &Value, state: Arc<ServerState>) -> ToolResponse {
+    let description = match args.get("description").and_then(Value::as_str) {
+        Some(d) => d.to_owned(),
+        None => return err("missing 'description'".into()),
+    };
+    let cfg = match load_config_in_cwd() {
+        Ok(c) => c,
+        Err(e) => return err(format!("config: {e}")),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(format!("memory: {e}")),
+    };
+    // Match against feature names + research notes containing the description's words.
+    let needle = description.to_lowercase();
+    let features = mem
+        .list_scope(&cfg.project, "feature")
+        .await
+        .unwrap_or_default();
+    let matched_features: Vec<Value> = features
+        .into_iter()
+        .filter_map(|(_, v)| serde_json::from_str::<Value>(&v).ok())
+        .filter(|f| {
+            let name = f.get("name").and_then(Value::as_str).unwrap_or("");
+            let desc = f.get("description").and_then(Value::as_str).unwrap_or("");
+            name.to_lowercase().contains(&needle) || desc.to_lowercase().contains(&needle)
+        })
+        .collect();
+
+    let notes = mem
+        .list_scope(&cfg.project, "research_note")
+        .await
+        .unwrap_or_default();
+    let matched_notes: Vec<Value> = notes
+        .into_iter()
+        .filter_map(|(_, v)| serde_json::from_str::<Value>(&v).ok())
+        .filter(|n| {
+            n.get("excerpt")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.to_lowercase().contains(&needle))
+                || n.get("title")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.to_lowercase().contains(&needle))
+        })
+        .collect();
+
+    ToolResponse::ok(json!({
+        "description": description,
+        "features": matched_features,
+        "research_notes": matched_notes,
+    }))
 }
 
 fn err(msg: String) -> ToolResponse {
