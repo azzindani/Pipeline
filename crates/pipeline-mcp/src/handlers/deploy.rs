@@ -6,7 +6,7 @@
 #![allow(clippy::doc_markdown)]
 
 use crate::server::ServerState;
-use crate::tools::{ToolName, ToolRequest, ToolResponse};
+use crate::tools::{ToolRequest, ToolResponse};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::process::Command;
@@ -17,9 +17,10 @@ pub async fn handle(req: ToolRequest, _state: Arc<ServerState>) -> ToolResponse 
         "target" => target(&req.args).await,
         "smoke" | "health" => health(&req.args).await,
         "release_create" => release_create(&req.args).await,
-        "rollback" | "canary" | "blue_green" | "diff" => {
-            ToolResponse::not_implemented(ToolName::Deploy, &req.action)
-        }
+        "rollback" => rollback(&req.args).await,
+        "canary" => canary(&req.args).await,
+        "blue_green" => blue_green(&req.args).await,
+        "diff" => diff(&req.args).await,
         other => err(format!("unknown action 'pipeline_deploy.{other}'")),
     }
 }
@@ -184,6 +185,94 @@ async fn release_create(args: &Value) -> ToolResponse {
             ))
         },
     }
+}
+
+async fn rollback(args: &Value) -> ToolResponse {
+    let env = args.get("env").and_then(Value::as_str).unwrap_or("staging");
+    let to = args.get("to").and_then(Value::as_str);
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    // Strategy: previous git tag · or explicit `to`. Reset image tag pointer.
+    let target_tag = match to {
+        Some(t) => t.to_owned(),
+        None => match Command::new("git")
+            .args(["describe", "--tags", "--abbrev=0", "HEAD~1"])
+            .current_dir(&cwd)
+            .output()
+            .await
+        {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_owned(),
+            _ => return err("could not resolve previous tag · pass 'to'".into()),
+        },
+    };
+    ToolResponse::ok(json!({
+        "env": env,
+        "rolled_back_to": target_tag,
+        "next": "agent re-runs deploy.target with this tag",
+    }))
+}
+
+#[allow(clippy::unused_async)]
+async fn canary(args: &Value) -> ToolResponse {
+    let env = args
+        .get("env")
+        .and_then(Value::as_str)
+        .unwrap_or("production");
+    let percent = args.get("percent").and_then(Value::as_u64).unwrap_or(10);
+    if percent > 100 {
+        return err("percent must be 0-100".into());
+    }
+    ToolResponse::ok(json!({
+        "env": env,
+        "canary_percent": percent,
+        "stable_percent": 100 - percent,
+        "note": "Day-9b · returns the split decision · agent applies via traffic router (nginx/envoy/ingress)",
+    }))
+}
+
+#[allow(clippy::unused_async)]
+async fn blue_green(args: &Value) -> ToolResponse {
+    let env = args
+        .get("env")
+        .and_then(Value::as_str)
+        .unwrap_or("production");
+    let active = args.get("active").and_then(Value::as_str).unwrap_or("blue");
+    let next = if active == "blue" { "green" } else { "blue" };
+    ToolResponse::ok(json!({
+        "env": env,
+        "active": active,
+        "switching_to": next,
+        "note": "Day-9b · returns the swap decision · agent flips the load balancer",
+    }))
+}
+
+async fn diff(args: &Value) -> ToolResponse {
+    let env = args.get("env").and_then(Value::as_str).unwrap_or("staging");
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    // Compare current HEAD vs latest tag · approximates "what's not yet deployed".
+    let output = match Command::new("git")
+        .args([
+            "log",
+            "--oneline",
+            "$(git describe --tags --abbrev=0)..HEAD",
+        ])
+        .current_dir(&cwd)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => return err(format!("git log: {e}")),
+    };
+    ToolResponse::ok(json!({
+        "env": env,
+        "log": String::from_utf8_lossy(&output.stdout).into_owned(),
+        "stderr": String::from_utf8_lossy(&output.stderr).into_owned(),
+    }))
 }
 
 const GITHUB_DEPLOY: &str = "name: deploy\n\non:\n  push:\n    tags:\n      - 'v*'\n  workflow_dispatch:\n    inputs:\n      env:\n        description: 'staging | production'\n        required: true\n        default: 'staging'\n\njobs:\n  deploy:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - name: docker login ghcr\n        uses: docker/login-action@v3\n        with:\n          registry: ghcr.io\n          username: ${{ github.actor }}\n          password: ${{ secrets.GITHUB_TOKEN }}\n      - name: build + push\n        run: |\n          IMAGE=ghcr.io/${{ github.repository }}:${{ github.sha }}\n          docker build -t \"$IMAGE\" .\n          docker push \"$IMAGE\"\n      - name: deploy\n        run: echo \"TODO: ssh+compose deploy to ${{ inputs.env || 'staging' }}\"\n";

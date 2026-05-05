@@ -5,7 +5,7 @@
 #![allow(clippy::doc_markdown)]
 
 use crate::server::ServerState;
-use crate::tools::{ToolName, ToolRequest, ToolResponse};
+use crate::tools::{ToolRequest, ToolResponse};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::process::Command;
@@ -14,9 +14,10 @@ pub async fn handle(req: ToolRequest, _state: Arc<ServerState>) -> ToolResponse 
     match req.action.as_str() {
         "generate" => generate(&req.args).await,
         "changelog" => changelog(&req.args).await,
-        "update_from_code" | "diagram" | "publish" | "spec_generate" => {
-            ToolResponse::not_implemented(ToolName::Docs, &req.action)
-        }
+        "update_from_code" => update_from_code(&req.args).await,
+        "diagram" => diagram(&req.args).await,
+        "publish" => publish(&req.args).await,
+        "spec_generate" => spec_generate(&req.args).await,
         other => err(format!("unknown action 'pipeline_docs.{other}'")),
     }
 }
@@ -102,6 +103,155 @@ const ONBOARDING_TEMPLATE: &str = "# Onboarding\n\n## Day 1\n\n## Day 7\n\n## Da
 const API_TEMPLATE: &str = "# API\n\n## Endpoints\n\n## Errors\n\n## Auth\n";
 const ARCH_TEMPLATE: &str =
     "# Architecture\n\n## Components\n\n## Data flow\n\n## Trust boundaries\n";
+
+async fn update_from_code(_args: &Value) -> ToolResponse {
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    // Best-effort: regenerate cargo doc · the agent then merges into READMEs.
+    let output = match Command::new("cargo")
+        .args(["doc", "--workspace", "--no-deps"])
+        .current_dir(&cwd)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => return err(format!("cargo doc: {e}")),
+    };
+    let ok = output.status.success();
+    ToolResponse {
+        ok,
+        data: json!({
+            "command": "cargo doc --workspace --no-deps",
+            "exit_code": output.status.code().unwrap_or(-1),
+            "out_dir": cwd.join("target/doc").display().to_string(),
+        }),
+        next_suggested: vec!["pipeline_docs.publish".into()],
+        memory_refs: vec![],
+        error: if ok {
+            None
+        } else {
+            Some("cargo doc failed".into())
+        },
+    }
+}
+
+#[allow(clippy::unused_async)]
+async fn diagram(args: &Value) -> ToolResponse {
+    let kind = args.get("kind").and_then(Value::as_str).unwrap_or("arch");
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    let dir = cwd.join("docs/diagrams");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return err(format!("mkdir: {e}"));
+    }
+    let path = dir.join(format!("{kind}.mmd"));
+    if path.exists() {
+        return err(format!("refusing to overwrite {}", path.display()));
+    }
+    let body = match kind {
+        "arch" => {
+            "graph TD\n    A[Agent] -->|MCP| B[Pipeline]\n    B --> C[Stages]\n    B --> D[Memory]\n    B --> E[Docker]\n"
+        }
+        "sequence" => {
+            "sequenceDiagram\n    Agent->>Pipeline: pipeline_session.lock\n    Pipeline-->>Agent: handover packet\n    Agent->>Pipeline: pipeline_run.stage(fast)\n    Pipeline-->>Agent: result\n"
+        }
+        "er" => {
+            "erDiagram\n    PROJECT ||--o{ SESSION : has\n    SESSION ||--o{ RUN : produces\n    RUN ||--o{ FAILURE : may_have\n"
+        }
+        "c4" => {
+            "C4Context\n    Person(agent, \"Coding Agent\")\n    System(pipeline, \"Pipeline\", \"Local-first CI/CD\")\n    Rel(agent, pipeline, \"MCP\")\n"
+        }
+        other => return err(format!("unknown kind '{other}' · arch|sequence|er|c4")),
+    };
+    if let Err(e) = std::fs::write(&path, body) {
+        return err(format!("write: {e}"));
+    }
+    ToolResponse::ok(json!({"kind": kind, "path": path.display().to_string(), "format": "mermaid"}))
+}
+
+async fn publish(args: &Value) -> ToolResponse {
+    let target = args
+        .get("target")
+        .and_then(Value::as_str)
+        .unwrap_or("github-pages");
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    // Try mkdocs · falls back to a helpful note.
+    let output = Command::new("mkdocs")
+        .args(["build", "-d", "site"])
+        .current_dir(&cwd)
+        .output()
+        .await;
+    match output {
+        Ok(o) if o.status.success() => ToolResponse::ok(json!({
+            "target": target,
+            "site_dir": cwd.join("site").display().to_string(),
+            "next": "publish site/ to your hosting target (Pages, S3, Cloudflare...)",
+        })),
+        Ok(o) => err(format!(
+            "mkdocs build failed: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(_) => ToolResponse::ok(json!({
+            "target": target,
+            "note": "mkdocs not installed · install with `pip install mkdocs` or use your preferred publisher",
+        })),
+    }
+}
+
+#[allow(clippy::unused_async)]
+async fn spec_generate(args: &Value) -> ToolResponse {
+    let format = args
+        .get("format")
+        .and_then(Value::as_str)
+        .unwrap_or("openapi");
+    let source = args
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("manual");
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    let dir = cwd.join("specs");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return err(format!("mkdir: {e}"));
+    }
+    let (path, body) = match format {
+        "openapi" => (
+            dir.join("openapi.yaml"),
+            "openapi: 3.1.0\ninfo:\n  title: Generated API\n  version: 0.0.1\npaths:\n  /health:\n    get:\n      responses:\n        '200':\n          description: ok\n",
+        ),
+        "jsonschema" => (
+            dir.join("schema.json"),
+            "{\n  \"$schema\": \"https://json-schema.org/draft/2020-12/schema\",\n  \"type\": \"object\",\n  \"properties\": {}\n}\n",
+        ),
+        "asyncapi" => (
+            dir.join("asyncapi.yaml"),
+            "asyncapi: 3.0.0\ninfo:\n  title: Generated AsyncAPI\n  version: 0.0.1\nchannels: {}\n",
+        ),
+        "protobuf" => (
+            dir.join("schema.proto"),
+            "syntax = \"proto3\";\npackage app;\n\nmessage Health { string status = 1; }\n",
+        ),
+        other => return err(format!("unsupported format '{other}'")),
+    };
+    if path.exists() {
+        return err(format!("refusing to overwrite {}", path.display()));
+    }
+    if let Err(e) = std::fs::write(&path, body) {
+        return err(format!("write: {e}"));
+    }
+    ToolResponse::ok(
+        json!({"format": format, "source": source, "path": path.display().to_string()}),
+    )
+}
 
 fn err(msg: String) -> ToolResponse {
     ToolResponse {

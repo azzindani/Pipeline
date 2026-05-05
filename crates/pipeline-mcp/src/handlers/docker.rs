@@ -7,7 +7,7 @@
 #![allow(clippy::doc_markdown)]
 
 use crate::server::ServerState;
-use crate::tools::{ToolName, ToolRequest, ToolResponse};
+use crate::tools::{ToolRequest, ToolResponse};
 use pipeline_docker::CommandOutput;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
@@ -29,9 +29,9 @@ pub async fn handle(req: ToolRequest, _state: Arc<ServerState>) -> ToolResponse 
         "image_push" => image_push(&req.args).await,
         "image_pull" => image_pull(&req.args).await,
         "dockerfile_lint" => dockerfile_lint(&req.args).await,
-        "image_scan" | "image_promote" | "dockerfile_generate" => {
-            ToolResponse::not_implemented(ToolName::Docker, &req.action)
-        }
+        "image_scan" => image_scan(&req.args).await,
+        "image_promote" => image_promote(&req.args).await,
+        "dockerfile_generate" => dockerfile_generate(&req.args).await,
         other => err(format!("unknown action 'pipeline_docker.{other}'")),
     }
 }
@@ -310,6 +310,110 @@ fn truncate(s: &str, max: usize) -> String {
         t
     }
 }
+
+async fn image_scan(args: &Value) -> ToolResponse {
+    let image = match args.get("image").and_then(Value::as_str) {
+        Some(i) => i.to_owned(),
+        None => return err("missing 'image'".into()),
+    };
+    // Docker run trivy against the image.
+    match pipeline_docker::run_image(
+        "aquasec/trivy:latest",
+        &[
+            "image",
+            "--severity",
+            "CRITICAL,HIGH",
+            "--no-progress",
+            &image,
+        ],
+        &[],
+    )
+    .await
+    {
+        Ok(out) => command_output_response(&out, &format!("image_scan({image})")),
+        Err(e) => err(e.to_string()),
+    }
+}
+
+async fn image_promote(args: &Value) -> ToolResponse {
+    let image = match args.get("image").and_then(Value::as_str) {
+        Some(i) => i.to_owned(),
+        None => return err("missing 'image'".into()),
+    };
+    let registry = match args.get("registry").and_then(Value::as_str) {
+        Some(r) => r.to_owned(),
+        None => return err("missing 'registry' (e.g. ghcr.io/owner)".into()),
+    };
+    let tag = args.get("tag").and_then(Value::as_str).unwrap_or("latest");
+    // docker tag <image> <registry>/<image_basename>:<tag> · then push.
+    let basename = image.rsplit('/').next().unwrap_or(&image);
+    let stripped_tag = basename.split(':').next().unwrap_or(basename);
+    let target = format!("{registry}/{stripped_tag}:{tag}");
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    let tag_out = match tokio::process::Command::new("docker")
+        .args(["tag", &image, &target])
+        .current_dir(&cwd)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => return err(format!("docker tag: {e}")),
+    };
+    if !tag_out.status.success() {
+        return err(format!(
+            "docker tag failed: {}",
+            String::from_utf8_lossy(&tag_out.stderr).trim()
+        ));
+    }
+    match pipeline_docker::image_push(&target).await {
+        Ok(out) => command_output_response(&out, &format!("image_promote({target})")),
+        Err(e) => err(e.to_string()),
+    }
+}
+
+async fn dockerfile_generate(args: &Value) -> ToolResponse {
+    let stack = args.get("stack").and_then(Value::as_str).unwrap_or("rust");
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    let path = cwd.join("Dockerfile");
+    if path.exists() {
+        return err(format!(
+            "Dockerfile exists at {} · refusing to overwrite",
+            path.display()
+        ));
+    }
+    let body = match stack {
+        "rust" => RUST_DOCKERFILE,
+        "node" | "ts" | "typescript" => NODE_DOCKERFILE,
+        "bun" => BUN_DOCKERFILE,
+        "python" | "python-uv" | "uv" => PYTHON_DOCKERFILE,
+        "go" | "golang" => GO_DOCKERFILE,
+        other => return err(format!("no template for stack '{other}'")),
+    };
+    if let Err(e) = tokio::fs::write(&path, body).await {
+        return err(format!("write: {e}"));
+    }
+    ToolResponse::ok(json!({
+        "stack": stack,
+        "path": path.display().to_string(),
+        "next": "pipeline_docker.dockerfile_lint",
+    }))
+}
+
+const RUST_DOCKERFILE: &str = "FROM rust:1.94-slim-bookworm AS builder\nWORKDIR /usr/src/app\nRUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*\nCOPY . .\nRUN cargo build --release\n\nFROM debian:bookworm-slim\nRUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/* && useradd -r -u 10001 app\nCOPY --from=builder /usr/src/app/target/release/app /usr/local/bin/app\nUSER app\nENTRYPOINT [\"/usr/local/bin/app\"]\n";
+
+const NODE_DOCKERFILE: &str = "FROM node:22-bookworm-slim AS builder\nWORKDIR /app\nCOPY package*.json ./\nRUN npm ci\nCOPY . .\nRUN npm run build\n\nFROM node:22-bookworm-slim\nWORKDIR /app\nRUN useradd -r -u 10001 app\nCOPY --from=builder /app/dist ./dist\nCOPY --from=builder /app/node_modules ./node_modules\nCOPY package.json ./\nUSER app\nCMD [\"node\", \"dist/index.js\"]\n";
+
+const BUN_DOCKERFILE: &str = "FROM oven/bun:1 AS builder\nWORKDIR /app\nCOPY bun.lockb package.json ./\nRUN bun install --frozen-lockfile\nCOPY . .\nRUN bun build src/index.ts --outdir dist\n\nFROM oven/bun:1-slim\nWORKDIR /app\nRUN groupadd -r app && useradd -r -g app -u 10001 app\nCOPY --from=builder /app/dist ./dist\nUSER app\nCMD [\"bun\", \"dist/index.js\"]\n";
+
+const PYTHON_DOCKERFILE: &str = "FROM python:3.13-slim-bookworm AS builder\nWORKDIR /app\nRUN pip install --no-cache-dir uv\nCOPY pyproject.toml uv.lock ./\nRUN uv sync --frozen --no-dev\nCOPY . .\n\nFROM python:3.13-slim-bookworm\nWORKDIR /app\nRUN useradd -r -u 10001 app\nCOPY --from=builder /app /app\nENV PATH=/app/.venv/bin:$PATH\nUSER app\nCMD [\"python\", \"-m\", \"app\"]\n";
+
+const GO_DOCKERFILE: &str = "FROM golang:1.23-bookworm AS builder\nWORKDIR /usr/src/app\nCOPY go.* ./\nRUN go mod download\nCOPY . .\nRUN CGO_ENABLED=0 go build -o /out/app ./...\n\nFROM gcr.io/distroless/static-debian12\nCOPY --from=builder /out/app /app\nUSER 10001:10001\nENTRYPOINT [\"/app\"]\n";
 
 fn err(msg: String) -> ToolResponse {
     ToolResponse {
