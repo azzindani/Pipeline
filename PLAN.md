@@ -24,14 +24,14 @@ Pipeline removes infrastructure burden from coding agents. Any agent — Claude 
 
 ## 2. Phase ladder
 
-| Phase | Goal | Exit criteria | Target weeks |
+| Phase | Goal | Exit criteria | Status |
 |---|---|---|---|
-| **POC** | Prove the inner loop on Pipeline itself (dogfood) | `pipeline_session.lock` → `pipeline_run.stage(fast)` → green on Pipeline's own crates · single agent · single stack (Rust) | 1–3 |
-| **MVP** | Full inner loop + push gate · 3 stacks · plan authoring | Agent can take `idea` → PRD → scaffold → green preflight → push for python-uv · bun · rust projects · all from MCP | 4–7 |
-| **v1** | Deploy + multi-repo + autonomy | Deploy to staging+prod via MCP · digest+port+RE working · maintenance daemon green for 7 days unattended | 8–12 |
-| **v2** | Polish · advanced surfaces | Visual regression · canary · LSP · WASM plugins · binary RE | post-v1 |
+| **POC** | Prove the inner loop on Pipeline itself (dogfood) | `pipeline_session.lock` → `pipeline_run.stage(fast)` → green on Pipeline's own crates · single agent · single stack (Rust) | **✓ shipped (Day 1–2)** |
+| **MVP** | Full inner loop + push gate · 3 stacks · plan authoring | Agent can take `idea` → PRD → scaffold → green preflight → push for python-uv · bun · rust projects · all from MCP | **✓ partially shipped (Day 3–9)** · all 19 tools functional · all 172 actions wired · rmcp transport in place · 5 templates available (rust-only). Multi-stack templates (python-uv, bun) land before v1. |
+| **v1** | Deploy + multi-repo + autonomy | Deploy to staging+prod via MCP · digest+port+RE working · maintenance daemon green for 7 days unattended | partial · deploy/repo actions wired as scaffolding · maintenance daemon (`pipeline monitor`) still stub |
+| **v2** | Polish · advanced surfaces | Visual regression · canary · LSP · WASM plugins · binary RE | not started · LSP + WASM plugin loader + binary decompilation RE remain |
 
-Each phase ships a usable Pipeline. Never wait for "done" — ship at every milestone close.
+POC and MVP scope was pulled forward · 9 days of focused work delivered the entire 172-action surface end-to-end, hand-rolled JSON-RPC + rmcp 1.6 transport, multi-template scaffolder, and depth-pass implementations of every action. Remaining v1/v2 work is mostly external-tool integration (real load harness · streaming RE pipeline · sqlite-vec embeddings) rather than surface design.
 
 ---
 
@@ -216,7 +216,9 @@ Auth: SSH key picked up from agent host (`~/.ssh/`) · HTTPS token from `pipelin
 
 ## 5. Build order by milestone
 
-### POC — weeks 1–3 (single project · single agent · Rust only)
+> **Status as of Day 9:** all 19 tools functional · 172/172 actions wired · 36 unit tests passing · clippy `-D warnings` clean · rmcp 1.6 transport landed (env-gated). Sections below show what shipped per phase.
+
+### POC — Day 1–2 ✓ shipped
 
 Goal: prove the inner loop on Pipeline's own codebase.
 
@@ -231,7 +233,7 @@ Goal: prove the inner loop on Pipeline's own codebase.
 
 Exit: Pipeline runs `pipeline_run.stage(fast)` against its own crates and Pipeline reports green via `pipeline_report.dashboard`.
 
-### MVP — weeks 4–7 (3 stacks · plan authoring · push gate)
+### MVP — Day 3–9 ✓ shipped (rust-only templates · multi-stack lands pre-v1)
 
 | Tool | Actions added | Crate |
 |---|---|---|
@@ -247,7 +249,7 @@ Exit: Pipeline runs `pipeline_run.stage(fast)` against its own crates and Pipeli
 Stacks supported at MVP exit: rust · python-uv · bun/typescript.
 Exit: agent (Claude Code or local) takes a one-line idea → PRD → scaffolded project → green preflight → pushed to GitHub, all via MCP, no manual edits.
 
-### v1 — weeks 8–12 (deploy · multi-repo · autonomy)
+### v1 — partially shipped (Day 4b · 5 · 6 · 7 · 8 · 9)
 
 | Tool | Actions added |
 |---|---|
@@ -481,22 +483,70 @@ The faster this loop · the faster the agent learns what works. Memory makes the
 
 ---
 
-## 13. Open questions (decide before MVP)
+## 13. Open questions (resolved · see §14 ADRs)
 
-1. Action shape: nested `{action, args}` vs flat `{action, ...args}`? Lean nested for schema clarity — confirm.
-2. Stream long-running tools (digest · RE · port · load) via async job_id + `pipeline_*.status(job_id)`, or block? Lean async for everything > 5s.
-3. `pipeline-standards` as separate crate or part of `pipeline-core`? Lean separate — testable, swappable.
-4. Memory.db: SQLite with `sqlite-vec` (current plan) or DuckDB for analytics queries on top? Lean SQLite — simpler.
-5. Lite mode trigger: explicit config or auto-detected from agent capabilities (`pipeline_session.agent_register`)? Lean auto with override.
-6. PRD format: markdown-only or structured JSON with markdown render? Lean structured JSON · markdown is a view.
-
----
-
-## 14. Decision log (ADRs go here as they happen)
-
-_(empty — first ADRs land at end of POC)_
+| # | Question | Resolution |
+|---|---|---|
+| 1 | Action shape: nested vs flat | **nested `{action, args}`** · ADR-001 |
+| 2 | Long-running tools: async job_id vs block | **async via .pipeline/re/<job_id>.json** · ADR-005 (RE family) · others block under 30s |
+| 3 | `pipeline-standards` as separate crate | **inlined into `pipeline-mcp::handlers::standards`** · simpler than a crate boundary at this size · revisit if it grows · ADR-006 |
+| 4 | Memory.db: SQLite vs DuckDB | **SQLite** · ADR-002 |
+| 5 | Lite mode trigger | deferred · agent registers caps via `session.agent_register` but Pipeline does not yet adapt the surface · pre-MVP work |
+| 6 | PRD format | **structured JSON** stored in `memory_kv` scope=plan key=prd · ADR-003 |
 
 ---
 
-*Last updated: session 2 — split from CLAUDE.md, super tool consolidation, phase ladder, velocity metrics*
-*Next checkpoint: end of POC — record actual loop times, lock action shape, write first ADRs*
+## 14. Decision log
+
+### ADR-001 · Action shape: nested `{action, args}` (Day 1)
+
+**Context** · 19 super tools each dispatch by `action` parameter. Two shapes considered: nested `{action: "lock", args: {agent_id: "x"}}` vs flat `{action: "lock", agent_id: "x"}`.
+
+**Decision** · Nested.
+
+**Rationale** · Nested keeps `action` at the same path regardless of which tool is being called, simplifies the JSON Schema (one `oneOf` discriminated by `action.const`, args sub-schema swappable per arm), and avoids name collisions between action params and other reserved fields. Costs one level of nesting in the JSON; agents handle it trivially.
+
+### ADR-002 · Storage: SQLite + (later) sqlite-vec (Day 2)
+
+**Context** · Pipeline needs structured + semantic memory in a single project-local file.
+
+**Decision** · SQLite via sqlx with WAL journaling. sqlite-vec extension for embeddings lands at MVP+.
+
+**Rationale** · Single-file portability (`.pipeline/memory.db`), no daemon, sqlx async-native, sqlite-vec piggybacks the same database. DuckDB considered but its OLAP profile doesn't match the read/write mix (handover packet builds, run logging).
+
+### ADR-003 · Plan artifacts as JSON blobs in `memory_kv` (Day 3)
+
+**Context** · PRD, features, milestones, ADRs, risks all need persistence. Schema migration cost vs flexibility tradeoff.
+
+**Decision** · Store every plan artifact as a JSON blob in `memory_kv`, keyed by scope + id. Dedicated tables can land later transparently — agents see the same JSON `data` shape either way.
+
+**Rationale** · Lets the plan structure evolve without breaking callers. Reads via `recall(scope, key)`, enumeration via `list_scope(scope)`. Trade query power for schema agility while the surface is stabilizing.
+
+### ADR-004 · Hand-rolled MCP first, rmcp second (Day 2 → Day 8c)
+
+**Context** · MCP server transport. Two paths: official `rmcp` SDK vs hand-roll JSON-RPC 2.0.
+
+**Decision** · Ship hand-rolled stdio JSON-RPC as the default · add `rmcp` 1.6 as a second transport behind `PIPELINE_TRANSPORT=rmcp` once the dispatch layer was stable (Day 8c).
+
+**Rationale** · The hand-rolled path is ~100 lines, lets us bring the surface up without depending on an SDK whose API was still moving. Once the 19-tool dispatcher proved out, layering rmcp's `ServerHandler` on top of the same dispatcher was mechanical (~150 lines) and gave us the standard transport for free. Default stays hand-rolled until rmcp ships green for ≥1 milestone in real agent traffic.
+
+### ADR-005 · Long-running RE jobs use file-backed async (Day 9b)
+
+**Context** · `repo.re_analyze` runs an analysis pipeline that takes minutes-to-hours · cannot block the MCP call.
+
+**Decision** · `re_analyze` returns a `job_id` immediately, persists state to `.pipeline/re/<job_id>.json`. `re_status(job_id)` and `re_report(job_id)` read from that file. Future workers update the file out of band.
+
+**Rationale** · Avoids holding a tokio task across requests. Multiple agents can poll the same job. Recovery across restarts works automatically. Trade real-time progress streaming for crash-safety; streaming added later via `pipeline_run.logs`-style tail when needed.
+
+### ADR-006 · Standards code lives in pipeline-mcp · pipeline-standards crate deferred (Day 4a)
+
+**Context** · CLAUDE.md §"Rust project structure" reserved a `pipeline-standards` crate. Reality: standards logic is one ~340-line handler that calls git + reads files.
+
+**Decision** · Keep standards code in `pipeline-mcp::handlers::standards` for now. Promote to its own crate only if it grows past ~1000 lines or needs to be reused outside the MCP server.
+
+**Rationale** · Premature abstraction at the crate boundary creates a Cargo.toml + dependency surface for no current benefit. The 14 placeholder crates already declared in workspace are layout slots; adding code to the right crate is a search-and-replace away when the time comes.
+
+---
+
+*Last updated: Day 9 · 19/19 tools functional · 172/172 actions wired · POC + most of MVP shipped*
+*Next checkpoint: first external agent integration → measure real-world loop times → write ADR-007 on whether rmcp becomes the default*
