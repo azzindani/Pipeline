@@ -22,6 +22,12 @@ pub struct ServerState {
     pub project_id: Arc<Mutex<Option<String>>>,
     /// Memory handle, lazily opened on first `pipeline_session.lock`.
     pub memory: Arc<Mutex<Option<pipeline_memory::Memory>>>,
+    /// Identity of the agent on the other end of stdio · set by
+    /// `pipeline_session.agent_register`. Used as `agent_id` on session rows.
+    pub agent_id: Arc<Mutex<Option<String>>>,
+    /// Capabilities the agent advertised on register · informational only,
+    /// surfaces in handover packets.
+    pub agent_capabilities: Arc<Mutex<Vec<String>>>,
 }
 
 impl ServerState {

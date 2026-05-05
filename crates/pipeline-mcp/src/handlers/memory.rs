@@ -11,11 +11,96 @@ pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
         "remember" => remember(req.args, state).await,
         "recall" => recall(req.args, state).await,
         "history" => history(req.args, state).await,
-        "known_issues" | "suggest_fix" | "pattern_report" | "export" | "import" => {
-            ToolResponse::not_implemented(ToolName::Memory, &req.action)
-        }
+        "suggest_fix" => suggest_fix(req.args, state).await,
+        "known_issues" => known_issues(state).await,
+        "pattern_report" => pattern_report(state).await,
+        "export" | "import" => ToolResponse::not_implemented(ToolName::Memory, &req.action),
         other => err(format!("unknown action 'pipeline_memory.{other}'")),
     }
+}
+
+async fn suggest_fix(args: Value, state: Arc<ServerState>) -> ToolResponse {
+    let error_message = match args.get("error").and_then(Value::as_str) {
+        Some(e) => e.to_owned(),
+        None => return err("missing 'error'".into()),
+    };
+    let cfg = match load_config_in_cwd() {
+        Ok(c) => c,
+        Err(e) => return err(e),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(e),
+    };
+    let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(5);
+    let similar = match mem
+        .find_similar_failures(&cfg.project, &error_message, limit)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return err(e.to_string()),
+    };
+    let prior_fixes: Vec<Value> = similar
+        .iter()
+        .filter(|f| f.fix_worked == Some(1) && f.fix_applied.is_some())
+        .map(|f| {
+            json!({
+                "fix": f.fix_applied,
+                "stage": f.stage,
+                "ts": f.created_at,
+            })
+        })
+        .collect();
+    ToolResponse::ok(json!({
+        "matches": similar.len(),
+        "prior_fixes": prior_fixes,
+        "candidates": similar.iter().map(|f| json!({
+            "id": f.id,
+            "stage": f.stage,
+            "error_message": f.error_message,
+            "ts": f.created_at,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+async fn known_issues(state: Arc<ServerState>) -> ToolResponse {
+    let cfg = match load_config_in_cwd() {
+        Ok(c) => c,
+        Err(e) => return err(e),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(e),
+    };
+    let patterns = mem.failure_patterns(&cfg.project).await.unwrap_or_default();
+    let by_stage: Vec<Value> = patterns
+        .iter()
+        .map(|(stage, n)| json!({"stage": stage, "count": n}))
+        .collect();
+    ToolResponse::ok(json!({"by_stage": by_stage, "total_stages": patterns.len()}))
+}
+
+async fn pattern_report(state: Arc<ServerState>) -> ToolResponse {
+    // Same data as known_issues plus a coarse total count.
+    let cfg = match load_config_in_cwd() {
+        Ok(c) => c,
+        Err(e) => return err(e),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(e),
+    };
+    let patterns = mem.failure_patterns(&cfg.project).await.unwrap_or_default();
+    let total: i64 = patterns.iter().map(|(_, n)| *n).sum();
+    ToolResponse::ok(json!({
+        "total_failures": total,
+        "stages": patterns.iter().map(|(s, n)| json!({"stage": s, "count": n})).collect::<Vec<_>>(),
+        "tip": if total == 0 {
+            "no failures yet · this project has been green"
+        } else {
+            "look at the most-failing stage first · agent should add a check before that stage runs"
+        },
+    }))
 }
 
 async fn remember(args: Value, state: Arc<ServerState>) -> ToolResponse {

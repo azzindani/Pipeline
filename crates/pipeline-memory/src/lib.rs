@@ -407,6 +407,86 @@ impl Memory {
                 .await?;
         Ok(result.rows_affected() > 0)
     }
+
+    /// Find failures whose `error_message` contains any of `keywords`,
+    /// scoped to `project_id`. Cheap substring match; sqlite-vec lands at MVP.
+    pub async fn find_similar_failures(
+        &self,
+        project_id: &str,
+        error_message: &str,
+        limit: i64,
+    ) -> Result<Vec<FailureRecord>, MemoryError> {
+        let keywords = top_keywords(error_message, 4);
+        if keywords.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Build a dynamic query: one LIKE clause per keyword joined with OR.
+        let mut sql = String::from(
+            "SELECT f.id, f.run_id, f.stage, f.error_message, f.file, f.line,
+                    f.fix_applied, f.fix_worked, f.created_at
+             FROM failures f
+             JOIN pipeline_runs r ON r.id = f.run_id
+             WHERE r.project_id = ? AND (",
+        );
+        let conditions: Vec<&str> = keywords.iter().map(|_| "f.error_message LIKE ?").collect();
+        sql.push_str(&conditions.join(" OR "));
+        sql.push_str(") ORDER BY f.created_at DESC LIMIT ?");
+
+        let mut q = sqlx::query_as::<_, FailureRecord>(&sql).bind(project_id);
+        for kw in &keywords {
+            q = q.bind(format!("%{kw}%"));
+        }
+        q = q.bind(limit);
+        Ok(q.fetch_all(&self.pool).await?)
+    }
+
+    /// Group failures by stage and return `(stage, count)` ordered by count desc.
+    pub async fn failure_patterns(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(String, i64)>, MemoryError> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT f.stage, COUNT(*) as n
+             FROM failures f
+             JOIN pipeline_runs r ON r.id = f.run_id
+             WHERE r.project_id = ?
+             GROUP BY f.stage
+             ORDER BY n DESC",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+}
+
+/// Extract up to `n` distinctive keywords from an error message · strips
+/// short stop words and common Rust/CI noise.
+fn top_keywords(text: &str, n: usize) -> Vec<String> {
+    const STOP: &[&str] = &[
+        "the", "and", "for", "but", "with", "from", "into", "this", "that", "have", "has", "had",
+        "was", "were", "are", "is", "be", "been", "of", "on", "in", "at", "to", "or", "an", "a",
+        "as", "by", "it", "if", "not", "no", "yes", "do", "does", "did", "so", "use", "used",
+        "uses", "see", "via", "error", "failed", "fail", "exit", "code",
+    ];
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for raw in text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+        if raw.len() < 4 {
+            continue;
+        }
+        let lower = raw.to_ascii_lowercase();
+        if STOP.contains(&lower.as_str()) {
+            continue;
+        }
+        if seen.insert(lower.clone()) {
+            out.push(lower);
+            if out.len() >= n {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Naive SQL splitter · strips line comments · splits on `;`.
@@ -610,6 +690,93 @@ mod tests {
             .unwrap();
         let v2 = m.recall("p1", "config", "JWT_SECRET_REF").await.unwrap();
         assert_eq!(v2.as_deref(), Some("vault://v2"));
+    }
+
+    #[tokio::test]
+    async fn similar_failures_substring_matches() {
+        let m = fresh().await;
+        let lock = m.lock_session("p1", None, None).await.unwrap();
+        let run_id = m
+            .log_run(&NewRun {
+                project_id: "p1",
+                session_id: Some(&lock.session_id),
+                profile: "fast",
+                stage: "unit",
+                status: "fail",
+                duration_ms: 1,
+                triggered_by: None,
+                commit_sha: None,
+                stdout: None,
+                stderr: None,
+                failure_json: None,
+            })
+            .await
+            .unwrap();
+        m.log_failure(&NewFailure {
+            run_id: &run_id,
+            stage: "unit",
+            error_message: "JWT_SECRET environment variable is not set",
+            file: None,
+            line: None,
+        })
+        .await
+        .unwrap();
+        m.log_failure(&NewFailure {
+            run_id: &run_id,
+            stage: "static",
+            error_message: "clippy lint borrow_deref_ref triggered",
+            file: None,
+            line: None,
+        })
+        .await
+        .unwrap();
+
+        let hits = m
+            .find_similar_failures("p1", "missing JWT_SECRET token", 5)
+            .await
+            .unwrap();
+        assert!(hits.iter().any(|f| f.error_message.contains("JWT_SECRET")));
+        let other = m
+            .find_similar_failures("p1", "no such thing zzz", 5)
+            .await
+            .unwrap();
+        assert!(other.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failure_patterns_groups_by_stage() {
+        let m = fresh().await;
+        let lock = m.lock_session("p1", None, None).await.unwrap();
+        let run_id = m
+            .log_run(&NewRun {
+                project_id: "p1",
+                session_id: Some(&lock.session_id),
+                profile: "fast",
+                stage: "unit",
+                status: "fail",
+                duration_ms: 1,
+                triggered_by: None,
+                commit_sha: None,
+                stdout: None,
+                stderr: None,
+                failure_json: None,
+            })
+            .await
+            .unwrap();
+        for s in ["unit", "unit", "static"] {
+            m.log_failure(&NewFailure {
+                run_id: &run_id,
+                stage: s,
+                error_message: "x",
+                file: None,
+                line: None,
+            })
+            .await
+            .unwrap();
+        }
+        let patterns = m.failure_patterns("p1").await.unwrap();
+        assert_eq!(patterns[0], ("unit".to_owned(), 2));
+        assert_eq!(patterns[1], ("static".to_owned(), 1));
     }
 
     #[tokio::test]

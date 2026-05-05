@@ -26,9 +26,80 @@ pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
         "run" => run_tests(&req.args).await,
         "generate" => generate(&req.args).await,
         "ac_to_test" => ac_to_test(&req.args, state).await,
-        "coverage" | "mutation_run" | "property_generate" | "validation_create"
-        | "flake_detect" => ToolResponse::not_implemented(ToolName::Test, &req.action),
+        "coverage" => coverage(&req.args).await,
+        "mutation_run" | "property_generate" | "validation_create" | "flake_detect" => {
+            ToolResponse::not_implemented(ToolName::Test, &req.action)
+        }
         other => err(format!("unknown action 'pipeline_test.{other}'")),
+    }
+}
+
+async fn coverage(args: &Value) -> ToolResponse {
+    let threshold = args.get("threshold").and_then(Value::as_f64).unwrap_or(0.0);
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    // cargo-llvm-cov · summary-only · workspace-scoped.
+    let output = match Command::new("cargo")
+        .args(["llvm-cov", "--workspace", "--summary-only", "--json"])
+        .current_dir(&cwd)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            return err(format!(
+                "cargo llvm-cov spawn: {e} · install with: cargo install cargo-llvm-cov"
+            ));
+        }
+    };
+    if !output.status.success() {
+        return err(format!(
+            "cargo llvm-cov failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let raw = String::from_utf8_lossy(&output.stdout).into_owned();
+    // llvm-cov emits a JSON object with `data[0].totals.lines.percent` etc.
+    let parsed: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    let lines_pct = parsed
+        .pointer("/data/0/totals/lines/percent")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let funcs_pct = parsed
+        .pointer("/data/0/totals/functions/percent")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let regions_pct = parsed
+        .pointer("/data/0/totals/regions/percent")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let ok = lines_pct >= threshold;
+    ToolResponse {
+        ok,
+        data: json!({
+            "threshold": threshold,
+            "lines_percent": lines_pct,
+            "functions_percent": funcs_pct,
+            "regions_percent": regions_pct,
+        }),
+        next_suggested: if ok {
+            vec!["pipeline_run.preflight".into()]
+        } else {
+            vec![
+                "pipeline_test.generate".into(),
+                "pipeline_test.ac_to_test".into(),
+            ]
+        },
+        memory_refs: vec![],
+        error: if ok {
+            None
+        } else {
+            Some(format!(
+                "coverage gate failed: lines={lines_pct:.1}% < threshold={threshold:.1}%"
+            ))
+        },
     }
 }
 
