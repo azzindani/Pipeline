@@ -43,6 +43,7 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
 regex = "1"
+rmcp = { version = "1.6", features = ["server", "transport-io"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

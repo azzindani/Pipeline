@@ -12,6 +12,7 @@
 mod dispatch;
 mod handlers;
 mod registry;
+mod rmcp_transport;
 mod server;
 pub mod templates;
 mod tools;
@@ -24,8 +25,19 @@ pub use tools::{ToolName, ToolRequest, ToolResponse};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Start the MCP server on stdio transport · blocks until stdin closes.
+///
+/// Transport selection:
+/// - default: hand-rolled JSON-RPC 2.0 (Day-2 implementation)
+/// - `PIPELINE_TRANSPORT=rmcp`: official `rmcp` crate (Day-8c)
+///
+/// Both wrap the same `dispatch::call_tool` so the 19-tool surface is
+/// identical from the agent's perspective. The env var lets the rmcp
+/// path bake before becoming the default.
 pub async fn serve_stdio() -> Result<(), McpError> {
-    server::run_stdio().await
+    match std::env::var("PIPELINE_TRANSPORT").as_deref() {
+        Ok("rmcp") => rmcp_transport::serve_stdio_rmcp().await,
+        _ => server::run_stdio().await,
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
