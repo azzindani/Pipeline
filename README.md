@@ -239,6 +239,127 @@ echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 
 ---
 
+## Remote MCP deployment (mobile · browser · multi-user)
+
+Pipeline ships a second transport — **Streamable HTTP** — that exposes the same 19-tool surface to:
+
+- Claude (mobile/browser) via **Custom Connectors**
+- Claude Code remote MCP integration
+- Any MCP client that speaks HTTP
+
+> ⚠️ **This is a remote code execution surface.** The tools shell out to `cargo`, `git`, `docker`, run containers, modify files, and push to your git remotes. Always: TLS · bearer token · capability gate. Walk through each step below before exposing a port.
+
+### Architecture
+
+```
+[Claude mobile/browser]
+       ↓ HTTPS · Authorization: Bearer <PIPELINE_TOKEN>
+[VPS · Caddy reverse proxy · TLS termination via Let's Encrypt]
+       ↓ HTTP localhost:8080
+[pipeline mcp --transport http · capability gate enforced]
+       ↓ docker.sock mount
+[Docker daemon · stages execute here]
+```
+
+### Endpoints
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| `POST` | `/mcp` | bearer required | JSON-RPC dispatch · `initialize` · `tools/list` · `tools/call` · `ping` |
+| `GET` | `/health` | none | Liveness probe |
+
+### Capability gate (`PIPELINE_REMOTE_MODE`)
+
+Two modes · default is read-only:
+
+| Mode | What's allowed | When to use |
+|---|---|---|
+| `read_only` (default) | ~50 read actions: `meta.version` · `run.status` · `repo.list` · `memory.recall` · `report.dashboard` · etc. | always · safe default |
+| `full` | every action including `run.stage/commit/push` · `docker.build/run` · `repo.register` · `simulate.chaos_inject` | only behind authenticated proxy + TLS · single-tenant blast radius |
+
+Destructive actions in `read_only` return:
+
+```json
+{ "ok": false, "error": "blocked by PIPELINE_REMOTE_MODE=read_only · 'pipeline_run.stage' is destructive · unlock by setting PIPELINE_REMOTE_MODE=full only when behind authenticated proxy + TLS" }
+```
+
+### Quick deploy (VPS · Docker Compose · Caddy)
+
+```bash
+# 1. Provision a VPS · point DNS at it.
+# 2. Set required env vars.
+export PIPELINE_TOKEN="$(openssl rand -hex 32)"
+export PIPELINE_DOMAIN=pipeline.example.com
+# Optional · unlock destructive actions.
+export PIPELINE_REMOTE_MODE=read_only   # change to "full" only after auditing access
+
+# 3. Bring up Pipeline + Caddy.
+docker compose -f compose.deploy.yml up -d
+
+# 4. Verify.
+curl https://$PIPELINE_DOMAIN/health
+# → {"status":"ok","transport":"http"}
+
+curl -H "Authorization: Bearer $PIPELINE_TOKEN" \
+     -H "Content-Type: application/json" \
+     -X POST https://$PIPELINE_DOMAIN/mcp \
+     -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}'
+# → {"result":{"serverInfo":{"name":"pipeline-mcp","version":"0.0.1"}, ...}}
+```
+
+The repo ships [`compose.deploy.yml`](compose.deploy.yml) and [`Caddyfile.example`](Caddyfile.example) ready to use. Caddy auto-fetches a Let's Encrypt cert on first request.
+
+### Wiring Claude mobile / browser to the remote endpoint
+
+In Claude.ai (web/mobile) **Settings → Connectors → Add custom connector**:
+
+- **URL** · `https://pipeline.example.com/mcp`
+- **Authentication** · Bearer token · paste `$PIPELINE_TOKEN`
+- **Name** · `Pipeline (MCP)`
+
+Save. Claude lists the 19 tools immediately. Try `pipeline_meta.version` first — if you see the version map in the response, the wiring is correct.
+
+For Claude Code with a remote MCP server:
+
+```jsonc
+{
+  "mcpServers": {
+    "pipeline-remote": {
+      "url": "https://pipeline.example.com/mcp",
+      "headers": { "Authorization": "Bearer YOUR_TOKEN_HERE" }
+    }
+  }
+}
+```
+
+### Running locally (no VPS · for development)
+
+```bash
+# Local-only HTTP server · bound to 127.0.0.1:8080 by default.
+PIPELINE_TOKEN=dev-token pipeline mcp --transport http
+# In another shell:
+curl -H "Authorization: Bearer dev-token" \
+     -H "Content-Type: application/json" \
+     -X POST http://127.0.0.1:8080/mcp \
+     -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}'
+```
+
+### Hardening checklist before going public
+
+- [ ] `PIPELINE_TOKEN` set to a strong random value (`openssl rand -hex 32` minimum)
+- [ ] Bound to `127.0.0.1` inside the container · only Caddy reaches it
+- [ ] Caddy serving HTTPS via Let's Encrypt · HTTP 80 redirects
+- [ ] HSTS · X-Frame-Options · CSP set in Caddyfile (default config does this)
+- [ ] Access log to a persistent volume · review for abuse
+- [ ] Token rotation plan (re-deploy with new token · old token invalidated immediately on restart)
+- [ ] `PIPELINE_REMOTE_MODE=read_only` unless you trust every token holder
+- [ ] Firewall: deny inbound to anything except 80/443 · SSH if needed
+- [ ] Pipeline volumes are private (`pipeline-memory`, `pipeline-workspace`) · single-tenant
+- [ ] Docker socket mount: only if `mode=full` is needed; remove for pure read-only deployments
+- [ ] Consider a separate VPS per project · the host = the blast radius
+
+---
+
 ## Configuration
 
 `pipeline.yaml` lives at the project root and tells Pipeline what stack it's looking at, which gates to enforce, and where to deploy. Generated by `pipeline init`; check it into git.

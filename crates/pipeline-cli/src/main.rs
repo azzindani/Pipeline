@@ -21,8 +21,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start the MCP server on stdio · agents connect here
-    Mcp,
+    /// Start the MCP server · agents connect here
+    Mcp {
+        /// Transport: stdio (default · for local agents) | http (for remote · VPS deployment)
+        #[arg(long, default_value = "stdio")]
+        transport: String,
+        /// HTTP bind address · ignored for stdio transport · default 127.0.0.1:8080
+        #[arg(long)]
+        bind: Option<String>,
+    },
     /// Run a stage profile against the current project
     Run {
         /// Profile: fast · full · preflight · confirm
@@ -51,7 +58,11 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
     let cli = Cli::parse();
     match cli.command {
-        Command::Mcp => pipeline_mcp::serve_stdio().await?,
+        Command::Mcp { transport, bind } => match transport.as_str() {
+            "stdio" => pipeline_mcp::serve_stdio().await?,
+            "http" => pipeline_mcp::serve_http(bind.as_deref()).await?,
+            other => anyhow::bail!("unknown transport '{other}' · valid: stdio · http"),
+        },
         Command::Run { profile } => run_profile(&profile).await?,
         Command::Dev => println!("[stub] dev (mcp + watch) · POC week 1"),
         Command::Watch => println!("[stub] watch · POC week 1"),
