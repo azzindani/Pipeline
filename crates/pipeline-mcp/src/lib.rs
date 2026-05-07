@@ -11,6 +11,7 @@
 
 mod dispatch;
 mod handlers;
+mod http_transport;
 mod registry;
 mod rmcp_transport;
 mod server;
@@ -26,7 +27,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Start the MCP server on stdio transport · blocks until stdin closes.
 ///
-/// Transport selection:
+/// Transport selection (for stdio only · use `serve_http` for HTTP mode):
 /// - default: hand-rolled JSON-RPC 2.0 (Day-2 implementation)
 /// - `PIPELINE_TRANSPORT=rmcp`: official `rmcp` crate (Day-8c)
 ///
@@ -38,6 +39,15 @@ pub async fn serve_stdio() -> Result<(), McpError> {
         Ok("rmcp") => rmcp_transport::serve_stdio_rmcp().await,
         _ => server::run_stdio().await,
     }
+}
+
+/// Start the MCP server on HTTP transport · blocks until process exit.
+///
+/// Streamable HTTP-style: POST `/mcp` with a JSON-RPC envelope, GET `/health`.
+/// Bearer auth via `PIPELINE_TOKEN` (mandatory).
+/// Capability gate via `PIPELINE_REMOTE_MODE` (default `read_only`).
+pub async fn serve_http(bind: Option<&str>) -> Result<(), McpError> {
+    http_transport::serve_http(bind).await
 }
 
 #[derive(Debug, thiserror::Error)]
