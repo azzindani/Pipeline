@@ -657,76 +657,11 @@ pipeline repo port     # translate external repo to target language
 
 ---
 
-## Build order (incremental, useful at every stage)
+## Build order
 
-```
-Week 1 — Core + MCP skeleton
-  pipeline_run (static + unit stages)
-  pipeline_status, pipeline_logs
-  MCP server running, agent can call 3 tools
-  Already useful for development
+Phase ladder · per-milestone tool delivery · velocity targets · risk register live in **`PLAN.md`**. Update there, not here.
 
-Week 2 — Docker integration
-  pipeline_run (container + integration stages)
-  bollard integration, clean environment guarantee
-  pipeline_fix_suggestion with memory context
-
-Week 3 — Init + scaffold
-  pipeline_init, pipeline_scaffold
-  Project templates (python-uv, bun, rust, go)
-  pipeline.yaml schema + validation
-
-Week 4 — GitHub integration
-  pipeline_preflight, pipeline_commit, pipeline_push
-  GitHub Actions YAML generation
-  PR status checks, branch protection
-
-Week 5 — Deployment
-  pipeline_deploy, pipeline_rollback
-  pipeline_smoke_test
-  GHCR image push, SSH + compose targets
-
-Week 6 — Maintenance + memory maturity
-  pipeline_monitor daemon
-  pipeline_update_deps, pipeline_health
-  Auto-PR on green update
-  Full handover protocol, semantic memory, learning loop
-
-Week 7 — Standards integration
-  pipeline standards fetch, list, show, apply
-  Standards compliance check baked into every stage run
-  pipeline_init applies correct standard subset per stack automatically
-
-Week 8 — Repo digestion
-  pipeline_repo_digest, pipeline_repo_list_capabilities
-  pipeline_repo_extract, pipeline_repo_diff
-  License check + secrets scan on external repos
-  Digest storage in .pipeline/digests/
-
-Week 9 — Repo porting
-  pipeline_repo_port, pipeline_repo_port_module
-  pipeline_repo_port_validate, pipeline_repo_port_report
-  Translation paths: Python ↔ Rust, Python ↔ Go, Go ↔ Rust, any → TypeScript
-  Standards enforcement on ported code (target language standards, not source)
-
-Week 10 — Reverse engineering
-  pipeline_re_analyze, pipeline_re_report
-  pipeline_re_reconstruct_api, pipeline_re_reconstruct_schema
-  pipeline_re_reconstruct_dockerfile
-  Binary + service + codebase RE targets
-
-Week 11 — Extended capabilities
-  pipeline_arch_synthesize, pipeline_spec_generate
-  pipeline_testgen_behavioral, pipeline_security_map
-  pipeline_migration_plan, pipeline_compliance_check
-
-Week 12 — Knowledge layer
-  pipeline_knowledge_export, pipeline_knowledge_import
-  pipeline_dep_archeology
-  Full capability relationship graph operational
-
-v2 — LSP integration, WASM plugins, binary RE (decompilation)
-```
+CLAUDE.md owns timeless project context (architecture · concepts · MCP surface concept · standards reference). PLAN.md owns execution.
 
 ---
 

@@ -1,0 +1,79 @@
+# Pipeline · remote MCP deployment · VPS + Docker.
+#
+# WARNING · this exposes Pipeline as a remote code execution surface to
+# any client that knows PIPELINE_TOKEN. Always:
+# - Run behind TLS (Caddy reverse-proxy below auto-handles Let's Encrypt)
+# - Set PIPELINE_TOKEN to a strong random value (`openssl rand -hex 32`)
+# - Keep PIPELINE_REMOTE_MODE=read_only unless you trust every token holder
+# - Treat the host as single-tenant blast radius (mounted docker socket = root)
+#
+# Run:
+#   export PIPELINE_TOKEN="$(openssl rand -hex 32)"
+#   export PIPELINE_DOMAIN=pipeline.example.com
+#   docker compose -f compose.deploy.yml up -d
+#
+# Then:
+#   curl -H "Authorization: Bearer $PIPELINE_TOKEN" \
+#        -H "Content-Type: application/json" \
+#        https://pipeline.example.com/mcp \
+#        -d '{"jsonrpc":"2.0","id":1,"method":"initialize"}'
+
+services:
+  pipeline:
+    image: pipeline:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["mcp", "--transport", "http", "--bind", "0.0.0.0:8080"]
+    environment:
+      PIPELINE_TOKEN: ${PIPELINE_TOKEN:?PIPELINE_TOKEN must be set}
+      PIPELINE_REMOTE_MODE: ${PIPELINE_REMOTE_MODE:-read_only}
+      PIPELINE_BIND: 0.0.0.0:8080
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      # Project files · the workspace pipeline operates on
+      - pipeline-workspace:/work
+      # Persistent memory · session log · run history · digests
+      - pipeline-memory:/work/.pipeline
+      # Docker socket · required for stages that build/run containers
+      # Comment out if PIPELINE_REMOTE_MODE=read_only and you trust no
+      # token to ever escalate.
+      - /var/run/docker.sock:/var/run/docker.sock
+    working_dir: /work
+    expose:
+      - "8080"          # internal · only Caddy reaches this
+    networks:
+      - pipeline-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      PIPELINE_DOMAIN: ${PIPELINE_DOMAIN:?PIPELINE_DOMAIN must be set}
+    volumes:
+      - ./Caddyfile.example:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - pipeline-net
+    restart: unless-stopped
+    depends_on:
+      - pipeline
+
+volumes:
+  pipeline-workspace:
+  pipeline-memory:
+  caddy-data:
+  caddy-config:
+
+networks:
+  pipeline-net:
+    driver: bridge
