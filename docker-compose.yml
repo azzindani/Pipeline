@@ -1,0 +1,84 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline · VPS deployment using the shared `caddy-router`.
+#
+# Pairs with /root/caddy-router · the central Caddy container owns :80/:443
+# and routes by hostname to each project. This compose file:
+#   - builds + runs the Pipeline MCP HTTP server on internal :8080
+#   - creates `pipeline_net` so the router can join it as external
+#   - exposes NO host ports (router reaches via the shared network)
+#
+# Bring up:
+#   docker compose up -d --build
+#
+# Sanity check from the host (token comes from .env):
+#   docker exec pipeline wget -qO- http://127.0.0.1:8080/health
+#
+# Wire the public route (one-time, after setting PIPELINE_DOMAIN in .env):
+#   1. Add `pipeline_net` to /root/caddy-router/docker-compose.yml:
+#         networks:
+#           pipeline_net:
+#             external: true
+#             name: pipeline_pipeline_net
+#      and add `- pipeline_net` to the caddy service's networks list.
+#   2. Add this block to /root/caddy-router/Caddyfile (uses $PIPELINE_DOMAIN
+#      from this project's .env, already loaded via env_file):
+#         {$PIPELINE_DOMAIN} {
+#             encode zstd gzip
+#             reverse_proxy pipeline:8080 {
+#                 header_up Host {host}
+#                 transport http {
+#                     read_timeout  300s
+#                     write_timeout 300s
+#                 }
+#             }
+#             log { output stdout; format console }
+#         }
+#   3. Add /root/Pipeline/.env to caddy-router's `env_file:` list.
+#   4. cd /root/caddy-router && docker compose up -d
+#
+# Auth + capability gate are enforced by Pipeline itself (PIPELINE_TOKEN,
+# PIPELINE_REMOTE_MODE) — Caddy adds TLS, nothing more.
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+  pipeline:
+    image: pipeline:latest
+    container_name: pipeline
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["mcp", "--transport", "http", "--bind", "0.0.0.0:8080"]
+    restart: unless-stopped
+    environment:
+      PIPELINE_TOKEN: ${PIPELINE_TOKEN:?PIPELINE_TOKEN must be set in .env}
+      PIPELINE_REMOTE_MODE: ${PIPELINE_REMOTE_MODE:-read_only}
+      PIPELINE_BIND: 0.0.0.0:8080
+      RUST_LOG: ${RUST_LOG:-info}
+    expose:
+      - "8080"
+    volumes:
+      # Workspace the agent operates on. Bind-mount a host dir if you want
+      # the workspace to survive `docker compose down -v` and be visible from
+      # the host (mirrors Folio's ./folio-projects pattern).
+      - ./pipeline-workspace:/work
+      # Persistent memory · session log · run history · digests.
+      - pipeline-memory:/work/.pipeline
+      # Docker socket · needed for stages that build/run containers. Comment
+      # out if PIPELINE_REMOTE_MODE=read_only and you want zero escalation
+      # surface — but `pipeline_run` + `pipeline_deploy` will fail.
+      - /var/run/docker.sock:/var/run/docker.sock
+    working_dir: /work
+    networks:
+      - pipeline_net
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+networks:
+  pipeline_net:
+    driver: bridge
+
+volumes:
+  pipeline-memory:
