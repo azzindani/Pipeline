@@ -235,9 +235,7 @@ async fn compliance_check(args: &Value) -> ToolResponse {
 
 fn ignored(needle: &str, cwd: &std::path::Path) -> bool {
     let g = cwd.join(".gitignore");
-    std::fs::read_to_string(&g)
-        .map(|s| s.lines().any(|l| l.trim() == needle))
-        .unwrap_or(false)
+    std::fs::read_to_string(&g).is_ok_and(|s| s.lines().any(|l| l.trim() == needle))
 }
 
 fn err(msg: String) -> ToolResponse {
