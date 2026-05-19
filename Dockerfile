@@ -25,7 +25,7 @@ RUN cargo build --release --bin pipeline \
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates git \
+ && apt-get install -y --no-install-recommends ca-certificates git curl \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd -r pipeline && useradd -r -g pipeline -u 10001 pipeline
 
