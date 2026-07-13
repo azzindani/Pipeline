@@ -27,11 +27,11 @@ Pipeline removes infrastructure burden from coding agents. Any agent — Claude 
 | Phase | Goal | Exit criteria | Status |
 |---|---|---|---|
 | **POC** | Prove the inner loop on Pipeline itself (dogfood) | `pipeline_session.lock` → `pipeline_run.stage(fast)` → green on Pipeline's own crates · single agent · single stack (Rust) | **✓ shipped (Day 1–2)** |
-| **MVP** | Full inner loop + push gate · 3 stacks · plan authoring | Agent can take `idea` → PRD → scaffold → green preflight → push for python-uv · bun · rust projects · all from MCP | **✓ partially shipped (Day 3–9)** · all 19 tools functional · all 172 actions wired · rmcp transport in place · 5 templates available (rust-only). Multi-stack templates (python-uv, bun) land before v1. |
+| **MVP** | Full inner loop + push gate · 3 stacks · plan authoring | Agent can take `idea` → PRD → scaffold → green preflight → push for python-uv · bun · rust projects · all from MCP | **✓ partially shipped (Day 3–9)** · all 19 tools functional · all 174 actions wired · rmcp transport in place · 5 templates available (rust-only). Multi-stack templates (python-uv, bun) land before v1. |
 | **v1** | Deploy + multi-repo + autonomy | Deploy to staging+prod via MCP · digest+port+RE working · maintenance daemon green for 7 days unattended | partial · deploy/repo actions wired as scaffolding · maintenance daemon (`pipeline monitor`) still stub |
 | **v2** | Polish · advanced surfaces | Visual regression · canary · LSP · WASM plugins · binary RE | not started · LSP + WASM plugin loader + binary decompilation RE remain |
 
-POC and MVP scope was pulled forward · 9 days of focused work delivered the entire 172-action surface end-to-end, hand-rolled JSON-RPC + rmcp 1.6 transport, multi-template scaffolder, and depth-pass implementations of every action. Remaining v1/v2 work is mostly external-tool integration (real load harness · streaming RE pipeline · sqlite-vec embeddings) rather than surface design.
+POC and MVP scope was pulled forward · 9 days of focused work delivered the entire 174-action surface end-to-end, hand-rolled JSON-RPC + rmcp 1.6 transport, multi-template scaffolder, and depth-pass implementations of every action. Remaining v1/v2 work is mostly external-tool integration (real load harness · streaming RE pipeline · sqlite-vec embeddings) rather than surface design.
 
 ---
 
@@ -52,7 +52,7 @@ Listing 140 individual MCP tools to a model = listing tax + context rot. Local 7
 |---|---|---|---|
 | 1 | `pipeline_session` | Lock · context · handover | 11 |
 | 2 | `pipeline_plan` | Idea intake · feasibility · PRD · features · milestones · ADRs · risks | 21 |
-| 3 | `pipeline_standards` | Fetch · select · apply · check | 7 |
+| 3 | `pipeline_standards` | Resolve · pin · route · inject · check | 9 |
 | 4 | `pipeline_project` | Init · scaffold · templates | 4 |
 | 5 | `pipeline_env` | Devcontainer · deps · runtime · tooling · secrets | 10 |
 | 6 | `pipeline_docker` | Build · run · compose · image · dockerfile | 16 |
@@ -70,7 +70,7 @@ Listing 140 individual MCP tools to a model = listing tax + context rot. Local 7
 | 18 | `pipeline_report` | Dashboard · velocity · burndown · last | 5 |
 | 19 | `pipeline_meta` | Explain · config · self-check · version | 5 |
 
-Total: 19 tools · 172 actions. Agent sees 19 schemas; each tool's description lists its actions inline so the agent picks one without a second tool call.
+Total: 19 tools · 174 actions. Agent sees 19 schemas; each tool's description lists its actions inline so the agent picks one without a second tool call.
 
 ### 3.3 Action dispatch pattern
 
@@ -151,7 +151,12 @@ Local models handle this well · Claude handles it trivially.
 Output is structured · feeds directly into `plan.create` and `plan.prd_write` as seed data.
 
 ### 4.3 `pipeline_standards`
-`list` · `show(category)` · `recommend(stack, project_type)` · `apply(category)` · `check` · `fetch` · `diff(before, after)`
+`brief` · `list` · `show(id)` · `checklist` · `route` · `fetch` · `update` · `pin` · `check`
+
+Standards is an EXTERNAL repo (`github.com/azzindani/Standards`) consumed as a versioned dependency — ✗ vendored · ✗ monorepo path.
+Resolution cascade: `pipeline.yaml standards.source` → `$PIPELINE_STANDARDS_DIR` → `~/.pipeline/standards` → clone. Locked by commit SHA (`standards.pin`).
+Routing is executed from that repo's own `index.json` (emitted + CI-validated by `tools/validate.py --emit-index`) — Pipeline ✗ restate a routing rule.
+Injection is tiered: `brief` L0 (~2KB, every session) · `show` L1 (one standard) · `checklist` L2 (the routed set's enforcement surface).
 
 ### 4.4 `pipeline_project`
 `init(name, type, stack)` · `scaffold(component, kind)` · `template_list(type?)` · `template_register(name, source)`
@@ -216,7 +221,7 @@ Auth: SSH key picked up from agent host (`~/.ssh/`) · HTTPS token from `pipelin
 
 ## 5. Build order by milestone
 
-> **Status as of Day 9:** all 19 tools functional · 172/172 actions wired · 36 unit tests passing · clippy `-D warnings` clean · rmcp 1.6 transport landed (env-gated). Sections below show what shipped per phase.
+> **Status as of Day 9:** all 19 tools functional · 174/174 actions wired · 36 unit tests passing · clippy `-D warnings` clean · rmcp 1.6 transport landed (env-gated). Sections below show what shipped per phase.
 
 ### POC — Day 1–2 ✓ shipped
 
@@ -239,7 +244,7 @@ Exit: Pipeline runs `pipeline_run.stage(fast)` against its own crates and Pipeli
 |---|---|---|
 | `pipeline_project` | init · scaffold · template_list | pipeline-cli · pipeline-config |
 | `pipeline_env` | create · deps_install · deps_audit · runtime_provision · secrets_setup | pipeline-core |
-| `pipeline_standards` | fetch · list · show · recommend · apply · check | pipeline-core (new: pipeline-standards) |
+| `pipeline_standards` | brief · list · show · checklist · route · fetch · update · pin · check | pipeline-standards |
 | `pipeline_plan` | idea_capture · link_ingest · research_notes_* · feasibility · create · prd_* · features_* · acceptance_define · milestone_* · progress | pipeline-memory · pipeline-mcp |
 | `pipeline_run` | preflight · commit · push · fix_suggestion · explain | pipeline-core · pipeline-github |
 | `pipeline_e2e` | run · record · trace · browser_launch · browser_close | pipeline-stages (new: pipeline-e2e) |
@@ -271,16 +276,55 @@ Exit: maintenance daemon runs unattended for 7 days · auto-PR on green dependen
 
 ---
 
+## 5b. Remote MCP transport
+
+Public deployment: **`https://pipe.casava.space/mcp`** · TLS + hostname routing by the shared `/root/caddy-router` (Pipeline ✗ own :80/:443 · the router does).
+
+Auth model ported from Folio (`src/mcp/{auth,oauth}.ts` → `crates/pipeline-mcp/src/{auth,oauth}.rs`), with one deliberate divergence: **Folio allows an unauthenticated `open` mode · Pipeline ✗**. `/mcp` is remote code execution — the server refuses to start with no token source.
+
+| Surface | Path | Gate |
+|---|---|---|
+| MCP JSON-RPC | `/mcp` | Bearer · static registry \| OAuth-issued |
+| OAuth discovery | `/.well-known/oauth-*` | public (RFC 8414 · RFC 9728) |
+| OAuth flow | `/oauth/{register,authorize,token}` | public (RFC 7591 DCR · PKCE S256) |
+| Liveness | `/health` | public |
+
+**Tokens** — `PIPELINE_TOKENS_FILE` → `PIPELINE_TOKENS` → `PIPELINE_TOKEN`, first hit wins. Named tokens map to **principals**, so revoking one holder ✗ rotate everyone.
+
+**OAuth** — claude.ai Custom Connector. User pastes a Pipeline token once at `/oauth/authorize`; the issued bearer inherits that principal and no more. Access 24 h · refresh 30 d rotating single-use · code 10 min one-shot · DCR clients 7 d TTL + 256 cap. Access + refresh persist to `.pipeline/oauth/` — ! in-memory-only forced a re-authorize on every container bounce (Folio hit this; we inherit the fix, not the bug).
+
+**Limits** — `/mcp` 8 MiB (tool args are legitimately large) · pre-auth OAuth surface 256 KB. Cap ordering is a compile-time assertion: an anonymous caller ✗ ever get the larger allocation.
+
+**`PIPELINE_REMOTE_MODE=read_only`** (default) still gates every destructive action — an OAuth principal is exactly as privileged as the token that authorized it.
+
+Not yet: SSE streaming (`flush_interval -1` already set in the router, so it lands without a routing change).
+
+---
+
 ## 6. Standards integration plan
 
 Driven from `https://github.com/azzindani/Standards`.
 
+Standards is a SEPARATE repo consumed as a versioned dependency. ✗ vendor it · ✗ restate its rules.
+
+**Contract** — Standards' CI emits `index.json` (`tools/validate.py --emit-index`, gated by `--check-index`): catalog · tiers · `Owns` · routes · checklists. Pipeline deserializes it. The producer owns the schema; ROUTER changes ✗ require a Pipeline change.
+
+**Resolution** — `pipeline.yaml standards.source` → `$PIPELINE_STANDARDS_DIR` → `~/.pipeline/standards` (shared cache) → clone. Pinned by commit SHA. ! a user-supplied clone is READ-ONLY — Pipeline ✗ fetch · ✗ checkout in it.
+
+**Injection** — tiered, because the corpus (~19k lines) ✗ fit a context window:
+
+| Tier | Action | Payload | When |
+|---|---|---|---|
+| L0 | `brief` | routed ids + tier + `Owns` + pin health | every session · always |
+| L1 | `show(id)` | one standard, full text | agent touches that surface |
+| L2 | `checklist` | routed set's Checklist sections | gates · review · `check` |
+
 | Phase | Standards behavior |
 |---|---|
-| POC | Manual fetch · `pipeline_standards.fetch` clones to `.pipeline/standards/` |
-| MVP | `recommend(stack, project_type)` returns category list · `apply(category)` writes config files · `check` produces gap report · runs as part of stage 0 |
+| POC | ✓ shipped · resolve cascade · SHA pin · ROUTER-driven routing · L0/L1/L2 injection · `check` reports drift + unresolved routes |
+| MVP | `check` scores checklist obligations against the codebase (agent-adjudicated) · runs as part of stage 0 |
 | v1 | Compliance score gates `pipeline_run.preflight` · `pipeline_repo.port` enforces target language standards · digest output includes standards compliance section |
-| v2 | Standards evolution tracking · auto-PRs to projects when standards update |
+| v2 | Standards evolution tracking · `update` auto-PRs to projects when bound standards change |
 
 ---
 
@@ -548,5 +592,5 @@ The faster this loop · the faster the agent learns what works. Memory makes the
 
 ---
 
-*Last updated: Day 9 · 19/19 tools functional · 172/172 actions wired · POC + most of MVP shipped*
+*Last updated: Day 9 · 19/19 tools functional · 174/174 actions wired · POC + most of MVP shipped*
 *Next checkpoint: first external agent integration → measure real-world loop times → write ADR-007 on whether rmcp becomes the default*

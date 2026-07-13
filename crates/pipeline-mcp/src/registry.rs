@@ -69,15 +69,18 @@ pub fn registry() -> Vec<ToolDescriptor> {
         },
         ToolDescriptor {
             name: Standards,
-            summary: "Standards fetch · select · apply · check.",
+            summary: "Standards brief · route · show · checklist · pin · check. \
+                      Sourced from the external Standards repo, pinned by commit SHA.",
             actions: &[
+                "brief",
                 "list",
                 "show",
-                "recommend",
-                "apply",
-                "check",
+                "checklist",
+                "route",
                 "fetch",
-                "diff",
+                "update",
+                "pin",
+                "check",
             ],
         },
         ToolDescriptor {
@@ -318,9 +321,9 @@ mod tests {
 
     #[test]
     fn registry_action_count_matches_plan() {
-        // PLAN.md §3.2 reports 172 total actions.
+        // PLAN.md §3.2 reports 174 total actions.
         let total: usize = registry().iter().map(ToolDescriptor::action_count).sum();
-        assert_eq!(total, 172, "action count drift vs PLAN.md §3.2");
+        assert_eq!(total, 174, "action count drift vs PLAN.md §3.2");
     }
 
     #[test]

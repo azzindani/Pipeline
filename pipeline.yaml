@@ -29,4 +29,19 @@ gates:
   image_size_mb: 200
   critical_vulns: 0
 
+# External Standards repo · github.com/azzindani/Standards — a dependency, not a
+# vendored copy. `source` resolves it (local path | git URL | omit → cascade to
+# ~/.pipeline/standards). `pin` locks the commit: upstream ✗ silently move gates.
+# `project_type` · `surfaces` are keys into that repo's ROUTER.md §5 · §6 tables —
+# Pipeline selects routes, it does not define them.
+standards:
+  source: /root/Standards
+  project_type: MCP server
+  languages: [rust]        # settles ROUTER's MCP-server language choice (python | typescript | rust)
+  surfaces:
+    - Command line
+    - Deployed service
+    - Public package
+  pin: 0828bd8de09977166cb30172d26fdcb1113bd0fa
+
 # deploy + maintenance wire in at v1 · see PLAN.md

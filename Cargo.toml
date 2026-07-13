@@ -4,6 +4,7 @@ members = [
     "crates/pipeline-cli",
     "crates/pipeline-core",
     "crates/pipeline-config",
+    "crates/pipeline-standards",
     "crates/pipeline-mcp",
     "crates/pipeline-memory",
     "crates/pipeline-docker",
@@ -44,7 +45,9 @@ tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
 regex = "1"
 rmcp = { version = "1.6", features = ["server", "transport-io"] }
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "tower-log"] }
+sha2 = "0.10"
+base64 = "0.22"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "tower-log", "form", "query"] }
 tower-http = { version = "0.6", default-features = false, features = ["trace", "cors"] }
 
 [workspace.lints.rust]
