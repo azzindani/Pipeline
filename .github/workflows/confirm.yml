@@ -34,6 +34,14 @@ jobs:
   static:
     name: stage 0 · static
     runs-on: ubuntu-latest
+    # `contents: read` is the workflow default; the RustSec audit action ALSO needs
+    # `checks: write` to post its findings as a check run. Without it the action dies with
+    # "Resource not accessible by integration" — but only once it actually has a finding to
+    # report, so the gap stays invisible until the day an advisory (or a yanked crate) lands
+    # and reddens CI for a reason unrelated to the commit. Grant it here, scoped to this job.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
 
@@ -53,16 +61,19 @@ jobs:
       - name: toolchain parity
         run: rustc --version && cargo clippy --version
 
+      # ! FIRST cargo command · Cargo.lock must already satisfy the manifests. This has to
+      # precede clippy/build: those run without --locked and would silently UPDATE a stale
+      # lock, so the drift never surfaces — which is exactly how a missing lock edge sailed
+      # through stage 0 while stage 1 (build --locked) caught it. Guard before anything can
+      # paper over it.
+      - name: lockfile is current
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
       - name: fmt
         run: cargo fmt --all -- --check
 
       - name: clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      # Cargo.lock must already satisfy the manifests. Without --locked a stale
-      # lockfile is silently "fixed" in CI and the drift never surfaces.
-      - name: lockfile is current
-        run: cargo metadata --locked --format-version 1 > /dev/null
 
       - name: dependency audit (RustSec)
         uses: rustsec/audit-check@v2
