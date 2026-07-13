@@ -9,35 +9,56 @@
 //! Activated via `--transport http` or `PIPELINE_TRANSPORT=http` + bind
 //! address from `--bind` or `PIPELINE_BIND` (default 127.0.0.1:8080).
 //!
+//! # The endpoint contract
+//!
+//! Deliberately identical to Folio's and Sift's, so a client — or a monitor, or a
+//! key — configured for one works against any of them.
+//!
+//! | Path | Gate |
+//! |---|---|
+//! | `/mcp` | Bearer · static registry or OAuth-issued |
+//! | `/tokens/whoami` | Bearer · the cheapest auth sanity check |
+//! | `/library`, `/library/*` | the SAME key · `?token=` → session cookie |
+//! | `/.well-known/oauth-*` | public — discovery |
+//! | `/oauth/{register,authorize,token}` | public — PKCE handshake |
+//! | `/health`, `/version` | public — a monitor should not need a token |
+//!
 //! # Security
 //!
 //! Treat this endpoint as remote code execution.
 //!
 //! - **Auth is mandatory.** `PIPELINE_TOKENS_FILE` | `PIPELINE_TOKENS` |
-//!   `PIPELINE_TOKEN` — the server refuses to start with none set. Unlike Folio,
-//!   there is no unauthenticated mode.
+//!   `PIPELINE_TOKEN` — the server refuses to start with none set. Unlike Folio and
+//!   Sift, there is no unauthenticated mode; a misconfigured lock must be a locked
+//!   door, not an open one.
 //! - **`PIPELINE_REMOTE_MODE=read_only`** (default) blocks every destructive
 //!   action in `is_safe_action`. `full` only behind an authenticated proxy + TLS.
 //! - **Bodies are capped.** An unbounded reader on a public endpoint lets one
 //!   POST grow the heap until the container OOMs. `/mcp` gets a generous cap
 //!   (tool args can be large); the pre-auth OAuth surface gets a tight one.
+//! - **Rate limited** ([`crate::ratelimit`]) on `(principal, ip)` → 429.
 //! - **OAuth 2.0 + PKCE** ([`crate::oauth`]) lets claude.ai connect as a Custom
 //!   Connector instead of a human pasting a static bearer.
+//! - **No basic_auth anywhere**, including the library. A browser username/password
+//!   popup can never be satisfied by an access token, and a second credential to read
+//!   your own record defeats the point of one key everywhere.
 
 #![allow(clippy::doc_markdown)]
 
 use crate::auth::{TokenRegistry, bearer};
 use crate::dispatch;
 use crate::oauth::{OAUTH_MAX_BODY_BYTES, OAuth};
+use crate::ratelimit::RateLimiter;
 use crate::registry::registry;
 use crate::server::ServerState;
 use crate::tools::ToolRequest;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -95,21 +116,33 @@ pub struct AppState {
     pub(crate) server: Arc<ServerState>,
     pub(crate) tokens: Arc<TokenRegistry>,
     pub(crate) oauth: Arc<OAuth>,
+    pub(crate) limiter: Arc<RateLimiter>,
+    pub(crate) library: Arc<PathBuf>,
     pub(crate) mode: RemoteMode,
 }
 
-/// Where OAuth persists its access + refresh stores. Under `.pipeline/` so it
-/// rides the existing `pipeline-memory` volume and survives a container bounce.
-fn oauth_state_dir() -> PathBuf {
-    std::env::var_os("PIPELINE_OAUTH_STATE_DIR").map_or_else(
+/// The library root — Pipeline's durable record: run history, reports, digests,
+/// sessions. The same directory the memory volume persists.
+fn library_dir() -> PathBuf {
+    std::env::var_os("PIPELINE_LIBRARY_DIR").map_or_else(
         || {
             std::env::current_dir()
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join(".pipeline")
-                .join("oauth")
         },
         PathBuf::from,
     )
+}
+
+/// Where OAuth persists its access + refresh stores.
+///
+/// ! Dot-prefixed ON PURPOSE. It sits INSIDE the library root, and `browse` hides
+/// dotfiles — otherwise `/library/oauth/access-tokens.json` would serve every reader a
+/// live credential. (`browse::DENY` also names it, belt and braces.) Sift calls its
+/// equivalent `.oauth-state` for exactly this reason.
+fn oauth_state_dir() -> PathBuf {
+    std::env::var_os("PIPELINE_OAUTH_STATE_DIR")
+        .map_or_else(|| library_dir().join(".oauth"), PathBuf::from)
 }
 
 /// Can we actually create + write in `dir`? Checked at boot so a read-only mount
@@ -154,10 +187,13 @@ pub async fn serve_http(bind: Option<&str>) -> Result<(), crate::McpError> {
         .map_err(|e| crate::McpError::Transport(format!("bad bind '{addr_str}': {e}")))?;
 
     let mode = RemoteMode::from_env();
+    let limiter = Arc::new(RateLimiter::from_env());
     let app_state = AppState {
         server: Arc::new(ServerState::new()),
         oauth: Arc::new(OAuth::new(oauth_state_dir())),
         tokens: Arc::new(tokens),
+        library: Arc::new(library_dir()),
+        limiter: Arc::clone(&limiter),
         mode,
     };
 
@@ -188,6 +224,19 @@ pub async fn serve_http(bind: Option<&str>) -> Result<(), crate::McpError> {
         .layer(DefaultBodyLimit::max(OAUTH_MAX_BODY_BYTES))
         .layer(public_cors);
 
+    // THE LIBRARY — the durable record, browsable.
+    //
+    // ! No basic_auth in front and no static file_server: Pipeline is the SOLE gate,
+    // exactly as Folio's editor route and Sift's /library are. It accepts the SAME key
+    // via ?token= / Bearer / the session cookie and serves its own gate page otherwise.
+    // A browser basic-auth popup could never be satisfied by an access token anyway, and
+    // handing someone a SECOND credential to read their own record defeats the point of
+    // one key everywhere. Its own body limit stays small — these are GETs.
+    let library = Router::new()
+        .route("/library", get(library_handler))
+        .route("/library/{*path}", get(library_handler))
+        .layer(DefaultBodyLimit::max(64 * 1024));
+
     // ✗ never print token values — only the principal names.
     let auth_summary = app_state.tokens.describe();
 
@@ -195,12 +244,17 @@ pub async fn serve_http(bind: Option<&str>) -> Result<(), crate::McpError> {
         .route("/mcp", post(mcp_handler))
         .layer(DefaultBodyLimit::max(mcp_body_limit()))
         .route("/health", get(health))
+        .route("/version", get(version))
+        .route("/tokens/whoami", get(whoami))
+        .merge(library)
         .merge(public)
         .with_state(app_state);
 
     eprintln!(
-        "pipeline-mcp http transport · {addr} · mode={} · auth={auth_summary} · oauth=/oauth/authorize",
+        "pipeline-mcp http transport · {addr} · mode={} · auth={auth_summary} · \
+         rate={} · oauth=/oauth/authorize · library=/library",
         mode.as_str(),
+        limiter.describe(),
     );
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -211,8 +265,33 @@ pub async fn serve_http(bind: Option<&str>) -> Result<(), crate::McpError> {
     Ok(())
 }
 
-async fn health() -> impl IntoResponse {
-    Json(json!({"status": "ok", "transport": "http"}))
+/// Liveness — public on purpose. A monitor should not need a token to see the box is up,
+/// and this leaks nothing: a version, a mode, and the NAMES of configured principals.
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    Json(json!({
+        "ok": true,
+        "status": "ok",
+        "transport": "http",
+        "name": "pipeline",
+        "version": crate::VERSION,
+        "mode": state.mode.as_str(),
+        "auth": state.tokens.describe(),
+        "rate_limit": state.limiter.describe(),
+    }))
+}
+
+/// Running version — public, so a monitor can alert on a stale deploy without a token.
+/// Same shape as Sift's and Folio's, so one probe works against all three.
+async fn version() -> impl IntoResponse {
+    Json(json!({"name": "pipeline", "version": crate::VERSION}))
+}
+
+/// Which named token you presented. The cheapest possible auth sanity check.
+async fn whoami(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    match authenticate(&state, &headers) {
+        Some(principal) => Json(json!({"token": principal, "authenticated": true})).into_response(),
+        None => unauthorized_json(&Value::Null),
+    }
 }
 
 /// JSON-RPC request handler. Matches the methods the stdio handler
@@ -224,23 +303,33 @@ async fn mcp_handler(
     Json(req): Json<Value>,
 ) -> Response {
     let Some(principal) = authenticate(&state, &headers) else {
+        return unauthorized_json(&req.get("id").cloned().unwrap_or(Value::Null));
+    };
+
+    if !state.limiter.allow(&principal, &client_ip(&headers)) {
         return (
-            StatusCode::UNAUTHORIZED,
-            // RFC 9728: point an unauthenticated client at the OAuth surface so
-            // claude.ai can discover it instead of just failing.
-            [(
-                axum::http::header::WWW_AUTHENTICATE,
-                r#"Bearer resource_metadata="/.well-known/oauth-protected-resource""#,
-            )],
+            StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::RETRY_AFTER, "1")],
             Json(json!({
                 "jsonrpc": "2.0",
                 "id": req.get("id").cloned().unwrap_or(Value::Null),
-                "error": { "code": -32001, "message": "missing or invalid bearer token" },
+                "error": {
+                    "code": -32029,
+                    "message": format!(
+                        "rate limited · over {} · back off, or raise PIPELINE_RATE_BURST / \
+                         PIPELINE_RATE_PER_SEC (0 disables)",
+                        state.limiter.describe()
+                    ),
+                },
             })),
         )
             .into_response();
-    };
-    tracing::debug!(principal = %principal, "authenticated /mcp call");
+    }
+
+    // Audit at INFO, not debug. Named tokens exist so the log can say WHO called a tool,
+    // not merely that someone did — a line nobody reads is not an audit trail.
+    let method_name = req.get("method").and_then(Value::as_str).unwrap_or("");
+    tracing::info!(token = %principal, method = %method_name, "mcp");
 
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
@@ -337,6 +426,193 @@ async fn mcp_handler(
             "error": {"code": -32601, "message": format!("method '{other}' not found")},
         }))
         .into_response(),
+    }
+}
+
+/// 401 with the RFC 9728 discovery hint — how claude.ai finds the OAuth surface from a
+/// bare 401 instead of just failing.
+fn unauthorized_json(id: &Value) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(
+            axum::http::header::WWW_AUTHENTICATE,
+            r#"Bearer resource_metadata="/.well-known/oauth-protected-resource""#,
+        )],
+        Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": -32001,
+                "message": "missing or invalid bearer token · send 'Authorization: Bearer <token>', \
+                            or complete the OAuth flow at /oauth/authorize",
+            },
+        })),
+    )
+        .into_response()
+}
+
+/// Best guess at the caller's address, for rate-limit keying.
+///
+/// Behind the shared caddy-router the socket peer is always the router, so keying on it
+/// would put every client in one bucket. Prefer what the proxy forwarded.
+///
+/// ! `X-Forwarded-For` is client-settable when nothing trusted sits in front. The blast
+/// radius is small — a caller must ALREADY hold a valid token to be rate-limited at all,
+/// so spoofing only lets a legitimate holder evade their own ceiling, never bypass auth.
+fn client_ip(headers: &HeaderMap) -> String {
+    for h in ["x-real-ip", "x-forwarded-for"] {
+        if let Some(v) = headers.get(h).and_then(|v| v.to_str().ok()) {
+            if let Some(first) = v.split(',').next().map(str::trim) {
+                if !first.is_empty() {
+                    return first.to_owned();
+                }
+            }
+        }
+    }
+    "unknown".to_owned()
+}
+
+/// Read one cookie out of the `Cookie` header.
+fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(axum::http::header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .filter_map(|kv| kv.trim().split_once('='))
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v.to_owned())
+}
+
+/// Browse the durable record: run history, reports, digests, sessions.
+///
+/// Auth here is the same key as everywhere else, by three routes: `Authorization: Bearer`
+/// (scripts), a `?token=` hand-off (browsers), or the session cookie it leaves behind.
+#[allow(clippy::too_many_lines)] // one auth→resolve→serve pivot · splitting scatters the gate
+async fn library_handler(
+    State(state): State<AppState>,
+    // `/library` carries no path param and `/library/{*path}` does — Option covers both
+    // with one handler rather than two near-identical ones.
+    path: Option<axum::extract::Path<String>>,
+    Query(q): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let rel = path.map(|axum::extract::Path(p)| p).unwrap_or_default();
+    let url_path = format!("/library/{rel}");
+
+    // Hand-off: a valid ?token= is swapped for a cookie and the token is dropped from the
+    // URL, so it does not linger in history, server logs, or a shared screenshot.
+    if let Some(presented) = q.get("token").filter(|t| !t.is_empty()) {
+        let Some(principal) = state
+            .tokens
+            .lookup(presented)
+            .map(str::to_owned)
+            .or_else(|| state.oauth.resolve(presented))
+        else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Html(crate::browse::gate_page(&url_path)),
+            )
+                .into_response();
+        };
+
+        // ! the cookie carries a MINTED session token, never the API key itself
+        let session = state.oauth.mint_session(&principal);
+        let secure = headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|p| p.starts_with("https"));
+        let set = format!(
+            "{}={session}; Max-Age={}; Path=/library; HttpOnly; SameSite=Lax{}",
+            crate::oauth::SESSION_COOKIE,
+            crate::oauth::session_ttl_secs(),
+            if secure { "; Secure" } else { "" },
+        );
+        return (
+            StatusCode::FOUND,
+            [
+                (axum::http::header::LOCATION, url_path.as_str()),
+                (axum::http::header::SET_COOKIE, set.as_str()),
+            ],
+            Html(String::new()),
+        )
+            .into_response();
+    }
+
+    // Bearer, or the session cookie left by the hand-off above.
+    let principal = authenticate(&state, &headers).or_else(|| {
+        cookie(&headers, crate::oauth::SESSION_COOKIE).and_then(|c| state.oauth.resolve(&c))
+    });
+    let Some(principal) = principal else {
+        // ! a plain 401 with NO WWW-Authenticate — a browser basic-auth popup cannot
+        // carry a bearer, so offering one is a dead end. Serve the gate page instead.
+        return (
+            StatusCode::UNAUTHORIZED,
+            Html(crate::browse::gate_page(&url_path)),
+        )
+            .into_response();
+    };
+
+    if !state.limiter.allow(&principal, &client_ip(&headers)) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::RETRY_AFTER, "1")],
+            Html(crate::browse::render(
+                &url_path,
+                &[],
+                "Rate limited. Slow down.",
+            )),
+        )
+            .into_response();
+    }
+
+    let Some(target) = crate::browse::resolve(&state.library, &rel) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Html(crate::browse::render(&url_path, &[], "Not found.")),
+        )
+            .into_response();
+    };
+
+    if target.is_dir() {
+        let entries = crate::browse::listing(&target, &url_path);
+        return Html(crate::browse::render(
+            &url_path,
+            &entries,
+            "Empty. Nothing has been recorded here yet.",
+        ))
+        .into_response();
+    }
+
+    // Only whitelisted types are served — ✗ hand out memory.db or an arbitrary binary.
+    let ext = target
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let Some(media) = crate::browse::inline_type(&ext) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Html(crate::browse::render(
+                &url_path,
+                &[],
+                "Not a readable file.",
+            )),
+        )
+            .into_response();
+    };
+
+    match tokio::fs::read(&target).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, media)],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Html(crate::browse::render(&url_path, &[], "Unreadable.")),
+        )
+            .into_response(),
     }
 }
 

@@ -1,0 +1,101 @@
+# Reference reverse-proxy config for Pipeline's HTTP transport.
+#
+# ! NOT APPLIED. Pipeline is currently ✗ deployed and ✗ released. This file documents
+# the route contract so bringing it up later is a paste, not an archaeology exercise.
+#
+# ! ✗ run this as a standalone Caddy on a host that already has /root/caddy-router.
+# That router OWNS :80/:443 and serves Folio, Kea, Krawl, Kestrel and the harnesses. A
+# second Caddy binding those ports takes TLS down for every one of them. To expose
+# Pipeline, paste the site block below INTO the shared router's Caddyfile and
+# `caddy reload` (zero downtime) — never `docker compose up` a competing Caddy.
+#
+# Routing — the same contract as Sift and Folio, so a client configured for one works
+# against any of them:
+#
+#   /mcp                  → pipeline:8080   MCP JSON-RPC                    [Bearer]
+#   /tokens/whoami        → pipeline:8080   token sanity check              [Bearer]
+#   /library · /library/* → pipeline:8080   the durable record, browsable   [same key]
+#   /.well-known/oauth-*  → pipeline:8080   OAuth discovery                 [public]
+#   /oauth/*              → pipeline:8080   authorize · token · register    [public]
+#   /health               → pipeline:8080   liveness                        [public]
+#   /version              → pipeline:8080   running version                 [public]
+#
+# Caddy terminates TLS and forwards `Authorization: Bearer` untouched — the app is the
+# SOLE auth gate. There is deliberately no basic_auth anywhere, including on /library:
+# a browser username/password popup cannot satisfy a bearer token, so it would only
+# produce a prompt no agent (and no access-token holder) can answer. Folio dropped it
+# from its equivalent route for exactly this reason; Sift never added it.
+#
+# /health and /version bypass auth so a monitor can alert on a dead or stale deployment
+# without holding a token. Neither echoes a token value.
+
+{$PIPELINE_DOMAIN} {
+	encode zstd gzip
+
+	# MCP + the token check. flush_interval -1 is load-bearing, not decoration: MCP's
+	# Streamable HTTP answers with SSE, and any response buffering deadlocks a long
+	# tool call — the server returns 200 and the client hangs forever.
+	@mcp path /mcp /mcp/* /tokens/* /health /version
+	handle @mcp {
+		reverse_proxy pipeline:8080 {
+			flush_interval -1
+			header_up Host {host}
+			header_up X-Real-IP {remote}
+			header_up X-Forwarded-For {remote}
+			# Rate limiting keys on (principal, ip). Without a forwarded address every
+			# client shares the router's IP and lands in one bucket.
+			# RE jobs · image builds · long tools need generous timeouts.
+			transport http {
+				read_timeout 300s
+				write_timeout 300s
+			}
+		}
+	}
+
+	# OAuth 2.0 + PKCE for claude.ai's Custom Connector. NOT gated — claude.ai walks
+	# discovery, registration and the PKCE dance anonymously and only then holds a
+	# token. The bearer issued by /oauth/token gates /mcp above.
+	#
+	# X-Forwarded-Proto/-Host are load-bearing: Pipeline listens on plain HTTP behind
+	# this router, so without them it advertises http://pipeline:8080 in its OAuth
+	# metadata and sends the user's browser to an unreachable internal host.
+	@oauth path /.well-known/oauth-* /oauth/*
+	handle @oauth {
+		reverse_proxy pipeline:8080 {
+			flush_interval -1
+			header_up Host {host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+		}
+	}
+
+	# THE LIBRARY — the durable record, browsable. No basic_auth and no static
+	# file_server: Pipeline is the sole gate. It takes the same key via ?token= /
+	# Bearer / the pipeline_session cookie and serves its own "access token required"
+	# page otherwise. Handing someone a SECOND credential to read their own record
+	# defeats the point of one key everywhere.
+	@library path /library /library/*
+	handle @library {
+		reverse_proxy pipeline:8080 {
+			header_up Host {host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		# GET is required: OAuth discovery and the authorize form are GETs.
+		Access-Control-Allow-Origin "https://claude.ai"
+		Access-Control-Allow-Methods "GET, POST, OPTIONS"
+		Access-Control-Allow-Headers "Authorization, Content-Type, MCP-Session-Id"
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

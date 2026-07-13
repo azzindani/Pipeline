@@ -276,28 +276,32 @@ Exit: maintenance daemon runs unattended for 7 days · auto-PR on green dependen
 
 ---
 
-## 5b. Remote MCP transport
+## 5b. Remote MCP transport + library
 
-**Status: built + tested · ✗ deployed · ✗ released.** The transport works and is covered by CI, but Pipeline is not currently exposed publicly and no image is published. Bringing it up means: restore a deploy lane · publish an image · `docker compose up -d` · point a hostname at it via the shared `/root/caddy-router` (Pipeline ✗ own :80/:443 · the router does).
+**Status: built + tested · ✗ deployed · ✗ released.** Covered by CI; nothing is exposed and no image is published.
 
-Auth model ported from Folio (`src/mcp/{auth,oauth}.ts` → `crates/pipeline-mcp/src/{auth,oauth}.rs`), with one deliberate divergence: **Folio allows an unauthenticated `open` mode · Pipeline ✗**. `/mcp` is remote code execution — the server refuses to start with no token source.
+The endpoint contract is deliberately IDENTICAL to Folio's and Sift's — one key, one client config, one monitor probe works against any of the three.
 
-| Surface | Path | Gate |
-|---|---|---|
-| MCP JSON-RPC | `/mcp` | Bearer · static registry \| OAuth-issued |
-| OAuth discovery | `/.well-known/oauth-*` | public (RFC 8414 · RFC 9728) |
-| OAuth flow | `/oauth/{register,authorize,token}` | public (RFC 7591 DCR · PKCE S256) |
-| Liveness | `/health` | public |
+| Path | Gate |
+|---|---|
+| `/mcp` | Bearer · static registry \| OAuth-issued |
+| `/tokens/whoami` | Bearer · cheapest auth sanity check |
+| `/library` · `/library/*` | SAME key · `?token=` → session cookie |
+| `/.well-known/oauth-*` | public · discovery (RFC 8414 · RFC 9728) |
+| `/oauth/{register,authorize,token}` | public · PKCE S256 (RFC 7591 DCR) |
+| `/health` · `/version` | public · a monitor ✗ need a token |
 
-**Tokens** — `PIPELINE_TOKENS_FILE` → `PIPELINE_TOKENS` → `PIPELINE_TOKEN`, first hit wins. Named tokens map to **principals**, so revoking one holder ✗ rotate everyone.
+**Auth** — `PIPELINE_TOKENS_FILE` → `PIPELINE_TOKENS` → `PIPELINE_TOKEN`. Named tokens map to **principals**: the audit log says WHO called a tool, and revoking one holder is a line out of a file. ! Unlike Folio/Sift there is **no open mode** — `/mcp` is RCE, so a misconfigured lock is a locked door, ✗ an open one.
 
-**OAuth** — claude.ai Custom Connector. User pastes a Pipeline token once at `/oauth/authorize`; the issued bearer inherits that principal and no more. Access 24 h · refresh 30 d rotating single-use · code 10 min one-shot · DCR clients 7 d TTL + 256 cap. Access + refresh persist to `.pipeline/oauth/` — ! in-memory-only forced a re-authorize on every container bounce (Folio hit this; we inherit the fix, not the bug).
+**Library** (`crates/pipeline-mcp/src/browse.rs`) — the durable record, browsable: run history · reports · digests · sessions. Folio's `/files` pattern, with the basic_auth Sift and Folio both dropped. ✗ basic_auth · ✗ static file_server — Pipeline is the SOLE gate. `?token=` once → 30-day HttpOnly cookie holding a **minted session token, never the API key**. Traversal-, symlink- and type-safe; the OAuth store lives at `<library>/.oauth` and is never listed or served.
 
-**Limits** — `/mcp` 8 MiB (tool args are legitimately large) · pre-auth OAuth surface 256 KB. Cap ordering is a compile-time assertion: an anonymous caller ✗ ever get the larger allocation.
+**Rate limit** — token bucket on **(principal, ip)**. Keyed on both: principal alone lets one leaked token spread across hosts; ip alone lets one NAT egress starve everyone behind it. `PIPELINE_RATE_BURST` (40) · `PIPELINE_RATE_PER_SEC` (10) · 0 disables.
 
-**`PIPELINE_REMOTE_MODE=read_only`** (default) still gates every destructive action — an OAuth principal is exactly as privileged as the token that authorized it.
+**Limits** — `/mcp` 8 MiB · pre-auth OAuth 256 KB. Cap ordering is a compile-time assertion: an anonymous caller ✗ ever get the larger allocation.
 
-Not yet: SSE streaming (`flush_interval -1` already set in the router, so it lands without a routing change).
+`caddy/Caddyfile` documents the route contract for the shared router. ! ✗ run it as a standalone Caddy — `/root/caddy-router` owns :80/:443.
+
+Not yet: SSE streaming.
 
 ---
 
