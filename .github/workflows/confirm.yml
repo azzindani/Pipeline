@@ -37,6 +37,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # rust-toolchain.toml pins the EXACT version · rustup honours it, so the
+      # compiler here is byte-for-byte the one the dev box runs. A floating
+      # `stable` is what let CI (1.97) outrun local (1.95) and fail a clippy
+      # lint that passed locally — the loop Pipeline exists to close.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -45,6 +49,9 @@ jobs:
         with:
           shared-key: pipeline
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: toolchain parity
+        run: rustc --version && cargo clippy --version
 
       - name: fmt
         run: cargo fmt --all -- --check
@@ -78,12 +85,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Version comes from rust-toolchain.toml — see the static job.
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: pipeline
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: toolchain parity
+        run: rustc --version
 
       - name: build
         run: cargo build --workspace --locked

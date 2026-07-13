@@ -1,3 +1,14 @@
+# ! Pin an exact version, ✗ "stable".
+#
+# Pipeline's premise is "local CI is the source of truth · local IS CI". A
+# floating `stable` breaks that the moment the CI runner's stable outruns the
+# dev box's: clippy gains a lint, local passes, CI fails, and the developer
+# debugs in CI — the exact loop Pipeline exists to close. It happened (local
+# 1.95 vs CI 1.97).
+#
+# CI installs this same toolchain (dtolnay/rust-toolchain reads this file), so
+# `cargo clippy` locally and `cargo clippy` in CI are now the same compiler.
+# Bump deliberately, run the gates, commit the result.
 [toolchain]
-channel = "stable"
+channel = "1.97.0"
 components = ["rustfmt", "clippy"]
