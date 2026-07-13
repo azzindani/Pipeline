@@ -1,0 +1,29 @@
+# cargo-audit config. Read by `cargo audit` locally AND by the RustSec
+# audit-check step in .github/workflows/confirm.yml — one source of truth, so a
+# green local audit means a green CI audit.
+#
+# ! An entry here is a claim that the advisory cannot affect us. Each one must
+# say WHY, and must be re-checked when the dependency graph changes. ✗ add an
+# ignore to silence a finding you have not actually reasoned about.
+
+[advisories]
+ignore = [
+  # RUSTSEC-2023-0071 · rsa 0.9.x · Marvin Attack (timing sidechannel, medium).
+  #
+  # Not reachable. `rsa` enters Cargo.lock only as a dependency of `sqlx-mysql`,
+  # and Cargo.lock records a crate's OPTIONAL dependencies whether or not the
+  # feature that activates them is enabled. Pipeline builds sqlx with
+  # `default-features = false, features = ["sqlite"]` (see workspace Cargo.toml),
+  # so sqlx-mysql is never compiled and `rsa` is never linked:
+  #
+  #     $ cargo tree -i rsa          → (empty)
+  #     $ cargo tree -i sqlx-mysql   → nothing to print
+  #
+  # Upstream has no fixed release ("No fixed upgrade is available"), so the only
+  # alternatives are pinning an old sqlx or vendoring it — both worse than an
+  # exception for code that is not in the binary.
+  #
+  # ! Revisit if Pipeline ever enables a MySQL backend — at that point the crate
+  # IS linked and this exception must be removed, not widened.
+  "RUSTSEC-2023-0071",
+]
