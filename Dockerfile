@@ -18,8 +18,11 @@ RUN apt-get update \
 COPY Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml clippy.toml ./
 COPY crates ./crates
 
-RUN cargo build --release --bin pipeline \
- && strip target/release/pipeline || true
+# ! ✗ append `|| true` here. It was `cargo build && strip || true`, which is
+# not if-then-else (SC2015): a FAILED cargo build fell through to `|| true` and
+# the layer reported success. The binary is already stripped by
+# RUSTFLAGS="-C strip=symbols" above, so the explicit strip was redundant too.
+RUN cargo build --release --bin pipeline
 
 # ---------- runtime ----------
 FROM debian:bookworm-slim AS runtime
