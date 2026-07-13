@@ -278,7 +278,7 @@ Exit: maintenance daemon runs unattended for 7 days · auto-PR on green dependen
 
 ## 5b. Remote MCP transport
 
-Public deployment: **`https://pipe.casava.space/mcp`** · TLS + hostname routing by the shared `/root/caddy-router` (Pipeline ✗ own :80/:443 · the router does).
+**Status: built + tested · ✗ deployed · ✗ released.** The transport works and is covered by CI, but Pipeline is not currently exposed publicly and no image is published. Bringing it up means: restore a deploy lane · publish an image · `docker compose up -d` · point a hostname at it via the shared `/root/caddy-router` (Pipeline ✗ own :80/:443 · the router does).
 
 Auth model ported from Folio (`src/mcp/{auth,oauth}.ts` → `crates/pipeline-mcp/src/{auth,oauth}.rs`), with one deliberate divergence: **Folio allows an unauthenticated `open` mode · Pipeline ✗**. `/mcp` is remote code execution — the server refuses to start with no token source.
 

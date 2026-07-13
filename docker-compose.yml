@@ -41,10 +41,11 @@
 # ─────────────────────────────────────────────────────────────────────────────
 services:
   pipeline:
-    # Default: build from the local source tree (`docker compose up -d --build`).
-    # To run the image the deploy lane published to GHCR instead:
-    #   export PIPELINE_IMAGE=ghcr.io/azzindani/pipeline:latest
-    #   docker compose pull && docker compose up -d --no-build
+    # Builds from the local source tree: `docker compose up -d --build`.
+    #
+    # ! No image is published. There is no release lane and nothing in a
+    # registry — PIPELINE_IMAGE stays as an override hook for whenever one
+    # exists again, but the default is and should be a local build.
     image: ${PIPELINE_IMAGE:-pipeline:latest}
     container_name: pipeline
     build:
