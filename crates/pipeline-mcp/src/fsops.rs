@@ -97,7 +97,7 @@ impl Writable {
         writes_enabled().then_some(Self(()))
     }
     #[cfg(test)]
-    const fn granted() -> Self {
+    pub(crate) const fn granted() -> Self {
         Self(())
     }
 }

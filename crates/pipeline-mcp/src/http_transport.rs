@@ -123,6 +123,10 @@ pub struct AppState {
     pub(crate) limiter: Arc<RateLimiter>,
     pub(crate) library: Arc<PathBuf>,
     pub(crate) mode: RemoteMode,
+    /// The library write capability, resolved from `PIPELINE_LIBRARY_WRITE` ONCE at boot
+    /// rather than per request. `None` → the library is read-only. Being unforgeable, its
+    /// mere presence in state is the permission; a handler cannot conjure one.
+    pub(crate) writable: Option<crate::fsops::Writable>,
 }
 
 /// The library root — Pipeline's durable record: run history, reports, digests,
@@ -199,11 +203,64 @@ pub async fn serve_http(bind: Option<&str>) -> Result<(), crate::McpError> {
         library: Arc::new(library_dir()),
         limiter: Arc::clone(&limiter),
         mode,
+        // ! The ONLY place the write switch is read. From here on it is a value in state,
+        // so a handler cannot re-read env, and a test can inject the grant directly.
+        writable: crate::fsops::Writable::from_env(),
     };
 
-    // The OAuth + discovery surface is deliberately PUBLIC and cross-origin:
-    // claude.ai walks it anonymously to discover, register, and run PKCE before
-    // any user has authenticated. The bearer it receives then gates /mcp.
+    // ✗ never print token values — only the principal names.
+    let auth_summary = app_state.tokens.describe();
+    let app = build_router(app_state);
+
+    eprintln!(
+        "pipeline-mcp http transport · {addr} · mode={} · auth={auth_summary} · \
+         rate={} · oauth=/oauth/authorize · library=/library",
+        mode.as_str(),
+        limiter.describe(),
+    );
+    // Reclaim idle rate-limit buckets. Without this the map only ever grows — one entry
+    // per (principal, ip) for the life of the process. A detached task, not a request-path
+    // check, so a quiet server still reclaims and a busy one pays nothing per request.
+    if limiter.enabled() {
+        let sweeper = Arc::clone(&limiter);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.tick().await; // interval fires immediately; skip that one
+            loop {
+                tick.tick().await;
+                let dropped = sweeper.sweep();
+                if dropped > 0 {
+                    tracing::debug!(dropped, "rate-limit buckets reclaimed");
+                }
+            }
+        });
+    }
+
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| crate::McpError::Transport(format!("bind {addr}: {e}")))?;
+    // ! `into_make_service_with_connect_info` is what makes the socket peer reachable
+    // from a handler. Plain `into_make_service` would leave `ConnectInfo` unextractable,
+    // and `client_ip` would silently fall back to "unknown" for every direct client.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|e| crate::McpError::Transport(format!("serve: {e}")))?;
+    Ok(())
+}
+
+/// Assemble the whole route table from a fully-built [`AppState`].
+///
+/// ! Reads NO environment — every knob is already resolved into `state`. That is what makes
+/// the surface testable: `serve_http` reads env once and hands the result here, and the
+/// integration tests construct `state` directly and drive this router in-process. The two
+/// callers must get the identical router, so there is exactly one place it is built.
+pub(crate) fn build_router(state: AppState) -> Router {
+    // The OAuth + discovery surface is deliberately PUBLIC and cross-origin: claude.ai walks
+    // it anonymously to discover, register, and run PKCE before any user has authenticated.
+    // The bearer it receives then gates /mcp.
     let public_cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -256,10 +313,7 @@ pub async fn serve_http(bind: Option<&str>) -> Result<(), crate::McpError> {
         .route("/library/upload", post(library_upload))
         .layer(DefaultBodyLimit::max(crate::fsops::MAX_UPLOAD_BYTES));
 
-    // ✗ never print token values — only the principal names.
-    let auth_summary = app_state.tokens.describe();
-
-    let app = Router::new()
+    Router::new()
         .route("/mcp", post(mcp_handler))
         .layer(DefaultBodyLimit::max(mcp_body_limit()))
         .route("/health", get(health))
@@ -268,45 +322,7 @@ pub async fn serve_http(bind: Option<&str>) -> Result<(), crate::McpError> {
         .merge(library)
         .merge(upload)
         .merge(public)
-        .with_state(app_state);
-
-    eprintln!(
-        "pipeline-mcp http transport · {addr} · mode={} · auth={auth_summary} · \
-         rate={} · oauth=/oauth/authorize · library=/library",
-        mode.as_str(),
-        limiter.describe(),
-    );
-    // Reclaim idle rate-limit buckets. Without this the map only ever grows — one entry
-    // per (principal, ip) for the life of the process. A detached task, not a request-path
-    // check, so a quiet server still reclaims and a busy one pays nothing per request.
-    if limiter.enabled() {
-        let sweeper = Arc::clone(&limiter);
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
-            tick.tick().await; // interval fires immediately; skip that one
-            loop {
-                tick.tick().await;
-                let dropped = sweeper.sweep();
-                if dropped > 0 {
-                    tracing::debug!(dropped, "rate-limit buckets reclaimed");
-                }
-            }
-        });
-    }
-
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| crate::McpError::Transport(format!("bind {addr}: {e}")))?;
-    // ! `into_make_service_with_connect_info` is what makes the socket peer reachable
-    // from a handler. Plain `into_make_service` would leave `ConnectInfo` unextractable,
-    // and `client_ip` would silently fall back to "unknown" for every direct client.
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .map_err(|e| crate::McpError::Transport(format!("serve: {e}")))?;
-    Ok(())
+        .with_state(state)
 }
 
 /// Liveness — public on purpose. A monitor should not need a token to see the box is up,
@@ -862,9 +878,8 @@ async fn library_op(
             .into_response();
     }
 
-    // ! The ONLY place the write switch is read. `Writable` is unforgeable, so an op that
-    // forgets to check it does not compile — see [`crate::fsops::Writable`].
-    let Some(cap) = crate::fsops::Writable::from_env() else {
+    // The write capability was resolved at boot into state; `None` → read-only.
+    let Some(cap) = state.writable else {
         return fs_err(&crate::fsops::FsError::Disabled);
     };
 
@@ -943,7 +958,7 @@ async fn library_upload(
             .into_response();
     }
 
-    let Some(cap) = crate::fsops::Writable::from_env() else {
+    let Some(cap) = state.writable else {
         return fs_err(&crate::fsops::FsError::Disabled);
     };
 
