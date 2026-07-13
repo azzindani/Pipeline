@@ -29,6 +29,35 @@ pub struct PipelineConfig {
     pub deploy: Option<Deploy>,
     #[serde(default)]
     pub maintenance: Option<Maintenance>,
+    #[serde(default)]
+    pub standards: Standards,
+}
+
+/// Binding to the external Standards repo — a dependency, not a vendored copy.
+///
+/// `source` + `pin` give it dependency semantics: a resolvable origin and a
+/// locked version. Upstream ✗ silently move a project's gates; `pin` moves only
+/// on an explicit `pipeline standards update`.
+///
+/// `project_type` · `surfaces` are keys into the Standards repo's own routing
+/// tables (ROUTER.md §5 · §6). Pipeline ✗ define routes — it selects them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Standards {
+    /// Local path | git URL. Unset → resolution cascade (env → cache → clone).
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Resolved commit SHA. Written on first resolve, moved on `standards update`.
+    #[serde(default)]
+    pub pin: Option<String>,
+    /// ROUTER.md §5 key, e.g. `MCP server`. Unset → always-on + language only.
+    #[serde(default)]
+    pub project_type: Option<String>,
+    /// ROUTER.md §6 keys, e.g. `Command line` · `Deployed service`.
+    #[serde(default)]
+    pub surfaces: Vec<String>,
+    /// Language routes. Empty → derived from `stack.runtime`.
+    #[serde(default)]
+    pub languages: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
