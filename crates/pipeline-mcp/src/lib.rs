@@ -10,10 +10,12 @@
 #![allow(clippy::doc_markdown, clippy::manual_let_else)] // domain prose · early-return readability
 
 mod auth;
+mod browse;
 mod dispatch;
 mod handlers;
 mod http_transport;
 mod oauth;
+mod ratelimit;
 mod registry;
 mod rmcp_transport;
 mod server;
