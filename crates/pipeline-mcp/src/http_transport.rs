@@ -18,8 +18,7 @@
 //! |---|---|
 //! | `/mcp` | Bearer · static registry or OAuth-issued |
 //! | `/tokens/whoami` | Bearer · the cheapest auth sanity check |
-//! | `/library` | the SAME key · the gallery ([`crate::library`]) |
-//! | `/library?raw=1`, `/library/*` | the SAME key · the raw browser ([`crate::browse`]) |
+//! | `/library`, `/library/*` | the SAME key · file manager over the record ([`crate::browse`]) |
 //! | `/.well-known/oauth-*` | public — discovery |
 //! | `/oauth/{register,authorize,token}` | public — PKCE handshake |
 //! | `/health`, `/version` | public — a monitor should not need a token |
@@ -679,6 +678,8 @@ async fn library_handler(
             StatusCode::TOO_MANY_REQUESTS,
             ratelimit_headers(&state, &quota),
             Html(crate::browse::render(
+                &state.library,
+                "",
                 &url_path,
                 &[],
                 &format!("Rate limited. Retry in {}s.", quota.retry_after_secs),
@@ -687,21 +688,16 @@ async fn library_handler(
             .into_response();
     }
 
-    // The front door is the GALLERY, not a directory listing — the record is meant to be
-    // read, and a bare list of filenames tells you nothing about which run went red.
-    // `?raw=1` drops to the file browser underneath; every path below /library is the
-    // browser already, so a card can link straight at the artifact it describes.
-    if rel.is_empty() && !q.contains_key("raw") {
-        return Html(crate::library::render_gallery(&crate::library::catalog(
-            &state.library,
-        )))
-        .into_response();
-    }
-
     let Some(target) = crate::browse::resolve(&state.library, &rel) else {
         return (
             StatusCode::NOT_FOUND,
-            Html(crate::browse::render(&url_path, &[], "Not found.")),
+            Html(crate::browse::render(
+                &state.library,
+                "",
+                &url_path,
+                &[],
+                "Not found.",
+            )),
         )
             .into_response();
     };
@@ -709,6 +705,8 @@ async fn library_handler(
     if target.is_dir() {
         let entries = crate::browse::listing(&target, &url_path);
         return Html(crate::browse::render(
+            &state.library,
+            &rel,
             &url_path,
             &entries,
             "Empty. Nothing has been recorded here yet.",
@@ -725,6 +723,8 @@ async fn library_handler(
         return (
             StatusCode::NOT_FOUND,
             Html(crate::browse::render(
+                &state.library,
+                "",
                 &url_path,
                 &[],
                 "Not a readable file.",
@@ -742,7 +742,13 @@ async fn library_handler(
             .into_response(),
         Err(_) => (
             StatusCode::NOT_FOUND,
-            Html(crate::browse::render(&url_path, &[], "Unreadable.")),
+            Html(crate::browse::render(
+                &state.library,
+                "",
+                &url_path,
+                &[],
+                "Unreadable.",
+            )),
         )
             .into_response(),
     }
