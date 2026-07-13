@@ -531,7 +531,7 @@ mod tests {
         let out = render_ac_tests("auth", &["valid login".into(), "rejects bad token".into()]);
         assert!(out.contains("fn ac_01_valid_login"));
         assert!(out.contains("fn ac_02_rejects_bad_token"));
-        assert!(out.matches("#[test]").count() == 2);
+        assert_eq!(out.matches("#[test]").count(), 2);
     }
 
     #[test]
