@@ -14,6 +14,7 @@ mod browse;
 mod dispatch;
 mod handlers;
 mod http_transport;
+mod library;
 mod oauth;
 mod ratelimit;
 mod registry;

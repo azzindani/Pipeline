@@ -40,10 +40,20 @@
 		reverse_proxy pipeline:8080 {
 			flush_interval -1
 			header_up Host {host}
+			# Rate limiting keys on (principal, ip). Without a forwarded address every
+			# client behind this router shares its IP and lands in ONE bucket, so a
+			# single noisy client starves everyone else.
+			#
+			# ! Pipeline reads the LAST X-Forwarded-For hop, never the first. A client
+			# can forge the header; a proxy appends the peer it actually saw, so the
+			# forged value lands to the LEFT of the real one. Reading the first hop
+			# would let a caller pick its own rate-limit key, rotate it per request,
+			# and turn the limiter off while it still looked like it was working.
+			# Whether this is a set (as here) or an append (`+X-Forwarded-For`), the
+			# last hop is the one this router wrote — which is why that rule is safe
+			# to depend on.
 			header_up X-Real-IP {remote}
 			header_up X-Forwarded-For {remote}
-			# Rate limiting keys on (principal, ip). Without a forwarded address every
-			# client shares the router's IP and lands in one bucket.
 			# RE jobs · image builds · long tools need generous timeouts.
 			transport http {
 				read_timeout 300s
@@ -74,13 +84,31 @@
 	# Bearer / the pipeline_session cookie and serves its own "access token required"
 	# page otherwise. Handing someone a SECOND credential to read their own record
 	# defeats the point of one key everywhere.
-	@library path /library /library/*
+	#
+	# ✗ do NOT point a `root`/`file_server` at the library directory. It contains
+	# .oauth/ — the live access + refresh token store. Caddy's file_server would
+	# happily serve it; Pipeline's browser refuses (dot-prefixed + deny-listed +
+	# containment-checked). The app must stay the only thing that reads that tree.
+	@library path /library /library/ /library/*
 	handle @library {
 		reverse_proxy pipeline:8080 {
 			header_up Host {host}
 			header_up X-Forwarded-Proto {scheme}
 			header_up X-Forwarded-Host {host}
+			# Same reason as /mcp — the library is rate-limited on (principal, ip) too,
+			# and without these every reader shares the router's address.
+			header_up X-Real-IP {remote}
+			header_up X-Forwarded-For {remote}
 		}
+	}
+
+	# The library is the front door — there is no other UI to land on.
+	redir / /library
+
+	# Anything else is honestly nothing. Without this Caddy answers an unmatched path
+	# with a blank 200, which reads like a live page that failed to render.
+	handle {
+		respond "Not found" 404
 	}
 
 	header {

@@ -286,22 +286,32 @@ The endpoint contract is deliberately IDENTICAL to Folio's and Sift's — one ke
 |---|---|
 | `/mcp` | Bearer · static registry \| OAuth-issued |
 | `/tokens/whoami` | Bearer · cheapest auth sanity check |
-| `/library` · `/library/*` | SAME key · `?token=` → session cookie |
+| `/library` | SAME key · the **gallery** |
+| `/library?raw=1` · `/library/*` | SAME key · the raw file browser |
 | `/.well-known/oauth-*` | public · discovery (RFC 8414 · RFC 9728) |
 | `/oauth/{register,authorize,token}` | public · PKCE S256 (RFC 7591 DCR) |
 | `/health` · `/version` | public · a monitor ✗ need a token |
 
 **Auth** — `PIPELINE_TOKENS_FILE` → `PIPELINE_TOKENS` → `PIPELINE_TOKEN`. Named tokens map to **principals**: the audit log says WHO called a tool, and revoking one holder is a line out of a file. ! Unlike Folio/Sift there is **no open mode** — `/mcp` is RCE, so a misconfigured lock is a locked door, ✗ an open one.
 
-**Library** (`crates/pipeline-mcp/src/browse.rs`) — the durable record, browsable: run history · reports · digests · sessions. Folio's `/files` pattern, with the basic_auth Sift and Folio both dropped. ✗ basic_auth · ✗ static file_server — Pipeline is the SOLE gate. `?token=` once → 30-day HttpOnly cookie holding a **minted session token, never the API key**. Traversal-, symlink- and type-safe; the OAuth store lives at `<library>/.oauth` and is never listed or served.
+**Library** — two layers over one root:
 
-**Rate limit** — token bucket on **(principal, ip)**. Keyed on both: principal alone lets one leaked token spread across hosts; ip alone lets one NAT egress starve everyone behind it. `PIPELINE_RATE_BURST` (40) · `PIPELINE_RATE_PER_SEC` (10) · 0 disables.
+- **Gallery** (`library.rs`) — the front door. Cards for every artifact: kind badge · pass/fail dot · cheap one-line summary · search · sort · kind filter · grid⇄list · theme. Ported from Folio's `library-gallery.ts` in SHAPE, ✗ content: Folio catalogs *designs* with rendered thumbnails; Pipeline has digests · reports · sessions · screenshots · RE jobs, so a card carries status where Folio's carried a picture. Reads are cheap — a bounded 16 KB peek per artifact, never a full parse (a digest is megabytes).
+- **Browser** (`browse.rs`) — underneath, at every path below `/library`. Folio's `/files` pattern with the basic_auth Folio and Sift both dropped. ✗ basic_auth · ✗ static `file_server` — Pipeline is the SOLE gate. `?token=` once → 30-day HttpOnly cookie holding a **minted session token, never the API key**.
+
+! Both listing paths go through **one** containment rule (`browse::resolve` — canonicalize + deny-list + root check). The gallery originally walked the tree itself with `read_dir` + `metadata`, which follows symlinks: a symlink to `/etc` catalogued the whole of `/etc` onto cards. The browser was never exploitable, which is exactly what made a second, weaker listing path dangerous. The OAuth store at `<library>/.oauth` is excluded three ways: dot-prefixed · deny-listed · containment-checked.
+
+**Rate limit** — token bucket on **(principal, ip)**. Keyed on both: principal alone lets one leaked token spread across hosts; ip alone lets one NAT egress starve everyone behind it. `PIPELINE_RATE_BURST` (40) · `PIPELINE_RATE_PER_SEC` (10) · 0 disables. Idle buckets swept every 60s — the map is otherwise a slow leak, one entry per (principal, ip), forever. `X-RateLimit-Limit`/`-Remaining` on **every** response (✗ only the 429 — a client that learns the limit exists by being cut off has already been cut off); `Retry-After` computed from the real refill rate, ✗ hardcoded.
+
+! **Client IP is the LAST `X-Forwarded-For` hop**, never the first. A proxy *appends* the peer it saw, so a client-forged value lands to the LEFT — reading the first hop lets a caller pick its own rate-limit key, rotate it per request, and switch the limiter off while it still looks like it works. No proxy headers → the socket peer (`ConnectInfo`), so a direct deploy ✗ key every client to one shared bucket.
 
 **Limits** — `/mcp` 8 MiB · pre-auth OAuth 256 KB. Cap ordering is a compile-time assertion: an anonymous caller ✗ ever get the larger allocation.
 
-`caddy/Caddyfile` documents the route contract for the shared router. ! ✗ run it as a standalone Caddy — `/root/caddy-router` owns :80/:443.
+**Wire conformance** — the whole `notifications/*` namespace → **202 + empty body** (a notification has no id, so any response object is unanswerable; strict SDK clients drop the connection on one). `GET`/`DELETE /mcp` → 405 + `Allow`.
 
-Not yet: SSE streaming.
+`caddy/Caddyfile` documents the route contract for the shared router. ! ✗ run it as a standalone Caddy — `/root/caddy-router` owns :80/:443. ! ✗ point a Caddy `file_server` at the library root — it would serve `.oauth/`.
+
+Not yet: SSE streaming · live gallery refresh (Folio pushes new cards over SSE).
 
 ---
 
