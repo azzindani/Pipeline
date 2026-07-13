@@ -19,6 +19,7 @@
 //! | `/mcp` | Bearer · static registry or OAuth-issued |
 //! | `/tokens/whoami` | Bearer · the cheapest auth sanity check |
 //! | `/library`, `/library/*` | the SAME key · file manager over the record ([`crate::browse`]) |
+//! | `/library/op`, `/library/upload` | the SAME key · mutation · `PIPELINE_LIBRARY_WRITE=1` ([`crate::fsops`]) |
 //! | `/.well-known/oauth-*` | public — discovery |
 //! | `/oauth/{register,authorize,token}` | public — PKCE handshake |
 //! | `/health`, `/version` | public — a monitor should not need a token |
@@ -235,13 +236,25 @@ pub async fn serve_http(bind: Option<&str>) -> Result<(), crate::McpError> {
     // A browser basic-auth popup could never be satisfied by an access token anyway, and
     // handing someone a SECOND credential to read their own record defeats the point of
     // one key everywhere. Its own body limit stays small — these are GETs.
+    //
+    // Writes (rename · move · delete · mkdir) live on /library/op and are OFF unless
+    // PIPELINE_LIBRARY_WRITE=1 — see [`crate::fsops`] for why they are deliberately not
+    // behind PIPELINE_REMOTE_MODE=full.
     let library = Router::new()
         .route("/library", get(library_handler))
         // A typed-by-hand trailing slash must not 404. `{*path}` requires at least one
         // segment, so `/library/` matches neither it nor `/library` — an easy dead page.
         .route("/library/", get(library_handler))
+        .route("/library/op", post(library_op))
         .route("/library/{*path}", get(library_handler))
         .layer(DefaultBodyLimit::max(64 * 1024));
+
+    // Upload needs its own, larger cap — the 64 KB above is right for a GET or a rename
+    // and far too small for a report. Kept on a separate route so raising it here cannot
+    // widen the body limit on everything else.
+    let upload = Router::new()
+        .route("/library/upload", post(library_upload))
+        .layer(DefaultBodyLimit::max(crate::fsops::MAX_UPLOAD_BYTES));
 
     // ✗ never print token values — only the principal names.
     let auth_summary = app_state.tokens.describe();
@@ -253,6 +266,7 @@ pub async fn serve_http(bind: Option<&str>) -> Result<(), crate::McpError> {
         .route("/version", get(version))
         .route("/tokens/whoami", get(whoami))
         .merge(library)
+        .merge(upload)
         .merge(public)
         .with_state(app_state);
 
@@ -734,12 +748,23 @@ async fn library_handler(
     };
 
     match tokio::fs::read(&target).await {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, media)],
-            bytes,
-        )
-            .into_response(),
+        Ok(bytes) => {
+            let mut h = HeaderMap::new();
+            if let Ok(v) = media.parse() {
+                h.insert(axum::http::header::CONTENT_TYPE, v);
+            }
+            // `?download=1` → save instead of render. The filename is quoted and the
+            // quotes/backslashes stripped: a header value cannot be escaped the way HTML
+            // can, so a name containing `"` would otherwise break out of the parameter.
+            if q.contains_key("download") {
+                let (_, leaf) = crate::fsops::split_rel(&rel);
+                let safe: String = leaf.chars().filter(|c| *c != '"' && *c != '\\').collect();
+                if let Ok(v) = format!("attachment; filename=\"{safe}\"").parse() {
+                    h.insert(axum::http::header::CONTENT_DISPOSITION, v);
+                }
+            }
+            (StatusCode::OK, h, bytes).into_response()
+        }
         Err(_) => (
             StatusCode::NOT_FOUND,
             Html(crate::browse::render(
@@ -751,6 +776,184 @@ async fn library_handler(
             )),
         )
             .into_response(),
+    }
+}
+
+/// Auth for the write routes: Bearer, or the session cookie the `?token=` hand-off left.
+///
+/// Returns the principal AND whether it came from the cookie — the caller needs to know,
+/// because a cookie is what a CSRF attack rides on and a Bearer header is not.
+fn library_auth(state: &AppState, headers: &HeaderMap) -> Option<(String, bool)> {
+    if let Some(p) = authenticate(state, headers) {
+        return Some((p, false));
+    }
+    cookie(headers, crate::oauth::SESSION_COOKIE)
+        .and_then(|c| state.oauth.resolve(&c))
+        .map(|p| (p, true))
+}
+
+/// ! CSRF guard for cookie-authenticated writes.
+///
+/// The session cookie is `SameSite=Lax`, which already stops a cross-site POST from
+/// carrying it — that is the primary defence. This is the second one, because a single
+/// cookie-attribute typo would otherwise silently re-open the hole: evil.com submits a
+/// form to /library/op, the browser attaches your session, and your report is in the
+/// trash. Browsers always send `Origin` on a POST, so a mismatch is decisive.
+///
+/// A Bearer-authenticated script sends no Origin and needs none — it cannot be CSRF'd,
+/// since an attacker's page cannot make the browser attach a header it does not have.
+fn csrf_ok(headers: &HeaderMap, via_cookie: bool) -> bool {
+    if !via_cookie {
+        return true;
+    }
+    let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) else {
+        return false; // a browser POST without Origin is not a browser POST we trust
+    };
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(axum::http::header::HOST))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    origin
+        .rsplit_once("//")
+        .is_some_and(|(_, o)| !host.is_empty() && o == host)
+}
+
+fn fs_err(e: &crate::fsops::FsError) -> Response {
+    (
+        StatusCode::from_u16(e.status()).unwrap_or(StatusCode::BAD_REQUEST),
+        Json(json!({"ok": false, "error": e.message()})),
+    )
+        .into_response()
+}
+
+/// `POST /library/op` — rename · move · delete · mkdir.
+///
+/// Delete is a MOVE to `trash/` and never an unlink; see [`crate::fsops`].
+async fn library_op(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some((principal, via_cookie)) = library_auth(&state, &headers) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"ok": false, "error": "Unauthorized."})),
+        )
+            .into_response();
+    };
+    if !csrf_ok(&headers, via_cookie) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"ok": false, "error": "Cross-origin write refused."})),
+        )
+            .into_response();
+    }
+    let quota = state
+        .limiter
+        .allow(&principal, &client_ip(&headers, Some(peer)));
+    if !quota.ok {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            ratelimit_headers(&state, &quota),
+            Json(json!({"ok": false, "error": "Rate limited."})),
+        )
+            .into_response();
+    }
+
+    // ! The ONLY place the write switch is read. `Writable` is unforgeable, so an op that
+    // forgets to check it does not compile — see [`crate::fsops::Writable`].
+    let Some(cap) = crate::fsops::Writable::from_env() else {
+        return fs_err(&crate::fsops::FsError::Disabled);
+    };
+
+    let s = |k: &str| {
+        body.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let (op, path, name, dest) = (s("op"), s("path"), s("name"), s("dest"));
+    let root = state.library.as_path();
+
+    // Audit every mutation with the principal — "someone deleted it" is not an audit trail.
+    tracing::info!(token = %principal, op = %op, path = %path, "library write");
+
+    let result = match op.as_str() {
+        "rename" => crate::fsops::rename(cap, root, &path, &name).map(|()| json!({"ok": true})),
+        "move" => crate::fsops::move_to(cap, root, &path, &dest).map(|()| json!({"ok": true})),
+        "mkdir" => crate::fsops::mkdir(cap, root, &path, &name).map(|()| json!({"ok": true})),
+        "delete" => {
+            let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+            crate::fsops::delete(cap, root, &path, &stamp)
+                .map(|to| json!({"ok": true, "trashed_to": to}))
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"ok": false, "error": format!("Unknown op: {op}")})),
+            )
+                .into_response();
+        }
+    };
+
+    match result {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => fs_err(&e),
+    }
+}
+
+/// `POST /library/upload?dir=<rel>&name=<leaf>` — raw body is the file.
+///
+/// Raw body rather than multipart on purpose: multipart drags in a parser to handle a
+/// single file, and every byte of that parser is attack surface on a route that writes to
+/// disk. The filename comes from a query param that goes through the same leaf validation
+/// as every other destination.
+async fn library_upload(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(q): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let Some((principal, via_cookie)) = library_auth(&state, &headers) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"ok": false, "error": "Unauthorized."})),
+        )
+            .into_response();
+    };
+    if !csrf_ok(&headers, via_cookie) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"ok": false, "error": "Cross-origin write refused."})),
+        )
+            .into_response();
+    }
+    let quota = state
+        .limiter
+        .allow(&principal, &client_ip(&headers, Some(peer)));
+    if !quota.ok {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            ratelimit_headers(&state, &quota),
+            Json(json!({"ok": false, "error": "Rate limited."})),
+        )
+            .into_response();
+    }
+
+    let Some(cap) = crate::fsops::Writable::from_env() else {
+        return fs_err(&crate::fsops::FsError::Disabled);
+    };
+
+    let dir = q.get("dir").cloned().unwrap_or_default();
+    let name = q.get("name").cloned().unwrap_or_default();
+    tracing::info!(token = %principal, dir = %dir, name = %name, "library upload");
+
+    match crate::fsops::upload(cap, state.library.as_path(), &dir, &name, &body) {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(e) => fs_err(&e),
     }
 }
 
