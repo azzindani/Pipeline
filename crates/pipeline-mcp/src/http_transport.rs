@@ -18,10 +18,14 @@
 //! |---|---|
 //! | `/mcp` | Bearer · static registry or OAuth-issued |
 //! | `/tokens/whoami` | Bearer · the cheapest auth sanity check |
-//! | `/library`, `/library/*` | the SAME key · `?token=` → session cookie |
+//! | `/library` | the SAME key · the gallery ([`crate::library`]) |
+//! | `/library?raw=1`, `/library/*` | the SAME key · the raw browser ([`crate::browse`]) |
 //! | `/.well-known/oauth-*` | public — discovery |
 //! | `/oauth/{register,authorize,token}` | public — PKCE handshake |
 //! | `/health`, `/version` | public — a monitor should not need a token |
+//!
+//! `?token=…` on any library path is swapped for an HttpOnly session cookie and dropped
+//! from the URL, so the key never lingers in history, logs, or a shared screenshot.
 //!
 //! # Security
 //!
@@ -52,7 +56,7 @@ use crate::ratelimit::RateLimiter;
 use crate::registry::registry;
 use crate::server::ServerState;
 use crate::tools::ToolRequest;
-use axum::extract::{DefaultBodyLimit, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -234,6 +238,9 @@ pub async fn serve_http(bind: Option<&str>) -> Result<(), crate::McpError> {
     // one key everywhere. Its own body limit stays small — these are GETs.
     let library = Router::new()
         .route("/library", get(library_handler))
+        // A typed-by-hand trailing slash must not 404. `{*path}` requires at least one
+        // segment, so `/library/` matches neither it nor `/library` — an easy dead page.
+        .route("/library/", get(library_handler))
         .route("/library/{*path}", get(library_handler))
         .layer(DefaultBodyLimit::max(64 * 1024));
 
@@ -256,12 +263,36 @@ pub async fn serve_http(bind: Option<&str>) -> Result<(), crate::McpError> {
         mode.as_str(),
         limiter.describe(),
     );
+    // Reclaim idle rate-limit buckets. Without this the map only ever grows — one entry
+    // per (principal, ip) for the life of the process. A detached task, not a request-path
+    // check, so a quiet server still reclaims and a busy one pays nothing per request.
+    if limiter.enabled() {
+        let sweeper = Arc::clone(&limiter);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.tick().await; // interval fires immediately; skip that one
+            loop {
+                tick.tick().await;
+                let dropped = sweeper.sweep();
+                if dropped > 0 {
+                    tracing::debug!(dropped, "rate-limit buckets reclaimed");
+                }
+            }
+        });
+    }
+
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| crate::McpError::Transport(format!("bind {addr}: {e}")))?;
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| crate::McpError::Transport(format!("serve: {e}")))?;
+    // ! `into_make_service_with_connect_info` is what makes the socket peer reachable
+    // from a handler. Plain `into_make_service` would leave `ConnectInfo` unextractable,
+    // and `client_ip` would silently fall back to "unknown" for every direct client.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .map_err(|e| crate::McpError::Transport(format!("serve: {e}")))?;
     Ok(())
 }
 
@@ -299,6 +330,11 @@ async fn whoami(State(state): State<AppState>, headers: HeaderMap) -> Response {
 #[allow(clippy::too_many_lines)] // single dispatch pivot · splitting hurts readability
 async fn mcp_handler(
     State(state): State<AppState>,
+    // ! must precede `Json` — it consumes the body, so nothing can extract after it.
+    // Non-Option: the server ALWAYS runs with `into_make_service_with_connect_info`, so
+    // this cannot fail. An Option would quietly degrade to "unknown" if that call were
+    // ever dropped, re-opening the shared-bucket bug; this way it fails loudly instead.
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<Value>,
 ) -> Response {
@@ -306,19 +342,22 @@ async fn mcp_handler(
         return unauthorized_json(&req.get("id").cloned().unwrap_or(Value::Null));
     };
 
-    if !state.limiter.allow(&principal, &client_ip(&headers)) {
+    let ip = client_ip(&headers, Some(peer));
+    let quota = state.limiter.allow(&principal, &ip);
+    if !quota.ok {
         return (
             StatusCode::TOO_MANY_REQUESTS,
-            [(axum::http::header::RETRY_AFTER, "1")],
+            ratelimit_headers(&state, &quota),
             Json(json!({
                 "jsonrpc": "2.0",
                 "id": req.get("id").cloned().unwrap_or(Value::Null),
                 "error": {
                     "code": -32029,
                     "message": format!(
-                        "rate limited · over {} · back off, or raise PIPELINE_RATE_BURST / \
+                        "rate limited · over {} · retry in {}s, or raise PIPELINE_RATE_BURST / \
                          PIPELINE_RATE_PER_SEC (0 disables)",
-                        state.limiter.describe()
+                        state.limiter.describe(),
+                        quota.retry_after_secs,
                     ),
                 },
             })),
@@ -333,6 +372,31 @@ async fn mcp_handler(
 
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+
+    // ! The WHOLE `notifications/*` namespace takes 202 + an EMPTY body, per the MCP
+    // Streamable-HTTP spec. A notification carries no id, so any response object — even a
+    // JSON-RPC error — is unanswerable, and strict SDK clients (LM Studio) drop the
+    // connection on receiving one. Matching only `notifications/initialized` left every
+    // OTHER notification (`notifications/cancelled`, `.../progress`) falling through to
+    // the default arm, which replied "method not found" with a null id and killed the
+    // session. Match the namespace, not the one member of it we happened to know about.
+    if method.starts_with("notifications/") {
+        return StatusCode::ACCEPTED.into_response();
+    }
+
+    // Budget headers ride on EVERY answer, not just the refusal. A client that can watch
+    // `remaining` fall can ease off before it trips; one that only learns the limit exists
+    // by getting a 429 has already been cut off. Publishing them solely on the 429 is the
+    // half that doesn't help anyone.
+    let mut resp = dispatch_method(&state, method, &id, &req).await;
+    resp.headers_mut().extend(ratelimit_headers(&state, &quota));
+    resp
+}
+
+/// The JSON-RPC method pivot, split out so `mcp_handler` can decorate whatever it returns.
+#[allow(clippy::too_many_lines)] // single dispatch pivot · splitting hurts readability
+async fn dispatch_method(state: &AppState, method: &str, id: &Value, req: &Value) -> Response {
+    let id = id.clone();
     match method {
         "initialize" => {
             let resp = json!({
@@ -353,7 +417,9 @@ async fn mcp_handler(
             Json(resp).into_response()
         }
         "ping" => Json(json!({"jsonrpc": "2.0", "id": id, "result": {}})).into_response(),
-        "notifications/initialized" | "initialized" => StatusCode::NO_CONTENT.into_response(),
+        // Bare "initialized" is not in the spec's notification namespace but some clients
+        // still send it; same treatment — it wants no answer either.
+        "initialized" => StatusCode::ACCEPTED.into_response(),
         "tools/list" => {
             let tools = build_tool_list();
             Json(json!({
@@ -459,17 +525,61 @@ fn unauthorized_json(id: &Value) -> Response {
 /// ! `X-Forwarded-For` is client-settable when nothing trusted sits in front. The blast
 /// radius is small — a caller must ALREADY hold a valid token to be rate-limited at all,
 /// so spoofing only lets a legitimate holder evade their own ceiling, never bypass auth.
-fn client_ip(headers: &HeaderMap) -> String {
-    for h in ["x-real-ip", "x-forwarded-for"] {
-        if let Some(v) = headers.get(h).and_then(|v| v.to_str().ok()) {
-            if let Some(first) = v.split(',').next().map(str::trim) {
-                if !first.is_empty() {
-                    return first.to_owned();
-                }
+/// `X-RateLimit-*` + `Retry-After`, so a client can pace itself instead of discovering
+/// the ceiling by hitting it. Empty when the limiter is off — advertising a limit that
+/// isn't enforced is worse than saying nothing.
+fn ratelimit_headers(state: &AppState, d: &crate::ratelimit::Decision) -> HeaderMap {
+    let mut h = HeaderMap::new();
+    if !state.limiter.enabled() {
+        return h;
+    }
+    let set = |h: &mut HeaderMap, k: &'static str, v: String| {
+        if let Ok(v) = v.parse() {
+            h.insert(k, v);
+        }
+    };
+    set(&mut h, "x-ratelimit-limit", state.limiter.burst.to_string());
+    set(&mut h, "x-ratelimit-remaining", d.remaining.to_string());
+    if !d.ok {
+        set(&mut h, "retry-after", d.retry_after_secs.to_string());
+    }
+    h
+}
+
+/// Best client IP for rate-limit keying and audit.
+///
+/// ! Takes the **LAST** `X-Forwarded-For` hop, and the choice is load-bearing.
+///
+/// A trusted edge proxy *appends* the peer it actually saw to the right of whatever
+/// arrived. So a client that injects its own `X-Forwarded-For: 9.9.9.9` lands to the
+/// LEFT of the real value — reading the first hop hands the attacker the rate-limit
+/// key. They rotate it per request, every request opens a fresh bucket, and the limiter
+/// silently stops limiting while still *looking* like it works. Reading the last hop
+/// takes the value only our own edge could have written.
+///
+/// `X-Real-IP` is checked only as a fallback and is single-valued: a proxy that sets it
+/// (ours does, via `header_up X-Real-IP {remote}` — a set, not an append) overwrites any
+/// client-supplied one.
+///
+/// Both headers are absent on a direct deploy, where they'd also be entirely
+/// attacker-supplied — hence the socket peer as the floor. It is the one address nobody
+/// can forge, and without it every direct client keyed to the same literal `"unknown"`:
+/// one shared bucket, so a single noisy client starved everyone else.
+fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+    if let Some(v) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        if let Some(last) = v.split(',').next_back().map(str::trim) {
+            if !last.is_empty() {
+                return last.to_owned();
             }
         }
     }
-    "unknown".to_owned()
+    if let Some(v) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        let v = v.trim();
+        if !v.is_empty() {
+            return v.to_owned();
+        }
+    }
+    peer.map_or_else(|| "unknown".to_owned(), |p| p.ip().to_string())
 }
 
 /// Read one cookie out of the `Cookie` header.
@@ -495,10 +605,19 @@ async fn library_handler(
     // with one handler rather than two near-identical ones.
     path: Option<axum::extract::Path<String>>,
     Query(q): Query<HashMap<String, String>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
     let rel = path.map(|axum::extract::Path(p)| p).unwrap_or_default();
-    let url_path = format!("/library/{rel}");
+    // ! No trailing slash at the root. This string becomes the `?token=` redirect target,
+    // and `/library/` matches NO route (the wildcard needs a segment) — so it 404'd. The
+    // hand-off issued a perfectly good cookie and then bounced the browser onto a dead
+    // page. A redirect is only correct if you follow it.
+    let url_path = if rel.is_empty() {
+        "/library".to_owned()
+    } else {
+        format!("/library/{rel}")
+    };
 
     // Hand-off: a valid ?token= is swapped for a cookie and the token is dropped from the
     // URL, so it does not linger in history, server logs, or a shared screenshot.
@@ -553,17 +672,30 @@ async fn library_handler(
             .into_response();
     };
 
-    if !state.limiter.allow(&principal, &client_ip(&headers)) {
+    let ip = client_ip(&headers, Some(peer));
+    let quota = state.limiter.allow(&principal, &ip);
+    if !quota.ok {
         return (
             StatusCode::TOO_MANY_REQUESTS,
-            [(axum::http::header::RETRY_AFTER, "1")],
+            ratelimit_headers(&state, &quota),
             Html(crate::browse::render(
                 &url_path,
                 &[],
-                "Rate limited. Slow down.",
+                &format!("Rate limited. Retry in {}s.", quota.retry_after_secs),
             )),
         )
             .into_response();
+    }
+
+    // The front door is the GALLERY, not a directory listing — the record is meant to be
+    // read, and a bare list of filenames tells you nothing about which run went red.
+    // `?raw=1` drops to the file browser underneath; every path below /library is the
+    // browser already, so a card can link straight at the artifact it describes.
+    if rel.is_empty() && !q.contains_key("raw") {
+        return Html(crate::library::render_gallery(&crate::library::catalog(
+            &state.library,
+        )))
+        .into_response();
     }
 
     let Some(target) = crate::browse::resolve(&state.library, &rel) else {
@@ -705,6 +837,68 @@ fn is_safe_action(tool: &str, action: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hdrs(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_str(k).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+    fn peer(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// THE regression that matters: a client forging XFF must not pick its own key.
+    /// Our edge appends the peer it saw, so the forged value sits to the LEFT.
+    /// Reading the first hop would hand the attacker a fresh bucket per request and
+    /// quietly turn the rate limiter off.
+    #[test]
+    fn a_forged_forwarded_for_cannot_choose_the_rate_limit_key() {
+        let h = hdrs(&[("x-forwarded-for", "9.9.9.9, 203.0.113.7")]);
+        assert_eq!(
+            client_ip(&h, Some(peer("172.18.0.2:5000"))),
+            "203.0.113.7",
+            "must take the LAST hop — the one only our edge could have written"
+        );
+    }
+
+    #[test]
+    fn a_single_hop_from_our_own_edge_is_taken_as_is() {
+        // Our caddy sets (not appends) XFF, so the single value IS the real peer.
+        let h = hdrs(&[("x-forwarded-for", "203.0.113.7")]);
+        assert_eq!(client_ip(&h, Some(peer("172.18.0.2:5000"))), "203.0.113.7");
+    }
+
+    #[test]
+    fn x_real_ip_is_the_fallback_when_there_is_no_forwarded_for() {
+        let h = hdrs(&[("x-real-ip", "203.0.113.9")]);
+        assert_eq!(client_ip(&h, Some(peer("172.18.0.2:5000"))), "203.0.113.9");
+    }
+
+    /// Direct deploy · no proxy · no headers. Before the socket-peer floor every
+    /// client keyed to the literal "unknown" → ONE shared bucket → one noisy client
+    /// starved everybody.
+    #[test]
+    fn a_direct_deploy_keys_on_the_socket_peer_not_a_shared_constant() {
+        let h = HeaderMap::new();
+        assert_eq!(
+            client_ip(&h, Some(peer("198.51.100.4:41000"))),
+            "198.51.100.4"
+        );
+        assert_ne!(
+            client_ip(&h, Some(peer("198.51.100.5:41000"))),
+            "198.51.100.4"
+        );
+    }
+
+    #[test]
+    fn no_headers_and_no_peer_still_yields_a_key() {
+        assert_eq!(client_ip(&HeaderMap::new(), None), "unknown");
+    }
 
     #[test]
     fn safe_actions_recognized() {

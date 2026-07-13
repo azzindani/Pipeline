@@ -67,15 +67,24 @@ services:
       PIPELINE_BIND: 0.0.0.0:8080
       # OAuth client for the claude.ai Custom Connector. Both optional — an
       # empty secret keeps the client public (PKCE-only), which is what
-      # claude.ai uses. Access/refresh tokens persist under /work/.pipeline/oauth
+      # claude.ai uses. Access/refresh tokens persist under /work/.pipeline/.oauth
       # (the pipeline-memory volume), so a container bounce never forces a
       # re-authorize.
+      #
+      # ! The leading dot is not cosmetic. That directory sits INSIDE the library
+      # root that /library serves, and the browser hides dotfiles — without it,
+      # /library/oauth/access-tokens.json would hand every reader a live credential.
       PIPELINE_OAUTH_CLIENT_ID: ${PIPELINE_OAUTH_CLIENT_ID:-claude-ai}
       PIPELINE_OAUTH_CLIENT_SECRET: ${PIPELINE_OAUTH_CLIENT_SECRET:-}
       # Request-body ceiling on /mcp. Tool args (patches, digests, file bodies)
       # are legitimately large; the pre-auth OAuth surface is capped separately
       # and far tighter (256 KB) so an anonymous POST cannot OOM the container.
       PIPELINE_MAX_BODY_BYTES: ${PIPELINE_MAX_BODY_BYTES:-}
+      # Token bucket, keyed on (principal, ip). Either at 0 disables it — which is
+      # the right default on a laptop and the wrong one on a public endpoint, so
+      # they are set here rather than left to the code's default.
+      PIPELINE_RATE_BURST: ${PIPELINE_RATE_BURST:-40}
+      PIPELINE_RATE_PER_SEC: ${PIPELINE_RATE_PER_SEC:-10}
       RUST_LOG: ${RUST_LOG:-info}
     expose:
       - "8080"

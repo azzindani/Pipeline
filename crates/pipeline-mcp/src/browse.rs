@@ -78,7 +78,7 @@ pub fn resolve(root: &Path, relative: &str) -> Option<PathBuf> {
     Some(target)
 }
 
-fn is_hidden_or_denied(name: &str) -> bool {
+pub(crate) fn is_hidden_or_denied(name: &str) -> bool {
     name.starts_with('.') || DENY.contains(&name)
 }
 
@@ -121,7 +121,7 @@ pub fn listing(target: &Path, url_path: &str) -> Vec<Entry> {
     entries
 }
 
-fn human(n: u64) -> String {
+pub(crate) fn human(n: u64) -> String {
     #[allow(clippy::cast_precision_loss)] // display only
     let mut step = n as f64;
     for unit in ["B", "KB", "MB", "GB"] {
@@ -138,7 +138,7 @@ fn human(n: u64) -> String {
 }
 
 /// Epoch seconds → `YYYY-MM-DD HH:MM` (UTC).
-fn stamp(secs: u64) -> String {
+pub(crate) fn stamp(secs: u64) -> String {
     let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
     let dt: chrono::DateTime<chrono::Utc> = t.into();
     dt.format("%Y-%m-%d %H:%M").to_string()
