@@ -244,6 +244,29 @@ fn clone_dir(alias: &str) -> PathBuf {
         .join(alias)
 }
 
+/// Where a registered repo's source ACTUALLY lives.
+///
+/// ! A `local` repo is digested in place — nothing is ever cloned into
+/// `.pipeline/repos/<alias>/`. Reaching straight for [`clone_dir`] therefore
+/// lands on a path that does not exist, which is how `list_capabilities` came
+/// to silently return an empty set for every local repo.
+///
+/// ✗ use this in `remove` — deleting a local repo's "clone" must stay pointed at
+/// `clone_dir`, or `delete_clone` would erase the user's actual source tree.
+async fn repo_root(alias: &str) -> Result<PathBuf, String> {
+    let reg = read_registry().await?;
+    let entry = reg
+        .repos
+        .iter()
+        .find(|r| r.alias == alias)
+        .ok_or_else(|| format!("alias '{alias}' not registered"))?;
+    Ok(if entry.kind == "local" {
+        PathBuf::from(strip_local_prefix(&entry.url))
+    } else {
+        clone_dir(alias)
+    })
+}
+
 fn digest_file(alias: &str) -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
@@ -451,7 +474,10 @@ async fn list_capabilities(args: &Value) -> ToolResponse {
         Ok(v) => v,
         Err(e) => return err(e),
     };
-    let dir = clone_dir(&alias);
+    let dir = match repo_root(&alias).await {
+        Ok(d) => d,
+        Err(e) => return err(e),
+    };
     let mut capabilities: Vec<Value> = Vec::new();
 
     if let Some(top) = digest
@@ -584,7 +610,10 @@ async fn extract(args: &Value) -> ToolResponse {
         None => cwd.join("extracted").join(&capability),
     };
 
-    let src_root = clone_dir(&alias);
+    let src_root = match repo_root(&alias).await {
+        Ok(d) => d,
+        Err(e) => return err(e),
+    };
     let src = src_root.join(&capability);
     if !tokio::fs::try_exists(&src).await.unwrap_or(false) {
         return err(format!(
