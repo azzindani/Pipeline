@@ -2,7 +2,13 @@
 # Image size cap = 200 MB (gates.image_size_mb in pipeline.yaml).
 
 # ---------- builder ----------
-FROM rust:1.94-slim-bookworm AS builder
+# ! Must match rust-toolchain.toml (1.97.0). It did NOT — the base was 1.94 while the
+# pin said 1.97 — so every image build made rustup download a SECOND toolchain at build
+# time. Slow, and a hard dependency on static.rust-lang.org being reachable from inside
+# buildkit: when that fetch failed the whole build died, having compiled nothing. It also
+# quietly reintroduced the drift the pin exists to prevent, since the image was the one
+# place the pinned compiler wasn't guaranteed. Bump both together, or not at all.
+FROM rust:1.97-slim-bookworm AS builder
 
 ENV CARGO_TERM_COLOR=never \
     CARGO_NET_RETRY=4 \
