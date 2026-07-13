@@ -11,27 +11,54 @@
 //!
 //! # Security
 //!
-//! Treat this endpoint as remote code execution. Bearer auth via
-//! `PIPELINE_TOKEN` is mandatory in HTTP mode · server refuses to start
-//! without it. `PIPELINE_REMOTE_MODE=read_only` (default) blocks every
-//! destructive action listed in `is_safe_action`. Set `PIPELINE_REMOTE_MODE=full`
-//! only when bound to localhost behind an authenticated reverse proxy.
+//! Treat this endpoint as remote code execution.
+//!
+//! - **Auth is mandatory.** `PIPELINE_TOKENS_FILE` | `PIPELINE_TOKENS` |
+//!   `PIPELINE_TOKEN` — the server refuses to start with none set. Unlike Folio,
+//!   there is no unauthenticated mode.
+//! - **`PIPELINE_REMOTE_MODE=read_only`** (default) blocks every destructive
+//!   action in `is_safe_action`. `full` only behind an authenticated proxy + TLS.
+//! - **Bodies are capped.** An unbounded reader on a public endpoint lets one
+//!   POST grow the heap until the container OOMs. `/mcp` gets a generous cap
+//!   (tool args can be large); the pre-auth OAuth surface gets a tight one.
+//! - **OAuth 2.0 + PKCE** ([`crate::oauth`]) lets claude.ai connect as a Custom
+//!   Connector instead of a human pasting a static bearer.
 
 #![allow(clippy::doc_markdown)]
 
+use crate::auth::{TokenRegistry, bearer};
 use crate::dispatch;
+use crate::oauth::{OAUTH_MAX_BODY_BYTES, OAuth};
 use crate::registry::registry;
 use crate::server::ServerState;
 use crate::tools::ToolRequest;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use tower_http::cors::{Any, CorsLayer};
+
+/// `/mcp` body cap. Tool arguments (file contents, digests, patches) are
+/// legitimately large, so this is generous — but it is not unbounded.
+const MCP_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// ! The pre-auth surface must always be capped tighter than the authenticated
+/// one. Enforced at compile time so nobody can widen `OAUTH_MAX_BODY_BYTES` past
+/// `/mcp` and hand an anonymous caller the bigger allocation.
+const _: () = assert!(OAUTH_MAX_BODY_BYTES < MCP_MAX_BODY_BYTES);
+
+fn mcp_body_limit() -> usize {
+    std::env::var("PIPELINE_MAX_BODY_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MCP_MAX_BODY_BYTES)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RemoteMode {
@@ -64,26 +91,33 @@ impl RemoteMode {
 }
 
 #[derive(Clone)]
-struct AppState {
-    server: Arc<ServerState>,
-    token: Arc<String>,
-    mode: RemoteMode,
+pub struct AppState {
+    pub(crate) server: Arc<ServerState>,
+    pub(crate) tokens: Arc<TokenRegistry>,
+    pub(crate) oauth: Arc<OAuth>,
+    pub(crate) mode: RemoteMode,
+}
+
+/// Where OAuth persists its access + refresh stores. Under `.pipeline/` so it
+/// rides the existing `pipeline-memory` volume and survives a container bounce.
+fn oauth_state_dir() -> PathBuf {
+    std::env::var_os("PIPELINE_OAUTH_STATE_DIR").map_or_else(
+        || {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(".pipeline")
+                .join("oauth")
+        },
+        PathBuf::from,
+    )
 }
 
 /// Run the HTTP MCP server. Bind defaults to 127.0.0.1:8080 if `bind` is None.
 ///
-/// Returns `Err` immediately if `PIPELINE_TOKEN` is unset. Pipeline refuses to
-/// expose remote code execution without an auth token.
+/// Returns `Err` immediately if no token source is configured — Pipeline refuses
+/// to expose remote code execution unauthenticated.
 pub async fn serve_http(bind: Option<&str>) -> Result<(), crate::McpError> {
-    let token = match std::env::var("PIPELINE_TOKEN") {
-        Ok(t) if !t.trim().is_empty() => t,
-        _ => {
-            return Err(crate::McpError::Transport(
-                "PIPELINE_TOKEN env var is required for HTTP transport · refusing to start without auth"
-                    .into(),
-            ));
-        }
-    };
+    let tokens = TokenRegistry::from_env().map_err(crate::McpError::Transport)?;
 
     let addr_str = bind
         .map(str::to_owned)
@@ -95,18 +129,51 @@ pub async fn serve_http(bind: Option<&str>) -> Result<(), crate::McpError> {
     let mode = RemoteMode::from_env();
     let app_state = AppState {
         server: Arc::new(ServerState::new()),
-        token: Arc::new(token),
+        oauth: Arc::new(OAuth::new(oauth_state_dir())),
+        tokens: Arc::new(tokens),
         mode,
     };
 
+    // The OAuth + discovery surface is deliberately PUBLIC and cross-origin:
+    // claude.ai walks it anonymously to discover, register, and run PKCE before
+    // any user has authenticated. The bearer it receives then gates /mcp.
+    let public_cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
+    let public = Router::new()
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(crate::oauth::metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(crate::oauth::protected_resource),
+        )
+        .route("/oauth/register", post(crate::oauth::register))
+        .route(
+            "/oauth/authorize",
+            get(crate::oauth::authorize_get).post(crate::oauth::authorize_post),
+        )
+        .route("/oauth/token", post(crate::oauth::token))
+        // ! tight cap — these are unauthenticated endpoints
+        .layer(DefaultBodyLimit::max(OAUTH_MAX_BODY_BYTES))
+        .layer(public_cors);
+
+    // ✗ never print token values — only the principal names.
+    let auth_summary = app_state.tokens.describe();
+
     let app = Router::new()
         .route("/mcp", post(mcp_handler))
+        .layer(DefaultBodyLimit::max(mcp_body_limit()))
         .route("/health", get(health))
+        .merge(public)
         .with_state(app_state);
 
     eprintln!(
-        "pipeline-mcp http transport · {addr} · mode={}",
-        mode.as_str()
+        "pipeline-mcp http transport · {addr} · mode={} · auth={auth_summary} · oauth=/oauth/authorize",
+        mode.as_str(),
     );
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -129,9 +196,15 @@ async fn mcp_handler(
     headers: HeaderMap,
     Json(req): Json<Value>,
 ) -> Response {
-    if !verify_token(&headers, &state.token) {
+    let Some(principal) = authenticate(&state, &headers) else {
         return (
             StatusCode::UNAUTHORIZED,
+            // RFC 9728: point an unauthenticated client at the OAuth surface so
+            // claude.ai can discover it instead of just failing.
+            [(
+                axum::http::header::WWW_AUTHENTICATE,
+                r#"Bearer resource_metadata="/.well-known/oauth-protected-resource""#,
+            )],
             Json(json!({
                 "jsonrpc": "2.0",
                 "id": req.get("id").cloned().unwrap_or(Value::Null),
@@ -139,7 +212,8 @@ async fn mcp_handler(
             })),
         )
             .into_response();
-    }
+    };
+    tracing::debug!(principal = %principal, "authenticated /mcp call");
 
     let id = req.get("id").cloned().unwrap_or(Value::Null);
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
@@ -239,28 +313,18 @@ async fn mcp_handler(
     }
 }
 
-fn verify_token(headers: &HeaderMap, expected: &str) -> bool {
-    let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) else {
-        return false;
-    };
-    let Ok(value) = auth.to_str() else {
-        return false;
-    };
-    let Some(token) = value.strip_prefix("Bearer ") else {
-        return false;
-    };
-    constant_time_eq(token.as_bytes(), expected.as_bytes())
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+/// Resolve a request's bearer to a principal, or `None`.
+///
+/// Two passes, mirroring Folio: the static registry first (a token an operator
+/// configured), then the OAuth store (a token this server minted). Both map to
+/// the same principal namespace, so an OAuth grant is exactly as privileged as
+/// the token whose holder authorized it — no more.
+fn authenticate(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    let presented = bearer(headers)?;
+    if let Some(name) = state.tokens.lookup(presented) {
+        return Some(name.to_owned());
     }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    state.oauth.resolve(presented)
 }
 
 fn build_tool_list() -> Vec<Value> {
@@ -302,7 +366,11 @@ fn is_safe_action(tool: &str, action: &str) -> bool {
                 | "progress"
                 | "milestone_progress"
         ),
-        "pipeline_standards" => matches!(action, "list" | "show" | "recommend"),
+        // fetch · update · pin mutate (network / cache / pipeline.yaml) → not read-only.
+        "pipeline_standards" => matches!(
+            action,
+            "brief" | "list" | "show" | "checklist" | "route" | "check"
+        ),
         "pipeline_project" => action == "template_list",
         "pipeline_run" => matches!(action, "status" | "logs" | "fix_suggestion" | "explain"),
         "pipeline_test" => action == "flake_detect",
@@ -353,12 +421,33 @@ mod tests {
         assert!(!is_safe_action("pipeline_deploy", "target"));
     }
 
+    // constant_time_eq now lives in `crate::auth` alongside the TokenRegistry
+    // it protects · its tests moved with it.
+
     #[test]
-    fn constant_time_eq_handles_lengths() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abcd"));
-        assert!(!constant_time_eq(b"abcd", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
+    fn oauth_surface_is_reachable_without_a_bearer() {
+        // ! claude.ai walks discovery + register + PKCE anonymously — if any of
+        // these ever fell behind the /mcp auth gate the connector could never
+        // bootstrap. This pins them as PUBLIC.
+        for path in [
+            "/.well-known/oauth-authorization-server",
+            "/.well-known/oauth-protected-resource",
+            "/oauth/register",
+            "/oauth/authorize",
+            "/oauth/token",
+        ] {
+            assert!(
+                !path.starts_with("/mcp"),
+                "{path} must not sit behind the /mcp bearer gate"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_body_limit_defaults_to_the_bounded_constant() {
+        // An unbounded reader on a public endpoint is an OOM waiting to happen.
+        // (The cap ordering itself is enforced at compile time — see above.)
+        assert_eq!(mcp_body_limit(), MCP_MAX_BODY_BYTES);
     }
 
     // RemoteMode::from_env() is intentionally not unit-tested · it reads
