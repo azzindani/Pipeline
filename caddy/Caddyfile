@@ -1,30 +1,28 @@
 # Reference reverse-proxy config for Pipeline's HTTP transport.
 #
-# ! NOT APPLIED. Pipeline is currently ✗ deployed and ✗ released. This file documents
-# the route contract so bringing it up later is a paste, not an archaeology exercise.
+# ! NOT APPLIED. The LIVE routing lives in the shared /root/caddy-router, which owns
+# :80/:443 and already serves pipe.casava.space with a catch-all reverse_proxy to
+# pipeline:8080. This file documents the equivalent standalone block with explicit path
+# matchers, so the contract is legible in one place.
 #
 # ! ✗ run this as a standalone Caddy on a host that already has /root/caddy-router.
 # That router OWNS :80/:443 and serves Folio, Kea, Krawl, Kestrel and the harnesses. A
-# second Caddy binding those ports takes TLS down for every one of them. To expose
-# Pipeline, paste the site block below INTO the shared router's Caddyfile and
-# `caddy reload` (zero downtime) — never `docker compose up` a competing Caddy.
+# second Caddy binding those ports takes TLS down for every one of them. To change how
+# Pipeline is exposed, edit the block in the shared router's Caddyfile and `caddy reload`
+# (zero downtime) — never `docker compose up` a competing Caddy.
 #
 # Routing — the same contract as Sift and Folio, so a client configured for one works
 # against any of them:
 #
 #   /mcp                  → pipeline:8080   MCP JSON-RPC                    [Bearer]
 #   /tokens/whoami        → pipeline:8080   token sanity check              [Bearer]
-#   /library · /library/* → pipeline:8080   the durable record, browsable   [same key]
 #   /.well-known/oauth-*  → pipeline:8080   OAuth discovery                 [public]
 #   /oauth/*              → pipeline:8080   authorize · token · register    [public]
 #   /health               → pipeline:8080   liveness                        [public]
 #   /version              → pipeline:8080   running version                 [public]
 #
-# Caddy terminates TLS and forwards `Authorization: Bearer` untouched — the app is the
-# SOLE auth gate. There is deliberately no basic_auth anywhere, including on /library:
-# a browser username/password popup cannot satisfy a bearer token, so it would only
-# produce a prompt no agent (and no access-token holder) can answer. Folio dropped it
-# from its equivalent route for exactly this reason; Sift never added it.
+# Pipeline is an MCP endpoint, not a web app — there is no browser UI. Caddy terminates
+# TLS and forwards `Authorization: Bearer` untouched; the app is the SOLE auth gate.
 #
 # /health and /version bypass auth so a monitor can alert on a dead or stale deployment
 # without holding a token. Neither echoes a token value.
@@ -79,36 +77,10 @@
 		}
 	}
 
-	# THE LIBRARY — the durable record, browsable. No basic_auth and no static
-	# file_server: Pipeline is the sole gate. It takes the same key via ?token= /
-	# Bearer / the pipeline_session cookie and serves its own "access token required"
-	# page otherwise. Handing someone a SECOND credential to read their own record
-	# defeats the point of one key everywhere.
-	#
-	# ✗ do NOT point a `root`/`file_server` at the library directory. It contains
-	# .oauth/ — the live access + refresh token store. Caddy's file_server would
-	# happily serve it; Pipeline's browser refuses (dot-prefixed + deny-listed +
-	# containment-checked). The app must stay the only thing that reads that tree.
-	@library path /library /library/ /library/*
-	handle @library {
-		reverse_proxy pipeline:8080 {
-			header_up Host {host}
-			header_up X-Forwarded-Proto {scheme}
-			header_up X-Forwarded-Host {host}
-			# Same reason as /mcp — the library is rate-limited on (principal, ip) too,
-			# and without these every reader shares the router's address.
-			header_up X-Real-IP {remote}
-			header_up X-Forwarded-For {remote}
-		}
-	}
-
-	# The library is the front door — there is no other UI to land on.
-	redir / /library
-
-	# Anything else is honestly nothing. Without this Caddy answers an unmatched path
-	# with a blank 200, which reads like a live page that failed to render.
+	# No browser UI to land on — the root and any unmatched path get a one-line hint
+	# rather than a blank 200 (which reads like a live page that failed to render).
 	handle {
-		respond "Not found" 404
+		respond "Pipeline MCP — POST /mcp with Authorization: Bearer <token>. See /health." 200
 	}
 
 	header {

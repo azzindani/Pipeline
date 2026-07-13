@@ -11,21 +11,16 @@
 //!
 //! # The endpoint contract
 //!
-//! Deliberately identical to Folio's and Sift's, so a client — or a monitor, or a
+//! Deliberately identical to Folio's and Sift's `/mcp`, so a client — or a monitor, or a
 //! key — configured for one works against any of them.
 //!
 //! | Path | Gate |
 //! |---|---|
 //! | `/mcp` | Bearer · static registry or OAuth-issued |
 //! | `/tokens/whoami` | Bearer · the cheapest auth sanity check |
-//! | `/library`, `/library/*` | the SAME key · file manager over the record ([`crate::browse`]) |
-//! | `/library/op`, `/library/upload` | the SAME key · mutation · `PIPELINE_LIBRARY_WRITE=1` ([`crate::fsops`]) |
 //! | `/.well-known/oauth-*` | public — discovery |
 //! | `/oauth/{register,authorize,token}` | public — PKCE handshake |
 //! | `/health`, `/version` | public — a monitor should not need a token |
-//!
-//! `?token=…` on any library path is swapped for an HttpOnly session cookie and dropped
-//! from the URL, so the key never lingers in history, logs, or a shared screenshot.
 //!
 //! # Security
 //!
@@ -43,9 +38,6 @@
 //! - **Rate limited** ([`crate::ratelimit`]) on `(principal, ip)` → 429.
 //! - **OAuth 2.0 + PKCE** ([`crate::oauth`]) lets claude.ai connect as a Custom
 //!   Connector instead of a human pasting a static bearer.
-//! - **No basic_auth anywhere**, including the library. A browser username/password
-//!   popup can never be satisfied by an access token, and a second credential to read
-//!   your own record defeats the point of one key everywhere.
 
 #![allow(clippy::doc_markdown)]
 
@@ -56,13 +48,12 @@ use crate::ratelimit::RateLimiter;
 use crate::registry::registry;
 use crate::server::ServerState;
 use crate::tools::ToolRequest;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -121,36 +112,24 @@ pub struct AppState {
     pub(crate) tokens: Arc<TokenRegistry>,
     pub(crate) oauth: Arc<OAuth>,
     pub(crate) limiter: Arc<RateLimiter>,
-    pub(crate) library: Arc<PathBuf>,
     pub(crate) mode: RemoteMode,
-    /// The library write capability, resolved from `PIPELINE_LIBRARY_WRITE` ONCE at boot
-    /// rather than per request. `None` → the library is read-only. Being unforgeable, its
-    /// mere presence in state is the permission; a handler cannot conjure one.
-    pub(crate) writable: Option<crate::fsops::Writable>,
-}
-
-/// The library root — Pipeline's durable record: run history, reports, digests,
-/// sessions. The same directory the memory volume persists.
-fn library_dir() -> PathBuf {
-    std::env::var_os("PIPELINE_LIBRARY_DIR").map_or_else(
-        || {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(".pipeline")
-        },
-        PathBuf::from,
-    )
 }
 
 /// Where OAuth persists its access + refresh stores.
 ///
-/// ! Dot-prefixed ON PURPOSE. It sits INSIDE the library root, and `browse` hides
-/// dotfiles — otherwise `/library/oauth/access-tokens.json` would serve every reader a
-/// live credential. (`browse::DENY` also names it, belt and braces.) Sift calls its
-/// equivalent `.oauth-state` for exactly this reason.
+/// ! Dot-prefixed ON PURPOSE and kept INSIDE `.pipeline/`, so it rides the same persisted
+/// volume as the rest of Pipeline's state and stays out of casual listings. Sift calls its
+/// equivalent `.oauth-state` for the same reason. Override with `PIPELINE_OAUTH_STATE_DIR`.
 fn oauth_state_dir() -> PathBuf {
-    std::env::var_os("PIPELINE_OAUTH_STATE_DIR")
-        .map_or_else(|| library_dir().join(".oauth"), PathBuf::from)
+    std::env::var_os("PIPELINE_OAUTH_STATE_DIR").map_or_else(
+        || {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(".pipeline")
+                .join(".oauth")
+        },
+        PathBuf::from,
+    )
 }
 
 /// Can we actually create + write in `dir`? Checked at boot so a read-only mount
@@ -200,12 +179,8 @@ pub async fn serve_http(bind: Option<&str>) -> Result<(), crate::McpError> {
         server: Arc::new(ServerState::new()),
         oauth: Arc::new(OAuth::new(oauth_state_dir())),
         tokens: Arc::new(tokens),
-        library: Arc::new(library_dir()),
         limiter: Arc::clone(&limiter),
         mode,
-        // ! The ONLY place the write switch is read. From here on it is a value in state,
-        // so a handler cannot re-read env, and a test can inject the grant directly.
-        writable: crate::fsops::Writable::from_env(),
     };
 
     // ✗ never print token values — only the principal names.
@@ -214,7 +189,7 @@ pub async fn serve_http(bind: Option<&str>) -> Result<(), crate::McpError> {
 
     eprintln!(
         "pipeline-mcp http transport · {addr} · mode={} · auth={auth_summary} · \
-         rate={} · oauth=/oauth/authorize · library=/library",
+         rate={} · oauth=/oauth/authorize",
         mode.as_str(),
         limiter.describe(),
     );
@@ -285,42 +260,12 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(OAUTH_MAX_BODY_BYTES))
         .layer(public_cors);
 
-    // THE LIBRARY — the durable record, browsable.
-    //
-    // ! No basic_auth in front and no static file_server: Pipeline is the SOLE gate,
-    // exactly as Folio's editor route and Sift's /library are. It accepts the SAME key
-    // via ?token= / Bearer / the session cookie and serves its own gate page otherwise.
-    // A browser basic-auth popup could never be satisfied by an access token anyway, and
-    // handing someone a SECOND credential to read their own record defeats the point of
-    // one key everywhere. Its own body limit stays small — these are GETs.
-    //
-    // Writes (rename · move · delete · mkdir) live on /library/op and are OFF unless
-    // PIPELINE_LIBRARY_WRITE=1 — see [`crate::fsops`] for why they are deliberately not
-    // behind PIPELINE_REMOTE_MODE=full.
-    let library = Router::new()
-        .route("/library", get(library_handler))
-        // A typed-by-hand trailing slash must not 404. `{*path}` requires at least one
-        // segment, so `/library/` matches neither it nor `/library` — an easy dead page.
-        .route("/library/", get(library_handler))
-        .route("/library/op", post(library_op))
-        .route("/library/{*path}", get(library_handler))
-        .layer(DefaultBodyLimit::max(64 * 1024));
-
-    // Upload needs its own, larger cap — the 64 KB above is right for a GET or a rename
-    // and far too small for a report. Kept on a separate route so raising it here cannot
-    // widen the body limit on everything else.
-    let upload = Router::new()
-        .route("/library/upload", post(library_upload))
-        .layer(DefaultBodyLimit::max(crate::fsops::MAX_UPLOAD_BYTES));
-
     Router::new()
         .route("/mcp", post(mcp_handler))
         .layer(DefaultBodyLimit::max(mcp_body_limit()))
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/tokens/whoami", get(whoami))
-        .merge(library)
-        .merge(upload)
         .merge(public)
         .with_state(state)
 }
@@ -546,14 +491,6 @@ fn unauthorized_json(id: &Value) -> Response {
         .into_response()
 }
 
-/// Best guess at the caller's address, for rate-limit keying.
-///
-/// Behind the shared caddy-router the socket peer is always the router, so keying on it
-/// would put every client in one bucket. Prefer what the proxy forwarded.
-///
-/// ! `X-Forwarded-For` is client-settable when nothing trusted sits in front. The blast
-/// radius is small — a caller must ALREADY hold a valid token to be rate-limited at all,
-/// so spoofing only lets a legitimate holder evade their own ceiling, never bypass auth.
 /// `X-RateLimit-*` + `Retry-After`, so a client can pace itself instead of discovering
 /// the ceiling by hitting it. Empty when the limiter is off — advertising a limit that
 /// isn't enforced is worse than saying nothing.
@@ -609,367 +546,6 @@ fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
         }
     }
     peer.map_or_else(|| "unknown".to_owned(), |p| p.ip().to_string())
-}
-
-/// Read one cookie out of the `Cookie` header.
-fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get(axum::http::header::COOKIE)?
-        .to_str()
-        .ok()?
-        .split(';')
-        .filter_map(|kv| kv.trim().split_once('='))
-        .find(|(k, _)| *k == name)
-        .map(|(_, v)| v.to_owned())
-}
-
-/// Browse the durable record: run history, reports, digests, sessions.
-///
-/// Auth here is the same key as everywhere else, by three routes: `Authorization: Bearer`
-/// (scripts), a `?token=` hand-off (browsers), or the session cookie it leaves behind.
-#[allow(clippy::too_many_lines)] // one auth→resolve→serve pivot · splitting scatters the gate
-async fn library_handler(
-    State(state): State<AppState>,
-    // `/library` carries no path param and `/library/{*path}` does — Option covers both
-    // with one handler rather than two near-identical ones.
-    path: Option<axum::extract::Path<String>>,
-    Query(q): Query<HashMap<String, String>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-) -> Response {
-    let rel = path.map(|axum::extract::Path(p)| p).unwrap_or_default();
-    // ! No trailing slash at the root. This string becomes the `?token=` redirect target,
-    // and `/library/` matches NO route (the wildcard needs a segment) — so it 404'd. The
-    // hand-off issued a perfectly good cookie and then bounced the browser onto a dead
-    // page. A redirect is only correct if you follow it.
-    let url_path = if rel.is_empty() {
-        "/library".to_owned()
-    } else {
-        format!("/library/{rel}")
-    };
-
-    // Hand-off: a valid ?token= is swapped for a cookie and the token is dropped from the
-    // URL, so it does not linger in history, server logs, or a shared screenshot.
-    if let Some(presented) = q.get("token").filter(|t| !t.is_empty()) {
-        let Some(principal) = state
-            .tokens
-            .lookup(presented)
-            .map(str::to_owned)
-            .or_else(|| state.oauth.resolve(presented))
-        else {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Html(crate::browse::gate_page(&url_path)),
-            )
-                .into_response();
-        };
-
-        // ! the cookie carries a MINTED session token, never the API key itself
-        let session = state.oauth.mint_session(&principal);
-        let secure = headers
-            .get("x-forwarded-proto")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|p| p.starts_with("https"));
-        let set = format!(
-            "{}={session}; Max-Age={}; Path=/library; HttpOnly; SameSite=Lax{}",
-            crate::oauth::SESSION_COOKIE,
-            crate::oauth::session_ttl_secs(),
-            if secure { "; Secure" } else { "" },
-        );
-        return (
-            StatusCode::FOUND,
-            [
-                (axum::http::header::LOCATION, url_path.as_str()),
-                (axum::http::header::SET_COOKIE, set.as_str()),
-            ],
-            Html(String::new()),
-        )
-            .into_response();
-    }
-
-    // Bearer, or the session cookie left by the hand-off above.
-    let principal = authenticate(&state, &headers).or_else(|| {
-        cookie(&headers, crate::oauth::SESSION_COOKIE).and_then(|c| state.oauth.resolve(&c))
-    });
-    let Some(principal) = principal else {
-        // ! a plain 401 with NO WWW-Authenticate — a browser basic-auth popup cannot
-        // carry a bearer, so offering one is a dead end. Serve the gate page instead.
-        return (
-            StatusCode::UNAUTHORIZED,
-            Html(crate::browse::gate_page(&url_path)),
-        )
-            .into_response();
-    };
-
-    let ip = client_ip(&headers, Some(peer));
-    let quota = state.limiter.allow(&principal, &ip);
-    if !quota.ok {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            ratelimit_headers(&state, &quota),
-            Html(crate::browse::render(
-                &state.library,
-                "",
-                &url_path,
-                &[],
-                &format!("Rate limited. Retry in {}s.", quota.retry_after_secs),
-            )),
-        )
-            .into_response();
-    }
-
-    let Some(target) = crate::browse::resolve(&state.library, &rel) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Html(crate::browse::render(
-                &state.library,
-                "",
-                &url_path,
-                &[],
-                "Not found.",
-            )),
-        )
-            .into_response();
-    };
-
-    if target.is_dir() {
-        let entries = crate::browse::listing(&target, &url_path);
-        return Html(crate::browse::render(
-            &state.library,
-            &rel,
-            &url_path,
-            &entries,
-            "Empty. Nothing has been recorded here yet.",
-        ))
-        .into_response();
-    }
-
-    // Only whitelisted types are served — ✗ hand out memory.db or an arbitrary binary.
-    let ext = target
-        .extension()
-        .map(|e| e.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let Some(media) = crate::browse::inline_type(&ext) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Html(crate::browse::render(
-                &state.library,
-                "",
-                &url_path,
-                &[],
-                "Not a readable file.",
-            )),
-        )
-            .into_response();
-    };
-
-    match tokio::fs::read(&target).await {
-        Ok(bytes) => {
-            let mut h = HeaderMap::new();
-            if let Ok(v) = media.parse() {
-                h.insert(axum::http::header::CONTENT_TYPE, v);
-            }
-            // `?download=1` → save instead of render. The filename is quoted and the
-            // quotes/backslashes stripped: a header value cannot be escaped the way HTML
-            // can, so a name containing `"` would otherwise break out of the parameter.
-            if q.contains_key("download") {
-                let (_, leaf) = crate::fsops::split_rel(&rel);
-                let safe: String = leaf.chars().filter(|c| *c != '"' && *c != '\\').collect();
-                if let Ok(v) = format!("attachment; filename=\"{safe}\"").parse() {
-                    h.insert(axum::http::header::CONTENT_DISPOSITION, v);
-                }
-            }
-            (StatusCode::OK, h, bytes).into_response()
-        }
-        Err(_) => (
-            StatusCode::NOT_FOUND,
-            Html(crate::browse::render(
-                &state.library,
-                "",
-                &url_path,
-                &[],
-                "Unreadable.",
-            )),
-        )
-            .into_response(),
-    }
-}
-
-/// Auth for the write routes: Bearer, or the session cookie the `?token=` hand-off left.
-///
-/// Returns the principal AND whether it came from the cookie — the caller needs to know,
-/// because a cookie is what a CSRF attack rides on and a Bearer header is not.
-fn library_auth(state: &AppState, headers: &HeaderMap) -> Option<(String, bool)> {
-    if let Some(p) = authenticate(state, headers) {
-        return Some((p, false));
-    }
-    cookie(headers, crate::oauth::SESSION_COOKIE)
-        .and_then(|c| state.oauth.resolve(&c))
-        .map(|p| (p, true))
-}
-
-/// ! CSRF guard for cookie-authenticated writes.
-///
-/// The session cookie is `SameSite=Lax`, which already stops a cross-site POST from
-/// carrying it — that is the primary defence. This is the second one, because a single
-/// cookie-attribute typo would otherwise silently re-open the hole: evil.com submits a
-/// form to /library/op, the browser attaches your session, and your report is in the
-/// trash. Browsers always send `Origin` on a POST, so a mismatch is decisive.
-///
-/// A Bearer-authenticated script sends no Origin and needs none — it cannot be CSRF'd,
-/// since an attacker's page cannot make the browser attach a header it does not have.
-fn csrf_ok(headers: &HeaderMap, via_cookie: bool) -> bool {
-    if !via_cookie {
-        return true;
-    }
-    let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) else {
-        return false; // a browser POST without Origin is not a browser POST we trust
-    };
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get(axum::http::header::HOST))
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    origin
-        .rsplit_once("//")
-        .is_some_and(|(_, o)| !host.is_empty() && o == host)
-}
-
-fn fs_err(e: &crate::fsops::FsError) -> Response {
-    (
-        StatusCode::from_u16(e.status()).unwrap_or(StatusCode::BAD_REQUEST),
-        Json(json!({"ok": false, "error": e.message()})),
-    )
-        .into_response()
-}
-
-/// `POST /library/op` — rename · move · delete · mkdir.
-///
-/// Delete is a MOVE to `trash/` and never an unlink; see [`crate::fsops`].
-async fn library_op(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> Response {
-    let Some((principal, via_cookie)) = library_auth(&state, &headers) else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"ok": false, "error": "Unauthorized."})),
-        )
-            .into_response();
-    };
-    if !csrf_ok(&headers, via_cookie) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({"ok": false, "error": "Cross-origin write refused."})),
-        )
-            .into_response();
-    }
-    let quota = state
-        .limiter
-        .allow(&principal, &client_ip(&headers, Some(peer)));
-    if !quota.ok {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            ratelimit_headers(&state, &quota),
-            Json(json!({"ok": false, "error": "Rate limited."})),
-        )
-            .into_response();
-    }
-
-    // The write capability was resolved at boot into state; `None` → read-only.
-    let Some(cap) = state.writable else {
-        return fs_err(&crate::fsops::FsError::Disabled);
-    };
-
-    let s = |k: &str| {
-        body.get(k)
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned()
-    };
-    let (op, path, name, dest) = (s("op"), s("path"), s("name"), s("dest"));
-    let root = state.library.as_path();
-
-    // Audit every mutation with the principal — "someone deleted it" is not an audit trail.
-    tracing::info!(token = %principal, op = %op, path = %path, "library write");
-
-    let result = match op.as_str() {
-        "rename" => crate::fsops::rename(cap, root, &path, &name).map(|()| json!({"ok": true})),
-        "move" => crate::fsops::move_to(cap, root, &path, &dest).map(|()| json!({"ok": true})),
-        "mkdir" => crate::fsops::mkdir(cap, root, &path, &name).map(|()| json!({"ok": true})),
-        "delete" => {
-            let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-            crate::fsops::delete(cap, root, &path, &stamp)
-                .map(|to| json!({"ok": true, "trashed_to": to}))
-        }
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"ok": false, "error": format!("Unknown op: {op}")})),
-            )
-                .into_response();
-        }
-    };
-
-    match result {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => fs_err(&e),
-    }
-}
-
-/// `POST /library/upload?dir=<rel>&name=<leaf>` — raw body is the file.
-///
-/// Raw body rather than multipart on purpose: multipart drags in a parser to handle a
-/// single file, and every byte of that parser is attack surface on a route that writes to
-/// disk. The filename comes from a query param that goes through the same leaf validation
-/// as every other destination.
-async fn library_upload(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Query(q): Query<HashMap<String, String>>,
-    headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Response {
-    let Some((principal, via_cookie)) = library_auth(&state, &headers) else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"ok": false, "error": "Unauthorized."})),
-        )
-            .into_response();
-    };
-    if !csrf_ok(&headers, via_cookie) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({"ok": false, "error": "Cross-origin write refused."})),
-        )
-            .into_response();
-    }
-    let quota = state
-        .limiter
-        .allow(&principal, &client_ip(&headers, Some(peer)));
-    if !quota.ok {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            ratelimit_headers(&state, &quota),
-            Json(json!({"ok": false, "error": "Rate limited."})),
-        )
-            .into_response();
-    }
-
-    let Some(cap) = state.writable else {
-        return fs_err(&crate::fsops::FsError::Disabled);
-    };
-
-    let dir = q.get("dir").cloned().unwrap_or_default();
-    let name = q.get("name").cloned().unwrap_or_default();
-    tracing::info!(token = %principal, dir = %dir, name = %name, "library upload");
-
-    match crate::fsops::upload(cap, state.library.as_path(), &dir, &name, &body) {
-        Ok(()) => Json(json!({"ok": true})).into_response(),
-        Err(e) => fs_err(&e),
-    }
 }
 
 /// Resolve a request's bearer to a principal, or `None`.

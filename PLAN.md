@@ -276,33 +276,21 @@ Exit: maintenance daemon runs unattended for 7 days · auto-PR on green dependen
 
 ---
 
-## 5b. Remote MCP transport + library
+## 5b. Remote MCP transport
 
-**Status: built + tested · ✗ deployed · ✗ released.** Covered by CI; nothing is exposed and no image is published.
+**Status: built + tested + DEPLOYED at pipe.casava.space · ✗ released.** Runs as a local Docker container behind the shared `/root/caddy-router`; no GHCR image is published.
 
-The endpoint contract is deliberately IDENTICAL to Folio's and Sift's — one key, one client config, one monitor probe works against any of the three.
+Pipeline is an **MCP endpoint, not a web app** — there is no browser UI. (An earlier pass ported Folio's `/library` file manager over the record; it was removed once the workflow settled on terminal-only use, where `ls`/`cat`/`$EDITOR` already do the job and a filesystem-write surface over HTTP is pure liability with no user.) The endpoint contract is deliberately IDENTICAL to Folio's and Sift's `/mcp` — one key, one client config, one monitor probe works against any of the three.
 
 | Path | Gate |
 |---|---|
 | `/mcp` | Bearer · static registry \| OAuth-issued |
 | `/tokens/whoami` | Bearer · cheapest auth sanity check |
-| `/library` · `/library/*` | SAME key · **file manager** (view · download) |
-| `/library/op` · `/library/upload` | SAME key · mutation · `PIPELINE_LIBRARY_WRITE=1` |
 | `/.well-known/oauth-*` | public · discovery (RFC 8414 · RFC 9728) |
 | `/oauth/{register,authorize,token}` | public · PKCE S256 (RFC 7591 DCR) |
 | `/health` · `/version` | public · a monitor ✗ need a token |
 
-**Auth** — `PIPELINE_TOKENS_FILE` → `PIPELINE_TOKENS` → `PIPELINE_TOKEN`. Named tokens map to **principals**: the audit log says WHO called a tool, and revoking one holder is a line out of a file. ! Unlike Folio/Sift there is **no open mode** — `/mcp` is RCE, so a misconfigured lock is a locked door, ✗ an open one.
-
-**Library** — a **file manager** over the record (`browse.rs` view · `library.rs` annotation · `fsops.rs` mutation). ✗ a gallery: an earlier pass ported Folio's design gallery (cards, thumbnails), which was the wrong shape — Folio catalogs *designs*, which have pictures; Pipeline has digests · reports · sessions · RE jobs, which you navigate like files.
-
-- **View** — directory-tree sidebar · breadcrumbs · sortable columns (name · kind · size · modified, dirs always leading) · filter (with `..` exempt) · light/dark. Server-rendered, one page per directory, works with JS off. Folio's `/files` pattern with the basic_auth Folio and Sift both dropped — ✗ basic_auth · ✗ static `file_server`, Pipeline is the SOLE gate. `?token=` once → 30-day HttpOnly cookie holding a **minted session token, never the API key**.
-- **Annotation** — a row says more than its filename: kind · pass/fail dot · one-line summary. `reports/run-812.json` is a name; `report · failed` is the fact you opened the library to find. Reads stay cheap — a bounded 16 KB peek, and only for directories under 200 entries.
-- **Mutation** (`fsops.rs`) — rename · move · delete · mkdir · upload · download. **OFF unless `PIPELINE_LIBRARY_WRITE=1`.** ! Deliberately NOT `PIPELINE_REMOTE_MODE=full` — that unlocks container exec/deploy/push, and forcing someone to grant RCE to tidy a directory is a worse trade than they asked for. The switch mints an unforgeable `Writable` capability every op demands, so a new op that forgets the check **does not compile**. **Delete is a MOVE to `trash/`, never an unlink** (Folio's rule) — always reversible. Destinations go through `resolve_new` (parent resolved + leaf validated as a bare name), since `browse::resolve` canonicalizes and can't check a path that doesn't exist yet — the exact gap a naive `root.join(name)` leaves for `../../etc/cron.d/x`.
-
-! Cookie-auth writes carry a **CSRF guard**: `SameSite=Lax` is the primary defence, an `Origin`-match the second (a single cookie-attribute typo would otherwise re-open it). A Bearer script sends no `Origin` and needs none — it can't be CSRF'd.
-
-! Every listing path — view, sidebar tree, AND the write destinations — goes through **one** containment rule (canonicalize + deny-list + root check). Two independent walks over one root is how a token store leaks out of one of them; symlinks are skipped in the listing (`lstat`, ✗ follow) and the sidebar refuses to expand a directory wider than 60 entries. The OAuth store at `<library>/.oauth` is excluded four ways: dot-prefixed · deny-listed · containment-checked · reserved-name-blocked (can't be recreated by rename/mkdir).
+**Auth** — `PIPELINE_TOKENS_FILE` → `PIPELINE_TOKENS` → `PIPELINE_TOKEN`. Named tokens map to **principals**: the audit log says WHO called a tool, and revoking one holder is a line out of a file. ! Unlike Folio/Sift there is **no open mode** — `/mcp` is RCE, so a misconfigured lock is a locked door, ✗ an open one. `PIPELINE_REMOTE_MODE=read_only` (default) blocks every destructive action even with a valid token; `full` only behind an authenticated proxy + TLS.
 
 **Rate limit** — token bucket on **(principal, ip)**. Keyed on both: principal alone lets one leaked token spread across hosts; ip alone lets one NAT egress starve everyone behind it. `PIPELINE_RATE_BURST` (40) · `PIPELINE_RATE_PER_SEC` (10) · 0 disables. Idle buckets swept every 60s — the map is otherwise a slow leak, one entry per (principal, ip), forever. `X-RateLimit-Limit`/`-Remaining` on **every** response (✗ only the 429 — a client that learns the limit exists by being cut off has already been cut off); `Retry-After` computed from the real refill rate, ✗ hardcoded.
 
@@ -310,11 +298,11 @@ The endpoint contract is deliberately IDENTICAL to Folio's and Sift's — one ke
 
 **Limits** — `/mcp` 8 MiB · pre-auth OAuth 256 KB. Cap ordering is a compile-time assertion: an anonymous caller ✗ ever get the larger allocation.
 
-**Wire conformance** — the whole `notifications/*` namespace → **202 + empty body** (a notification has no id, so any response object is unanswerable; strict SDK clients drop the connection on one). `GET`/`DELETE /mcp` → 405 + `Allow`.
+**Wire conformance** — the whole `notifications/*` namespace → **202 + empty body** (a notification has no id, so any response object is unanswerable; strict SDK clients drop the connection on one). `GET`/`DELETE /mcp` → 405 + `Allow`. All of the above is covered by the in-process `oneshot` integration suite (`http_tests.rs`), which drives the real router with no socket or env.
 
-`caddy/Caddyfile` documents the route contract for the shared router. ! ✗ run it as a standalone Caddy — `/root/caddy-router` owns :80/:443. ! ✗ point a Caddy `file_server` at the library root — it would serve `.oauth/`.
+`caddy/Caddyfile` documents the route contract for the shared router. ! ✗ run it as a standalone Caddy — `/root/caddy-router` owns :80/:443.
 
-Not yet: SSE streaming · live gallery refresh (Folio pushes new cards over SSE).
+Not yet: SSE streaming.
 
 ---
 

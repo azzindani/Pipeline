@@ -51,15 +51,6 @@ const CLIENT_MAX: usize = 256;
 /// hard so an unauthenticated caller cannot balloon the heap with a giant POST.
 pub const OAUTH_MAX_BODY_BYTES: usize = 256 * 1024;
 
-/// Browser session for the library. Long, because re-pasting a key into a URL every day
-/// is the kind of friction that ends with the key in a bookmark.
-pub const SESSION_COOKIE: &str = "pipeline_session";
-const SESSION_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
-
-pub fn session_ttl_secs() -> i64 {
-    SESSION_TTL_MS / 1000
-}
-
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -208,27 +199,6 @@ impl OAuth {
                 }
             }
         }
-    }
-
-    /// Mint a browser-session token for the library, bound to an existing principal.
-    ///
-    /// ! A browser cannot send `Authorization: Bearer`, so the library takes the key once
-    /// from `?token=` and hands back an HttpOnly cookie holding *this* — never the API
-    /// key itself. It rides the same persisted store as OAuth access tokens, so it
-    /// survives a restart and is revoked by the same expiry sweep.
-    pub fn mint_session(&self, principal: &str) -> String {
-        let token = random_token();
-        if let Ok(mut m) = self.access.lock() {
-            m.insert(
-                token.clone(),
-                Grant {
-                    principal: principal.to_owned(),
-                    expires_at: now_ms() + SESSION_TTL_MS,
-                },
-            );
-            persist(&self.access_file(), &m);
-        }
-        token
     }
 
     /// Mint an access + refresh pair and persist both.
