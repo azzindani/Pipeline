@@ -14,6 +14,8 @@ mod browse;
 mod dispatch;
 mod fsops;
 mod handlers;
+#[cfg(test)]
+mod http_tests;
 mod http_transport;
 mod library;
 mod oauth;
