@@ -12,6 +12,7 @@
 mod auth;
 mod browse;
 mod dispatch;
+mod fsops;
 mod handlers;
 mod http_transport;
 mod library;

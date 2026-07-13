@@ -238,8 +238,16 @@ td a:hover{color:var(--acc)}
 .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:middle}
 .dot.ok{background:var(--ok)}.dot.fail{background:var(--fail)}.dot.none{display:none}
 .empty{color:var(--mut);padding:24px 8px}
+td.act{text-align:right;white-space:nowrap;width:1%}
+th.act{width:1%}
+.op{background:none;border:1px solid transparent;color:var(--mut);border-radius:5px;padding:2px 6px;
+    cursor:pointer;font:inherit;font-size:13px;text-decoration:none;display:inline-block;opacity:0}
+tr:hover .op{opacity:1}
+.op:hover{border-color:var(--bd);color:var(--fg)}
+.op[data-op=delete]:hover{border-color:var(--fail);color:var(--fail)}
+.err{background:var(--fail);color:#fff;padding:8px 12px;border-radius:6px;margin:0 0 12px;font-size:13px}
 footer{color:var(--mut2);font-size:11px;padding:18px 8px 0;line-height:1.6}
-@media(max-width:680px){nav{display:none}.sum,.kind{display:none}}
+@media(max-width:680px){nav{display:none}.sum,.kind{display:none}.op{opacity:1}}
 ";
 
 // Restores the theme BEFORE first paint — after would flash dark at a light-theme reader
@@ -248,12 +256,14 @@ const BOOT: &str = r"try{var m=localStorage.getItem('pl-theme');if(m)document.do
 
 const JS: &str = r"
 var q=document.getElementById('q'),tb=document.getElementById('rows');
-var rows=[].slice.call(tb.querySelectorAll('tr'));
-function apply(){var t=(q.value||'').toLowerCase().trim(),n=0;
+// An empty directory renders no table. Guard, or every handler below dies on a null and
+// the theme button stops working in exactly the directories you just emptied.
+var rows=tb?[].slice.call(tb.querySelectorAll('tr')):[];
+function apply(){if(!q)return;var t=(q.value||'').toLowerCase().trim(),n=0;
   rows.forEach(function(r){var up=r.dataset.up==='1';
     var vis=up||!t||r.dataset.s.indexOf(t)>=0;r.style.display=vis?'':'none';if(vis&&!up)n++;});
   var e=document.getElementById('none');if(e)e.style.display=n?'none':'';}
-q.addEventListener('input',apply);
+if(q)q.addEventListener('input',apply);
 var dir={};
 document.querySelectorAll('th.s').forEach(function(th){th.addEventListener('click',function(){
   var k=th.dataset.k;dir[k]=!dir[k];var sgn=dir[k]?1:-1;
@@ -269,6 +279,48 @@ document.querySelectorAll('th.s').forEach(function(th){th.addEventListener('clic
 document.getElementById('theme').addEventListener('click',function(){
   var cur=document.documentElement.dataset.theme==='light'?'dark':'light';
   document.documentElement.dataset.theme=cur;try{localStorage.setItem('pl-theme',cur)}catch(e){}});
+
+// ── file operations ───────────────────────────────────────────────────────────────────
+var HERE=document.body.dataset.rel||'';
+function fail(msg){var d=document.createElement('div');d.className='err';d.textContent=msg;
+  var m=document.querySelector('main');m.insertBefore(d,m.firstChild);
+  setTimeout(function(){d.remove()},6000);}
+function op(payload){
+  return fetch('/library/op',{method:'POST',headers:{'Content-Type':'application/json'},
+    // same-origin: send the session cookie, and nothing else — the token never touches JS.
+    credentials:'same-origin',body:JSON.stringify(payload)})
+    .then(function(r){return r.json().then(function(j){
+      if(!r.ok||!j.ok){fail(j.error||('HTTP '+r.status));return false}
+      return true;});})
+    .catch(function(e){fail(String(e));return false});
+}
+function reloadIfOk(ok){if(ok)location.reload()}
+document.querySelectorAll('.op[data-op]').forEach(function(b){b.addEventListener('click',function(){
+  var tr=b.closest('tr'),path=tr.dataset.p,name=path.split('/').pop(),o=b.dataset.op;
+  if(o==='rename'){var n=prompt('Rename to:',name);if(!n||n===name)return;
+    op({op:'rename',path:path,name:n}).then(reloadIfOk);}
+  else if(o==='move'){var d=prompt('Move into which directory? (path under the library, blank = root)',HERE);
+    if(d===null)return;op({op:'move',path:path,dest:d}).then(reloadIfOk);}
+  else if(o==='delete'){
+    // Say where it GOES, not just that it goes. 'Delete' that silently keeps the file is
+    // as confusing as one that silently destroys it.
+    if(!confirm('Move to trash/ ?\n\n'+name+'\n\nIt is not destroyed — you can move it back out.'))return;
+    op({op:'delete',path:path}).then(reloadIfOk);}
+});});
+var mk=document.getElementById('mkdir');
+if(mk)mk.addEventListener('click',function(){var n=prompt('New folder name:');if(!n)return;
+  op({op:'mkdir',path:HERE,name:n}).then(reloadIfOk);});
+var upb=document.getElementById('up'),fi=document.getElementById('file');
+if(upb)upb.addEventListener('click',function(){fi.click()});
+if(fi)fi.addEventListener('change',function(){
+  var f=fi.files[0];if(!f)return;
+  fetch('/library/upload?dir='+encodeURIComponent(HERE)+'&name='+encodeURIComponent(f.name),
+    {method:'POST',credentials:'same-origin',body:f})
+    .then(function(r){return r.json().then(function(j){
+      if(!r.ok||!j.ok){fail(j.error||('HTTP '+r.status));return}
+      location.reload();});})
+    .catch(function(e){fail(String(e))});
+});
 ";
 
 /// Depth the sidebar tree expands to. Deep enough to see the shape of the record, shallow
@@ -320,7 +372,9 @@ fn tree(dir: &Path, url_base: &str, current: &str, depth: usize, out: &mut Strin
 ///
 /// `rel` is the path under the library root ("" = root). `root` is needed for the sidebar
 /// tree, which is always rendered from the top so you can jump anywhere in one click.
+#[allow(clippy::too_many_lines)] // one page template · splitting it scatters the markup
 pub fn render(root: &Path, rel: &str, url_path: &str, entries: &[Entry], hint: &str) -> String {
+    let writable = crate::fsops::writes_enabled();
     let here = format!("/library/{}", rel.trim_matches('/'))
         .trim_end_matches('/')
         .to_owned();
@@ -338,7 +392,7 @@ pub fn render(root: &Path, rel: &str, url_path: &str, entries: &[Entry], hint: &
             .map_or("", |(p, _)| p);
         let _ = write!(
             rows,
-            r#"<tr data-up="1"><td colspan="5"><a href="/library/{}"><span class="ic">↰</span>..</a></td></tr>"#,
+            r#"<tr data-up="1"><td colspan="6"><a href="/library/{}"><span class="ic">↰</span>..</a></td></tr>"#,
             escape(parent),
         );
     }
@@ -360,10 +414,11 @@ pub fn render(root: &Path, rel: &str, url_path: &str, entries: &[Entry], hint: &
 
         let _ = write!(
             rows,
-            r#"<tr data-d="{d}" data-nm="{nml}" data-kd="{kind}" data-sz="{sz}" data-mt="{mt}" data-s="{search}">
+            r#"<tr data-d="{d}" data-nm="{nml}" data-kd="{kind}" data-sz="{sz}" data-mt="{mt}" data-s="{search}" data-p="{crel}">
 <td><a href="{href}"><span class="dot {st}"></span><span class="ic">{ic}</span>{name}</a></td>
 <td class="kind">{kindshow}</td><td class="sum">{sum}</td>
-<td class="n">{size}</td><td class="n">{when}</td></tr>"#,
+<td class="n">{size}</td><td class="n">{when}</td>
+<td class="act">{dl}{ops}</td></tr>"#,
             d = u8::from(e.is_dir),
             nml = escape(&e.name.to_lowercase()),
             kind = escape(kind),
@@ -386,6 +441,23 @@ pub fn render(root: &Path, rel: &str, url_path: &str, entries: &[Entry], hint: &
                 human(e.size)
             },
             when = escape(&stamp(e.modified)),
+            crel = escape(&child_rel),
+            // Download only what we would render anyway — the same whitelist. A "download"
+            // button on memory.db would hand over the database the whitelist exists to
+            // withhold.
+            dl = if e.is_dir || inline_type(&ext_of(&e.name)).is_none() {
+                String::new()
+            } else {
+                format!(
+                    r#"<a class="op" title="Download" href="{}?download=1">⇩</a>"#,
+                    escape(&e.href)
+                )
+            },
+            ops = if writable {
+                r#"<button class="op" data-op="rename" title="Rename">✎</button><button class="op" data-op="move" title="Move">→</button><button class="op" data-op="delete" title="Delete (to trash)">🗑</button>"#
+            } else {
+                ""
+            },
         );
     }
 
@@ -401,7 +473,7 @@ pub fn render(root: &Path, rel: &str, url_path: &str, entries: &[Entry], hint: &
 <th class="s" data-k="kd">kind <span class="ar"></span></th>
 <th>summary</th>
 <th class="s n" data-k="sz">size <span class="ar"></span></th>
-<th class="s n" data-k="mt">modified <span class="ar"></span></th></tr>
+<th class="s n" data-k="mt">modified <span class="ar"></span></th><th class="act"></th></tr>
 <tbody id="rows">{rows}</tbody></table>
 <p class="empty" id="none" style="display:none">Nothing matches.</p>"#
         )
@@ -411,26 +483,47 @@ pub fn render(root: &Path, rel: &str, url_path: &str, entries: &[Entry], hint: &
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Pipeline · library · {title}</title>
-<style>{CSS}</style><script>{BOOT}</script></head><body>
+<style>{CSS}</style><script>{BOOT}</script></head><body data-rel="{relattr}">
 <header>
   <span class="brand">Pipeline</span>
   <span class="crumbs">{crumbs}</span>
   <input id="q" type="search" placeholder="Filter…" autocomplete="off">
+  {tools}
   <button class="tbtn" id="theme">Theme</button>
 </header>
 <div class="wrap">
   <nav>{nav}</nav>
   <main>
     {body}
-    <footer>Read-only. The record on disk under <code>.pipeline/</code> — runs, reports,
+    <footer>{note} The record on disk under <code>.pipeline/</code> — runs, reports,
     digests, sessions. Secrets and the OAuth token store are never listed or served.</footer>
   </main>
 </div>
 <script>{JS}</script></body></html>"#,
         title = escape(url_path),
         crumbs = crumbs(url_path),
+        relattr = escape(rel.trim_matches('/')),
+        tools = if writable {
+            r#"<button class="tbtn" id="mkdir">New folder</button><button class="tbtn" id="up">Upload</button><input type="file" id="file" hidden>"#
+        } else {
+            ""
+        },
+        note = if writable {
+            "Writable. Delete moves to <code>trash/</code> — it never unlinks, so a delete is always reversible."
+        } else {
+            "Read-only. Set <code>PIPELINE_LIBRARY_WRITE=1</code> to enable rename, move, delete and upload."
+        },
     )
 }
+
+/// Lowercase extension of a file name, or "" — used to decide if a download link is even
+/// offered.
+fn ext_of(name: &str) -> String {
+    name.rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
 /// Shown when there is no token and no session. ✗ a WWW-Authenticate header — a browser
 /// basic-auth popup can never be satisfied by an access token.
 pub fn gate_page(base: &str) -> String {

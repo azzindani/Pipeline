@@ -286,20 +286,23 @@ The endpoint contract is deliberately IDENTICAL to Folio's and Sift's — one ke
 |---|---|
 | `/mcp` | Bearer · static registry \| OAuth-issued |
 | `/tokens/whoami` | Bearer · cheapest auth sanity check |
-| `/library` | SAME key · the **gallery** |
-| `/library?raw=1` · `/library/*` | SAME key · the raw file browser |
+| `/library` · `/library/*` | SAME key · **file manager** (view · download) |
+| `/library/op` · `/library/upload` | SAME key · mutation · `PIPELINE_LIBRARY_WRITE=1` |
 | `/.well-known/oauth-*` | public · discovery (RFC 8414 · RFC 9728) |
 | `/oauth/{register,authorize,token}` | public · PKCE S256 (RFC 7591 DCR) |
 | `/health` · `/version` | public · a monitor ✗ need a token |
 
 **Auth** — `PIPELINE_TOKENS_FILE` → `PIPELINE_TOKENS` → `PIPELINE_TOKEN`. Named tokens map to **principals**: the audit log says WHO called a tool, and revoking one holder is a line out of a file. ! Unlike Folio/Sift there is **no open mode** — `/mcp` is RCE, so a misconfigured lock is a locked door, ✗ an open one.
 
-**Library** — two layers over one root:
+**Library** — a **file manager** over the record (`browse.rs` view · `library.rs` annotation · `fsops.rs` mutation). ✗ a gallery: an earlier pass ported Folio's design gallery (cards, thumbnails), which was the wrong shape — Folio catalogs *designs*, which have pictures; Pipeline has digests · reports · sessions · RE jobs, which you navigate like files.
 
-- **Gallery** (`library.rs`) — the front door. Cards for every artifact: kind badge · pass/fail dot · cheap one-line summary · search · sort · kind filter · grid⇄list · theme. Ported from Folio's `library-gallery.ts` in SHAPE, ✗ content: Folio catalogs *designs* with rendered thumbnails; Pipeline has digests · reports · sessions · screenshots · RE jobs, so a card carries status where Folio's carried a picture. Reads are cheap — a bounded 16 KB peek per artifact, never a full parse (a digest is megabytes).
-- **Browser** (`browse.rs`) — underneath, at every path below `/library`. Folio's `/files` pattern with the basic_auth Folio and Sift both dropped. ✗ basic_auth · ✗ static `file_server` — Pipeline is the SOLE gate. `?token=` once → 30-day HttpOnly cookie holding a **minted session token, never the API key**.
+- **View** — directory-tree sidebar · breadcrumbs · sortable columns (name · kind · size · modified, dirs always leading) · filter (with `..` exempt) · light/dark. Server-rendered, one page per directory, works with JS off. Folio's `/files` pattern with the basic_auth Folio and Sift both dropped — ✗ basic_auth · ✗ static `file_server`, Pipeline is the SOLE gate. `?token=` once → 30-day HttpOnly cookie holding a **minted session token, never the API key**.
+- **Annotation** — a row says more than its filename: kind · pass/fail dot · one-line summary. `reports/run-812.json` is a name; `report · failed` is the fact you opened the library to find. Reads stay cheap — a bounded 16 KB peek, and only for directories under 200 entries.
+- **Mutation** (`fsops.rs`) — rename · move · delete · mkdir · upload · download. **OFF unless `PIPELINE_LIBRARY_WRITE=1`.** ! Deliberately NOT `PIPELINE_REMOTE_MODE=full` — that unlocks container exec/deploy/push, and forcing someone to grant RCE to tidy a directory is a worse trade than they asked for. The switch mints an unforgeable `Writable` capability every op demands, so a new op that forgets the check **does not compile**. **Delete is a MOVE to `trash/`, never an unlink** (Folio's rule) — always reversible. Destinations go through `resolve_new` (parent resolved + leaf validated as a bare name), since `browse::resolve` canonicalizes and can't check a path that doesn't exist yet — the exact gap a naive `root.join(name)` leaves for `../../etc/cron.d/x`.
 
-! Both listing paths go through **one** containment rule (`browse::resolve` — canonicalize + deny-list + root check). The gallery originally walked the tree itself with `read_dir` + `metadata`, which follows symlinks: a symlink to `/etc` catalogued the whole of `/etc` onto cards. The browser was never exploitable, which is exactly what made a second, weaker listing path dangerous. The OAuth store at `<library>/.oauth` is excluded three ways: dot-prefixed · deny-listed · containment-checked.
+! Cookie-auth writes carry a **CSRF guard**: `SameSite=Lax` is the primary defence, an `Origin`-match the second (a single cookie-attribute typo would otherwise re-open it). A Bearer script sends no `Origin` and needs none — it can't be CSRF'd.
+
+! Every listing path — view, sidebar tree, AND the write destinations — goes through **one** containment rule (canonicalize + deny-list + root check). Two independent walks over one root is how a token store leaks out of one of them; symlinks are skipped in the listing (`lstat`, ✗ follow) and the sidebar refuses to expand a directory wider than 60 entries. The OAuth store at `<library>/.oauth` is excluded four ways: dot-prefixed · deny-listed · containment-checked · reserved-name-blocked (can't be recreated by rename/mkdir).
 
 **Rate limit** — token bucket on **(principal, ip)**. Keyed on both: principal alone lets one leaked token spread across hosts; ip alone lets one NAT egress starve everyone behind it. `PIPELINE_RATE_BURST` (40) · `PIPELINE_RATE_PER_SEC` (10) · 0 disables. Idle buckets swept every 60s — the map is otherwise a slow leak, one entry per (principal, ip), forever. `X-RateLimit-Limit`/`-Remaining` on **every** response (✗ only the 429 — a client that learns the limit exists by being cut off has already been cut off); `Retry-After` computed from the real refill rate, ✗ hardcoded.
 

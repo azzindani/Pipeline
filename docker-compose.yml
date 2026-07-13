@@ -85,6 +85,17 @@ services:
       # they are set here rather than left to the code's default.
       PIPELINE_RATE_BURST: ${PIPELINE_RATE_BURST:-40}
       PIPELINE_RATE_PER_SEC: ${PIPELINE_RATE_PER_SEC:-10}
+      # Library file operations: rename · move · delete · mkdir · upload. OFF by
+      # default — a record you can accidentally delete over the internet is worse
+      # than one you have to SSH in to tidy.
+      #
+      # ! Deliberately NOT the same switch as PIPELINE_REMOTE_MODE. That one unlocks
+      # container build/run, deploy and push — remote code execution. Renaming a
+      # report is not in that class, and forcing someone to grant RCE in order to
+      # tidy a directory is a strictly worse trade than the one they asked for.
+      #
+      # Delete moves to trash/ and never unlinks, so it is always reversible.
+      PIPELINE_LIBRARY_WRITE: ${PIPELINE_LIBRARY_WRITE:-0}
       RUST_LOG: ${RUST_LOG:-info}
     expose:
       - "8080"
