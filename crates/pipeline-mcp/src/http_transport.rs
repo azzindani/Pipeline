@@ -112,12 +112,39 @@ fn oauth_state_dir() -> PathBuf {
     )
 }
 
+/// Can we actually create + write in `dir`? Checked at boot so a read-only mount
+/// is loud rather than silent.
+fn probe_writable(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let probe = dir.join(".write-probe");
+    std::fs::write(&probe, b"")?;
+    std::fs::remove_file(&probe)
+}
+
 /// Run the HTTP MCP server. Bind defaults to 127.0.0.1:8080 if `bind` is None.
 ///
 /// Returns `Err` immediately if no token source is configured — Pipeline refuses
 /// to expose remote code execution unauthenticated.
 pub async fn serve_http(bind: Option<&str>) -> Result<(), crate::McpError> {
     let tokens = TokenRegistry::from_env().map_err(crate::McpError::Transport)?;
+
+    // ! Fail loudly if the OAuth store is not writable.
+    //
+    // Persisting is best-effort by design (a failed write costs a re-authorize,
+    // not correctness), which means a read-only mount fails SILENTLY: the
+    // container reports healthy, serves traffic, and quietly forces every client
+    // to re-authorize on each restart. A root-owned volume did exactly this in
+    // production. Surface it at boot instead of never.
+    let state_dir = oauth_state_dir();
+    if let Err(e) = probe_writable(&state_dir) {
+        eprintln!(
+            "pipeline-mcp · WARNING · OAuth state dir {} is not writable: {e}\n\
+             ·  access + refresh tokens will NOT survive a restart, so every client\n\
+             ·  must re-authorize on each bounce. Fix: chown it to the container\n\
+             ·  user (uid 10001), or point PIPELINE_OAUTH_STATE_DIR somewhere writable.",
+            state_dir.display()
+        );
+    }
 
     let addr_str = bind
         .map(str::to_owned)

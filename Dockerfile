@@ -35,7 +35,22 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=builder /usr/src/pipeline/target/release/pipeline /usr/local/bin/pipeline
 
+# ! The runtime writes everything durable under /work/.pipeline — memory.db,
+# sessions, digests, OAuth access+refresh tokens. compose mounts a named volume
+# there and a bind mount at /work, and BOTH land root-owned by default while the
+# process runs as uid 10001. Every write then fails; the OAuth store and the
+# memory layer are best-effort, so they fail SILENTLY — the deployment looks
+# healthy while persisting nothing (it did, for 10 days).
+#
+# Creating these in the image with the right owner makes a FRESH named volume
+# inherit that ownership when Docker initialises it. A pre-existing volume, or a
+# host bind mount, must be chowned to 10001:999 once — Docker never re-inits an
+# already-populated volume, and never touches bind-mount ownership at all.
+RUN mkdir -p /work/.pipeline \
+ && chown -R pipeline:pipeline /work
+
 USER pipeline
+WORKDIR /work
 
 ENTRYPOINT ["/usr/local/bin/pipeline"]
 CMD ["--help"]

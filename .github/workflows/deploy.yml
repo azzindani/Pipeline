@@ -117,6 +117,23 @@ jobs:
           fi
           echo "IMAGE_MB=$mb" >> "$GITHUB_ENV"
 
+      # The image runs as uid 10001 and writes everything durable to
+      # /work/.pipeline. A root-owned mount there makes every write fail —
+      # silently, because persistence is best-effort. That shipped to production
+      # and went unnoticed for 10 days: healthy container, persisting nothing.
+      # No unit test can catch it; only running the real image as the real user.
+      - name: gate · runtime user can write /work/.pipeline
+        run: |
+          set -euo pipefail
+          img="${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.short }}"
+          out=$(docker run --rm --entrypoint sh "$img" -c '
+            id -u
+            touch /work/.pipeline/.probe && echo WRITABLE || echo NOT_WRITABLE
+          ')
+          echo "$out"
+          echo "$out" | grep -q WRITABLE \
+            || { echo "FAIL · uid 10001 cannot write /work/.pipeline in the image"; exit 1; }
+
       - name: gate · critical CVEs (Trivy)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
