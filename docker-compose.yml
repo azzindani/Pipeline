@@ -41,7 +41,11 @@
 # ─────────────────────────────────────────────────────────────────────────────
 services:
   pipeline:
-    image: pipeline:latest
+    # Default: build from the local source tree (`docker compose up -d --build`).
+    # To run the image the deploy lane published to GHCR instead:
+    #   export PIPELINE_IMAGE=ghcr.io/azzindani/pipeline:latest
+    #   docker compose pull && docker compose up -d --no-build
+    image: ${PIPELINE_IMAGE:-pipeline:latest}
     container_name: pipeline
     build:
       context: .
@@ -49,9 +53,28 @@ services:
     command: ["mcp", "--transport", "http", "--bind", "0.0.0.0:8080"]
     restart: unless-stopped
     environment:
-      PIPELINE_TOKEN: ${PIPELINE_TOKEN:?PIPELINE_TOKEN must be set in .env}
+      # Auth — pick ONE. Priority: TOKENS_FILE → TOKENS → TOKEN. Pipeline
+      # refuses to start with none set: /mcp is a remote-code-execution surface
+      # and there is deliberately no unauthenticated mode.
+      #   PIPELINE_TOKENS_FILE  → /work/tokens.json  {"alice":"sk-…","ci":"sk-…"}
+      #   PIPELINE_TOKENS       → "alice:sk-…,ci:sk-…"  (named, revoke one at a time)
+      #   PIPELINE_TOKEN        → single shared bearer, principal "default"
+      PIPELINE_TOKENS_FILE: ${PIPELINE_TOKENS_FILE:-}
+      PIPELINE_TOKENS: ${PIPELINE_TOKENS:-}
+      PIPELINE_TOKEN: ${PIPELINE_TOKEN:-}
       PIPELINE_REMOTE_MODE: ${PIPELINE_REMOTE_MODE:-read_only}
       PIPELINE_BIND: 0.0.0.0:8080
+      # OAuth client for the claude.ai Custom Connector. Both optional — an
+      # empty secret keeps the client public (PKCE-only), which is what
+      # claude.ai uses. Access/refresh tokens persist under /work/.pipeline/oauth
+      # (the pipeline-memory volume), so a container bounce never forces a
+      # re-authorize.
+      PIPELINE_OAUTH_CLIENT_ID: ${PIPELINE_OAUTH_CLIENT_ID:-claude-ai}
+      PIPELINE_OAUTH_CLIENT_SECRET: ${PIPELINE_OAUTH_CLIENT_SECRET:-}
+      # Request-body ceiling on /mcp. Tool args (patches, digests, file bodies)
+      # are legitimately large; the pre-auth OAuth surface is capped separately
+      # and far tighter (256 KB) so an anonymous POST cannot OOM the container.
+      PIPELINE_MAX_BODY_BYTES: ${PIPELINE_MAX_BODY_BYTES:-}
       RUST_LOG: ${RUST_LOG:-info}
     expose:
       - "8080"

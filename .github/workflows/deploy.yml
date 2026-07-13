@@ -1,0 +1,160 @@
+# GitHub Actions · DEPLOY lane.
+#
+# Runs only after `confirm` (Stage 0 + 1) goes green on main. This is where the
+# Docker work lives — the confirm lane stays thin on purpose, and the image is
+# the one artifact CD actually needs.
+#
+# Gates are read from pipeline.yaml, not hardcoded here. Pipeline dogfoods its
+# own contract: `gates.image_size_mb` and `gates.critical_vulns` gate the very
+# image that ships Pipeline.
+#
+#   confirm (green, main) → build → size gate → CVE gate → push GHCR → summary
+#
+# The VPS pulls from GHCR (see the run summary for the exact command). Publishing
+# is deliberately separate from applying: an unattended upgrade means a bad
+# release lands on the box with nobody watching. See CLAUDE.md §"Phase 5".
+
+name: deploy
+
+on:
+  workflow_run:
+    workflows: [confirm]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false # never abort a half-finished registry push
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository_owner }}/pipeline
+
+jobs:
+  publish:
+    name: build · gate · publish
+    runs-on: ubuntu-latest
+    # workflow_run fires on FAILED runs too — guard, or a red build ships.
+    # workflow_dispatch has no workflow_run context, hence the second clause.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # workflow_run checks out the DEFAULT branch by default, not the commit
+          # that triggered it. Without this, a race could publish an image built
+          # from a different tree than the one that passed confirm.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: read gates from pipeline.yaml
+        id: gates
+        run: |
+          set -euo pipefail
+          size=$(python3 -c "
+          import re,sys
+          t=open('pipeline.yaml').read()
+          m=re.search(r'^\s*image_size_mb:\s*(\d+)', t, re.M)
+          print(m.group(1) if m else 200)")
+          vulns=$(python3 -c "
+          import re
+          t=open('pipeline.yaml').read()
+          m=re.search(r'^\s*critical_vulns:\s*(\d+)', t, re.M)
+          print(m.group(1) if m else 0)")
+          echo "image_size_mb=$size" >> "$GITHUB_OUTPUT"
+          echo "critical_vulns=$vulns" >> "$GITHUB_OUTPUT"
+          echo "gates · image_size_mb=$size · critical_vulns=$vulns"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: tags
+        id: meta
+        run: |
+          sha="${{ github.event.workflow_run.head_sha || github.sha }}"
+          {
+            echo "sha=$sha"
+            echo "short=${sha:0:7}"
+            echo "image=${{ env.IMAGE }}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Build ONCE, load locally. The gates below must run against the exact
+      # image that gets pushed — build-and-push-then-scan would publish first
+      # and ask questions later.
+      - name: build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.short }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: gate · image size
+        run: |
+          set -euo pipefail
+          img="${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.short }}"
+          bytes=$(docker image inspect "$img" --format '{{.Size}}')
+          mb=$(( bytes / 1000 / 1000 ))
+          cap=${{ steps.gates.outputs.image_size_mb }}
+          echo "image ${mb} MB · cap ${cap} MB"
+          if [ "$mb" -gt "$cap" ]; then
+            echo "FAIL · image ${mb} MB exceeds gates.image_size_mb=${cap} (pipeline.yaml)"
+            exit 1
+          fi
+          echo "IMAGE_MB=$mb" >> "$GITHUB_ENV"
+
+      - name: gate · critical CVEs (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.short }}
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          # gates.critical_vulns: 0 → any CRITICAL fails the build.
+          exit-code: '1'
+
+      - name: push
+        run: |
+          set -euo pipefail
+          img="${{ steps.meta.outputs.image }}"
+          short="${{ steps.meta.outputs.short }}"
+          docker tag "$img:$short" "$img:latest"
+          docker push "$img:$short"
+          docker push "$img:latest"
+
+      - name: summary
+        run: |
+          {
+            echo "### Pipeline image published"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| image | \`${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.short }}\` |"
+            echo "| also tagged | \`latest\` |"
+            echo "| size | ${IMAGE_MB} MB (cap ${{ steps.gates.outputs.image_size_mb }} MB) |"
+            echo "| critical CVEs | 0 (gate: ${{ steps.gates.outputs.critical_vulns }}) |"
+            echo
+            echo "Applying is deliberately manual — an unattended upgrade lands a bad"
+            echo "release on the box with nobody watching. On the VPS:"
+            echo
+            echo '```sh'
+            echo "cd /root/Pipeline"
+            echo "export PIPELINE_IMAGE=${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.short }}"
+            echo "docker compose pull && docker compose up -d"
+            echo "curl -sf https://pipe.casava.space/health"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

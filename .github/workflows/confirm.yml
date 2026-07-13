@@ -1,7 +1,12 @@
-# GitHub Actions · thin confirmation only.
-# Reruns Stage 0 (static) + Stage 1 (unit). Docker-heavy stages already passed locally.
-# Source of truth is local preflight; this is a parity check.
-# See CLAUDE.md §"Phase 4" and PLAN.md §7.
+# GitHub Actions · thin CONFIRMATION lane.
+#
+# Reruns Stage 0 (static) + Stage 1 (unit) only. Docker-heavy stages (container,
+# integration) already passed locally via preflight — rerunning them here would
+# spend CI minutes re-proving what local CI is the source of truth for. The image
+# build + size gate live in the deploy lane, the only place the artifact is
+# actually needed.
+#
+# See CLAUDE.md §"Phase 4" · PLAN.md §7 (CI/CD lane separation).
 
 name: confirm
 
@@ -10,27 +15,148 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A force-push mid-run should cancel the stale run, not race it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  confirm:
-    name: stage 0 + 1
+  # ── Stage 0 · static ───────────────────────────────────────────────────────
+  # No execution. Lint · format · supply chain · secrets · Dockerfile.
+  static:
+    name: stage 0 · static
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: install rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      - name: cache cargo
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pipeline
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: fmt
         run: cargo fmt --all -- --check
 
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      # Cargo.lock must already satisfy the manifests. Without --locked a stale
+      # lockfile is silently "fixed" in CI and the drift never surfaces.
+      - name: lockfile is current
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: dependency audit (RustSec)
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: dockerfile lint (hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          # DL3008 (pin apt versions) is noise for a base image rebuilt often.
+          ignore: DL3008
+
+  # ── Stage 1 · unit ─────────────────────────────────────────────────────────
+  # Fast, no containers. Runs in PARALLEL with static — a fmt nit should not
+  # hide a failing test.
+  unit:
+    name: stage 1 · unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pipeline
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: build
+        run: cargo build --workspace --locked
 
       - name: test
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features --locked
+
+      # No unit test covers process boot, but every agent downstream depends on
+      # it. If `pipeline mcp` cannot answer initialize, the MCP surface is dead.
+      - name: smoke · stdio transport answers initialize
+        run: |
+          set -euo pipefail
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+            | ./target/debug/pipeline mcp --transport stdio \
+            | grep -q '"serverInfo"'
+          echo "OK · stdio transport answers initialize"
+
+      # /mcp is a remote-code-execution surface. These are the invariants that
+      # must never regress:
+      #   1. it REFUSES to boot with no auth configured
+      #   2. OAuth discovery is reachable WITHOUT a bearer — claude.ai walks it
+      #      anonymously; behind the gate, the Connector could never bootstrap
+      #   3. /mcp itself is gated
+      - name: smoke · http transport auth invariants
+        run: |
+          set -euo pipefail
+
+          echo "→ must refuse to start with no token configured"
+          if env -u PIPELINE_TOKEN -u PIPELINE_TOKENS -u PIPELINE_TOKENS_FILE \
+               ./target/debug/pipeline mcp --transport http --bind 127.0.0.1:8123; then
+            echo "FAIL · server started with no auth configured"; exit 1
+          fi
+          echo "  refused ✓"
+
+          PIPELINE_TOKENS="ci:sk-ci-test" \
+          PIPELINE_OAUTH_STATE_DIR="$(mktemp -d)" \
+            ./target/debug/pipeline mcp --transport http --bind 127.0.0.1:8123 &
+          for _ in $(seq 40); do
+            curl -sf http://127.0.0.1:8123/health >/dev/null 2>&1 && break
+            sleep 0.25
+          done
+
+          echo "→ OAuth discovery must be public"
+          curl -sf http://127.0.0.1:8123/.well-known/oauth-authorization-server \
+            | grep -q '"code_challenge_methods_supported"'
+          echo "  public ✓"
+
+          echo "→ /mcp must reject an anonymous call"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8123/mcp \
+                   -H 'Content-Type: application/json' \
+                   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')
+          [ "$code" = "401" ] || { echo "FAIL · /mcp answered $code anonymously, want 401"; exit 1; }
+          echo "  401 ✓"
+
+          echo "→ /mcp must accept a valid bearer"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8123/mcp \
+                   -H 'Authorization: Bearer sk-ci-test' -H 'Content-Type: application/json' \
+                   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}')
+          [ "$code" = "200" ] || { echo "FAIL · /mcp answered $code with a valid bearer, want 200"; exit 1; }
+          echo "  200 ✓"
+
+  # ── Secret scan ────────────────────────────────────────────────────────────
+  # Separate job: needs full history (trufflehog diffs a commit range, and a
+  # shallow clone has no range to diff), which the build jobs do not want.
+  secrets:
+    name: stage 0 · secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: trufflehog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          extra_args: --results=verified,unknown
