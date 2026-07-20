@@ -32,6 +32,12 @@ fn init(args: &Value) -> ToolResponse {
         .and_then(Value::as_str)
         .unwrap_or("custom");
     let stack = args.get("stack").and_then(Value::as_str).unwrap_or("");
+    // adopt · bring an existing repo under Pipeline instead of scaffolding a new
+    // one. Writes only the missing files · ✗ overwrites anything already there.
+    let adopt = args
+        .get("adopt")
+        .and_then(Value::as_bool)
+        .unwrap_or_default();
 
     // Default parent: current working directory · agent can override with `parent`.
     let parent: PathBuf = match args.get("parent").and_then(Value::as_str) {
@@ -42,7 +48,7 @@ fn init(args: &Value) -> ToolResponse {
         },
     };
 
-    match templates::init_project(&parent, &name, template, stack) {
+    match templates::init_project_with(&parent, &name, template, stack, adopt) {
         Ok(outcome) => ToolResponse {
             ok: true,
             data: serde_json::to_value(&outcome).unwrap_or(json!({})),
@@ -54,7 +60,10 @@ fn init(args: &Value) -> ToolResponse {
             memory_refs: vec![],
             error: None,
         },
-        Err(InitError::NotEmpty(p)) => err(format!("target '{p}' is non-empty")),
+        Err(InitError::NotEmpty(p)) => err(format!(
+            "target '{p}' is non-empty · pass adopt=true to bring an existing \
+             project under Pipeline (writes only what is missing)"
+        )),
         Err(InitError::UnknownTemplate(t, valid)) => {
             err(format!("unknown template '{t}' · valid: {valid}"))
         }

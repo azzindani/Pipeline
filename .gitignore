@@ -4,8 +4,12 @@
 Cargo.lock.bak
 *.rs.bk
 
-# Pipeline runtime data (ignore by default; uncomment to commit shared memory)
-# .pipeline/
+# Pipeline runtime data · memory.db · digests · repo registry.
+# ! The rule below was commented out while the comment above it claimed the
+# directory was ignored "by default" — so `git add -A` swept machine-local
+# state (absolute paths, SQLite WAL) into a commit. Comment it out only if you
+# genuinely intend to commit shared team memory.
+.pipeline/
 
 # Editors
 .vscode/
