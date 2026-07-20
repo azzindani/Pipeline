@@ -9,6 +9,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -258,7 +259,81 @@ impl Memory {
             active_session: active_lock,
             last_run,
             recent_failures,
+            active_work: self.active_work(project_id).await?,
         })
+    }
+
+    /// Rebuild the planning context from what `pipeline_plan.*` stored.
+    ///
+    /// Reads rather than requires: a project with no plan yields a default
+    /// `ActiveWork`, ✗ an error — handover must answer on a bare project too.
+    async fn active_work(&self, project_id: &str) -> Result<ActiveWork, MemoryError> {
+        let mut work = ActiveWork::default();
+
+        if let Some(raw) = self.recall(project_id, "plan", "prd").await? {
+            if let Ok(prd) = serde_json::from_str::<serde_json::Value>(&raw) {
+                work.goal = prd
+                    .get("summary")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(ToOwned::to_owned);
+                work.goals = string_list(prd.get("goals"));
+                work.non_goals = string_list(prd.get("non_goals"));
+            }
+        }
+
+        // ! Plan order, ✗ recency order. list_scope is created_at DESC, which would
+        // hand the agent the LAST milestone as the next thing to build.
+        for (id, raw) in in_plan_order(self.list_scope(project_id, "feature").await?) {
+            let Ok(f) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            let status = f
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("todo")
+                .to_owned();
+            work.features_total += 1;
+            *work.features_by_status.entry(status.clone()).or_insert(0) += 1;
+            // Only unfinished work belongs in "what's next" · a done feature is history.
+            if status != "done" {
+                work.next_features.push(FeatureBrief {
+                    id,
+                    name: f
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_owned(),
+                    description: f
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_owned(),
+                    status,
+                    acceptance_criteria: string_list(f.get("ac")),
+                });
+            }
+        }
+
+        for (name, raw) in in_plan_order(self.list_scope(project_id, "milestone").await?) {
+            let m = serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_default();
+            work.milestones.push(MilestoneBrief {
+                name: m
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&name)
+                    .to_owned(),
+                status: m
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("planned")
+                    .to_owned(),
+                exit_criteria: string_list(m.get("exit_criteria")),
+            });
+        }
+
+        work.open_risks = self.list_scope(project_id, "risk").await?.len();
+        Ok(work)
     }
 
     // ---------- runs ----------
@@ -574,6 +649,41 @@ pub struct ProjectInfo {
     pub stack: String,
 }
 
+/// What the project is *trying to do* · reconstructed from the stored plan.
+///
+/// ! Without this the packet answers "what broke" but not "what are we building",
+/// so an agent that reconnects knows the last failure and nothing about the goal.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ActiveWork {
+    /// PRD summary · the one-paragraph statement of intent.
+    pub goal: Option<String>,
+    pub goals: Vec<String>,
+    pub non_goals: Vec<String>,
+    pub features_total: usize,
+    /// status → count, e.g. `{"todo": 11}`.
+    pub features_by_status: BTreeMap<String, usize>,
+    /// The work actually up next · todo features with their acceptance criteria.
+    pub next_features: Vec<FeatureBrief>,
+    pub milestones: Vec<MilestoneBrief>,
+    pub open_risks: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureBrief {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub status: String,
+    pub acceptance_criteria: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MilestoneBrief {
+    pub name: String,
+    pub status: String,
+    pub exit_criteria: Vec<String>,
+}
+
 /// Canonical handover packet · CLAUDE.md §"Handover protocol".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandoverPacket {
@@ -581,6 +691,39 @@ pub struct HandoverPacket {
     pub active_session: Option<SessionLock>,
     pub last_run: Option<RunRecord>,
     pub recent_failures: Vec<FailureRecord>,
+    pub active_work: ActiveWork,
+}
+
+/// Re-sort scope rows oldest-first on the payload's own `created_at`.
+///
+/// Plan artifacts are authored in dependency order — M1 before M5, schema before
+/// delivery — so handover must replay them in that order. Stable sort keeps rows
+/// that share a timestamp (a scripted planning pass writes many in the same
+/// second) in their original insertion order.
+fn in_plan_order(mut rows: Vec<(String, String)>) -> Vec<(String, String)> {
+    rows.reverse(); // list_scope is created_at DESC → oldest-first
+    rows.sort_by_key(|(_, raw)| {
+        serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|v| {
+                v.get("created_at")
+                    .and_then(|c| c.as_str())
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_default()
+    });
+    rows
+}
+
+/// JSON array → `Vec<String>`, dropping non-strings. Absent field → empty.
+fn string_list(v: Option<&serde_json::Value>) -> Vec<String> {
+    v.and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(ToOwned::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn now_rfc3339() -> String {
@@ -650,6 +793,109 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].stage, "static");
         assert_eq!(history[0].status, "pass");
+    }
+
+    #[tokio::test]
+    async fn handover_carries_the_plan_not_just_the_failures() {
+        // Regression: the packet used to answer "what broke" and never "what are we
+        // building", so a reconnecting agent got a project name and nothing else.
+        let m = fresh().await;
+        m.remember(
+            "p1",
+            "plan",
+            "prd",
+            r#"{"summary":"deliver Vera","goals":["cited results"],"non_goals":["never call an LLM"]}"#,
+        )
+        .await
+        .unwrap();
+        m.remember(
+            "p1",
+            "feature",
+            "f1",
+            r#"{"name":"pg-schema","description":"halfvec","status":"todo","ac":["migrates clean"]}"#,
+        )
+        .await
+        .unwrap();
+        m.remember(
+            "p1",
+            "feature",
+            "f2",
+            r#"{"name":"shipped","description":"done thing","status":"done","ac":[]}"#,
+        )
+        .await
+        .unwrap();
+        m.remember(
+            "p1",
+            "milestone",
+            "M1",
+            r#"{"name":"M1 · foundation","status":"planned","exit_criteria":["schema migrates"]}"#,
+        )
+        .await
+        .unwrap();
+
+        let w = m.handover("p1").await.unwrap().active_work;
+        assert_eq!(w.goal.as_deref(), Some("deliver Vera"));
+        assert_eq!(w.goals, vec!["cited results".to_owned()]);
+        assert_eq!(w.non_goals, vec!["never call an LLM".to_owned()]);
+        assert_eq!(w.features_total, 2);
+        assert_eq!(w.features_by_status.get("todo"), Some(&1));
+        assert_eq!(w.features_by_status.get("done"), Some(&1));
+        // Done work is history · only unfinished features are "what's next".
+        assert_eq!(w.next_features.len(), 1);
+        assert_eq!(w.next_features[0].name, "pg-schema");
+        assert_eq!(
+            w.next_features[0].acceptance_criteria,
+            vec!["migrates clean".to_owned()]
+        );
+        assert_eq!(w.milestones.len(), 1);
+        assert_eq!(w.milestones[0].exit_criteria.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handover_replays_the_plan_in_authoring_order() {
+        // Regression: list_scope is created_at DESC, so handover handed back the LAST
+        // milestone as the next thing to build — M5 before M1, delivery before schema.
+        let m = fresh().await;
+        for (i, name) in ["M1", "M2", "M3"].iter().enumerate() {
+            m.remember(
+                "p1",
+                "milestone",
+                name,
+                &format!(
+                    r#"{{"name":"{name}","status":"planned","created_at":"2026-07-20T00:0{i}:00Z"}}"#
+                ),
+            )
+            .await
+            .unwrap();
+            m.remember(
+                "p1",
+                "feature",
+                &format!("f{i}"),
+                &format!(
+                    r#"{{"name":"feat-{name}","status":"todo","created_at":"2026-07-20T00:0{i}:00Z"}}"#
+                ),
+            )
+            .await
+            .unwrap();
+        }
+        let w = m.handover("p1").await.unwrap().active_work;
+        let ms: Vec<&str> = w.milestones.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(
+            ms,
+            vec!["M1", "M2", "M3"],
+            "milestones must replay M1 first"
+        );
+        let fs: Vec<&str> = w.next_features.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(fs, vec!["feat-M1", "feat-M2", "feat-M3"]);
+    }
+
+    #[tokio::test]
+    async fn handover_on_a_project_with_no_plan_is_empty_not_an_error() {
+        let m = fresh().await;
+        let w = m.handover("p1").await.unwrap().active_work;
+        assert!(w.goal.is_none());
+        assert_eq!(w.features_total, 0);
+        assert!(w.next_features.is_empty());
     }
 
     #[tokio::test]

@@ -112,6 +112,53 @@ only Pipeline's own hand-written file was wrong, which is the same class of bug 
 finding 3: **the paths Pipeline generates were tested; the paths Pipeline was born with
 were not.**
 
+### 6 · The handover packet dropped the entire plan
+
+Planning Vera through `pipeline_plan.*` succeeded on all 24 calls — PRD, 11 features with
+acceptance criteria, 5 milestones. Then `pipeline_session.handover` returned:
+
+```json
+{ "project": {"id":"Vera","name":"Vera","stack":"rust"},
+  "active_session": null, "last_run": null, "recent_failures": [] }
+```
+
+Pipeline had just stored the plan and then declined to hand it over. `HandoverPacket`
+carried four fields — project · active_session · last_run · recent_failures — all of
+which answer *what broke*, and none of which answer *what are we building*. A
+reconnecting agent got a project name.
+
+This is the load-bearing claim in CLAUDE.md ("Pipeline owns all persistent context;
+agents are stateless consumers") failing at exactly the tool that exists to deliver it.
+It is also directly on the critical path for this exercise: handover **is** the mechanism
+that makes session N+1 work.
+
+**Fix.** `HandoverPacket.active_work` — goal · goals · non_goals · feature counts by
+status · unfinished features *with their acceptance criteria* · milestones with exit
+criteria · open risk count. Reads rather than requires: a project with no plan yields an
+empty `ActiveWork`, ✗ an error.
+
+### 7 · …and then replayed it backwards
+
+The fix worked and immediately exposed a second bug, visible only on real data with
+meaningful ordering:
+
+```
+milestones: ['M5 · delivery', 'M4 · ingest', 'M3 · tool surface', 'M2 · retrieval core', 'M1 · foundation']
+next up   : delivery · eval-harness · ingest-pipeline …
+```
+
+`list_scope` orders `created_at DESC`. Correct for "recent failures", wrong for a plan:
+an agent reading `next_features` would have started with `delivery` — the last thing to
+build — and worked toward the schema.
+
+**Fix.** `in_plan_order()` re-sorts on the payload's own `created_at`, oldest-first,
+with a stable sort so a scripted planning pass writing many rows in the same second
+keeps its insertion order. Scoped to handover; `list_scope`'s recency ordering is left
+alone for the callers that want it.
+
+A unit test would not have caught this. Two fixtures sort the same either way; it took
+five milestones with real names before the reversal was legible.
+
 ---
 
 ## Vera, after
