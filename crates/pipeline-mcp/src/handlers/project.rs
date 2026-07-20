@@ -146,19 +146,34 @@ fn scaffold_crate(cwd: &std::path::Path, name: &str, args: &Value) -> ToolRespon
         .get("description")
         .and_then(Value::as_str)
         .unwrap_or("Scaffolded by pipeline_project.scaffold.");
+    // ✗ inherit a table the root does not define · cargo refuses to load the whole
+    // workspace if a member points at a missing [workspace.lints]. An existing
+    // workspace that never configured lints is a normal case, not an error.
+    let root_manifest = std::fs::read_to_string(cwd.join("Cargo.toml")).unwrap_or_default();
+    let has_ws_lints = root_manifest.contains("[workspace.lints")
+        || root_manifest.trim().is_empty()  // absent → we are about to seed it
+        || !root_manifest.contains("[workspace]");
+    let lints = if has_ws_lints {
+        "\n[lints]\nworkspace = true\n"
+    } else {
+        ""
+    };
     // Inherit from the workspace so version/edition/lints stay in one place.
     let manifest = format!(
         "[package]\nname = \"{name}\"\nversion.workspace = true\nedition.workspace = true\n\
-         rust-version.workspace = true\ndescription = \"{description}\"\n\n[dependencies]\n\n\
-         [lints]\nworkspace = true\n"
+         rust-version.workspace = true\ndescription = \"{description}\"\n\n[dependencies]\n{lints}"
     );
+    // ! The description belongs in the manifest, ✗ in a `//!` doc comment.
+    // Free prose in doc position trips clippy::doc_markdown on any CamelCase word
+    // (a product name like OpenRouter is enough), so scaffold → run fast came back
+    // red by construction. A scaffold must pass the gate it hands you.
     let (src_rel, src_body) = if is_bin {
         (
             "src/main.rs",
-            format!("//! {name} · {description}\n\nfn main() {{\n    println!(\"{name}\");\n}}\n"),
+            format!("//! `{name}`\n\nfn main() {{\n    println!(\"{name}\");\n}}\n"),
         )
     } else {
-        ("src/lib.rs", format!("//! {name} · {description}\n"))
+        ("src/lib.rs", format!("//! `{name}`\n"))
     };
 
     if let Err(e) = std::fs::create_dir_all(root.join("src")) {
@@ -252,11 +267,57 @@ fn add_workspace_member(cwd: &std::path::Path, name: &str) -> Result<bool, Strin
             seeded,
             "\n[workspace]\nresolver = \"3\"\nmembers = [\n    \"{entry}\",\n]\n"
         );
+        // ! Scaffolded members use `edition.workspace = true`, so the table they
+        // inherit from has to exist or cargo cannot even load the manifest.
+        // Values are lifted from the existing [package], ✗ invented.
+        let inherit = [
+            "version",
+            "edition",
+            "rust-version",
+            "license",
+            "repository",
+        ];
+        let carried: Vec<String> = inherit
+            .iter()
+            .filter_map(|k| package_key(&text, k).map(|v| format!("{k} = {v}")))
+            .collect();
+        if !carried.is_empty() {
+            let _ = write!(seeded, "\n[workspace.package]\n{}\n", carried.join("\n"));
+        }
+        // Members declare `[lints] workspace = true`, which likewise needs a table
+        // to point at. Defaults follow rust/STANDARDS: deny unsafe, pedantic on.
+        seeded.push_str(WORKSPACE_LINTS);
         std::fs::write(&path, seeded).map_err(|e| format!("write workspace manifest: {e}"))?;
         return Ok(true);
     }
     std::fs::write(&path, out).map_err(|e| format!("write workspace manifest: {e}"))?;
     Ok(true)
+}
+
+/// Lint policy seeded into a new workspace · rust/STANDARDS defaults.
+const WORKSPACE_LINTS: &str = "\n[workspace.lints.rust]\nunsafe_code = \"forbid\"\n\n\
+     [workspace.lints.clippy]\npedantic = { level = \"warn\", priority = -1 }\n";
+
+/// Read `key = value` from the manifest's `[package]` table · returns the raw
+/// right-hand side (quotes intact) so it can be re-emitted verbatim.
+fn package_key(manifest: &str, key: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in manifest.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_package = t == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        if let Some((k, v)) = t.split_once('=') {
+            if k.trim() == key {
+                return Some(v.trim().to_owned());
+            }
+        }
+    }
+    None
 }
 
 fn template_register(args: &Value) -> ToolResponse {
@@ -358,7 +419,7 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(
             dir.path().join("Cargo.toml"),
-            "[package]\nname = \"vera\"\nversion = \"0.1.0\"\n",
+            "[package]\nname = \"vera\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
         )
         .unwrap();
         assert!(add_workspace_member(dir.path(), "vera-core").unwrap());

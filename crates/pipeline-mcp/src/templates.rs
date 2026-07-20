@@ -371,9 +371,11 @@ fn cli_rust_main(name: &str) -> String {
     )
 }
 
-const MICROSERVICE_MAIN: &str = "use axum::{Router, Json, routing::get};\nuse serde::Serialize;\n\n#[derive(Serialize)]\nstruct Health { status: &'static str }\n\n#[tokio::main]\nasync fn main() -> Result<(), Box<dyn std::error::Error>> {\n    let app = Router::new()\n        .route(\"/\", get(|| async { \"hello\" }))\n        .route(\"/health\", get(|| async { Json(Health { status: \"ok\" }) }));\n    let listener = tokio::net::TcpListener::bind(\"0.0.0.0:8080\").await?;\n    axum::serve(listener, app).await?;\n    Ok(())\n}\n";
+const MICROSERVICE_MAIN: &str = "use axum::{Json, Router, routing::get};\nuse serde::Serialize;\n\n#[derive(Serialize)]\nstruct Health {\n    status: &'static str,\n}\n\n#[tokio::main]\nasync fn main() -> Result<(), Box<dyn std::error::Error>> {\n    let app = Router::new()\n        .route(\"/\", get(|| async { \"hello\" }))\n        .route(\"/health\", get(|| async { Json(Health { status: \"ok\" }) }));\n    let listener = tokio::net::TcpListener::bind(\"0.0.0.0:8080\").await?;\n    axum::serve(listener, app).await?;\n    Ok(())\n}\n";
 
-const MCP_SERVER_MAIN: &str = "use anyhow::Result;\nuse serde_json::{Value, json};\nuse tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};\n\n#[tokio::main]\nasync fn main() -> Result<()> {\n    let stdin = tokio::io::stdin();\n    let mut reader = BufReader::new(stdin).lines();\n    let mut stdout = tokio::io::stdout();\n    while let Some(line) = reader.next_line().await? {\n        if line.trim().is_empty() { continue; }\n        let req: Value = match serde_json::from_str(&line) { Ok(v) => v, Err(_) => continue };\n        let id = req.get(\"id\").cloned();\n        let method = req.get(\"method\").and_then(Value::as_str).unwrap_or(\"\");\n        let resp = match method {\n            \"initialize\" => json!({\"jsonrpc\":\"2.0\",\"id\":id,\"result\":{\"protocolVersion\":\"2024-11-05\",\"serverInfo\":{\"name\":\"my-mcp\",\"version\":\"0.0.1\"},\"capabilities\":{\"tools\":{}}}}),\n            \"tools/list\" => json!({\"jsonrpc\":\"2.0\",\"id\":id,\"result\":{\"tools\":[]}}),\n            _ => json!({\"jsonrpc\":\"2.0\",\"id\":id,\"error\":{\"code\":-32601,\"message\":\"method not found\"}}),\n        };\n        let mut bytes = serde_json::to_vec(&resp)?;\n        bytes.push(b'\\n');\n        stdout.write_all(&bytes).await?;\n        stdout.flush().await?;\n    }\n    Ok(())\n}\n";
+// ! rustfmt-clean as written. A scaffold that fails `pipeline run fast` on
+// the very first call teaches the agent to distrust the gate.
+const MCP_SERVER_MAIN: &str = "use anyhow::Result;\nuse serde_json::{Value, json};\nuse tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};\n\n#[tokio::main]\nasync fn main() -> Result<()> {\n    let stdin = tokio::io::stdin();\n    let mut reader = BufReader::new(stdin).lines();\n    let mut stdout = tokio::io::stdout();\n    while let Some(line) = reader.next_line().await? {\n        if line.trim().is_empty() {\n            continue;\n        }\n        let req: Value = match serde_json::from_str(&line) {\n            Ok(v) => v,\n            Err(_) => continue,\n        };\n        let id = req.get(\"id\").cloned();\n        let method = req.get(\"method\").and_then(Value::as_str).unwrap_or(\"\");\n        let resp = match method {\n            \"initialize\" => {\n                json!({\"jsonrpc\":\"2.0\",\"id\":id,\"result\":{\"protocolVersion\":\"2024-11-05\",\"serverInfo\":{\"name\":\"my-mcp\",\"version\":\"0.0.1\"},\"capabilities\":{\"tools\":{}}}})\n            }\n            \"tools/list\" => json!({\"jsonrpc\":\"2.0\",\"id\":id,\"result\":{\"tools\":[]}}),\n            _ => {\n                json!({\"jsonrpc\":\"2.0\",\"id\":id,\"error\":{\"code\":-32601,\"message\":\"method not found\"}})\n            }\n        };\n        let mut bytes = serde_json::to_vec(&resp)?;\n        bytes.push(b'\\n');\n        stdout.write_all(&bytes).await?;\n        stdout.flush().await?;\n    }\n    Ok(())\n}\n";
 
 const GITIGNORE: &str = "# Build artifacts\ntarget/\nnode_modules/\ndist/\nbuild/\n\n# Pipeline runtime data\n.pipeline/\n\n# Editors\n.vscode/\n.idea/\n*.swp\n.DS_Store\n\n# Env\n.env\n.env.local\n*.pem\n*.key\n";
 
@@ -489,6 +491,34 @@ mod tests {
             let text = std::fs::read_to_string(dir.path().join("p/pipeline.yaml")).unwrap();
             pipeline_config::PipelineConfig::parse(&text)
                 .unwrap_or_else(|e| panic!("template '{template}' emits invalid yaml: {e}"));
+        }
+    }
+
+    #[test]
+    fn every_template_emits_rustfmt_clean_code() {
+        // Regression: mcp-server-rust's stub was not formatted, so `init` followed
+        // by `run fast` was RED on a brand-new project. A scaffold that fails the
+        // gate it hands you teaches the agent to distrust the gate.
+        for (template, _) in list_templates() {
+            let dir = tempdir().unwrap();
+            let outcome = init_project(dir.path(), "p", template, "").unwrap();
+            for file in outcome
+                .files_written
+                .iter()
+                .filter(|f| f.extension().is_some_and(|e| e == "rs"))
+            {
+                let out = std::process::Command::new("rustfmt")
+                    .args(["--edition", "2024", "--check"])
+                    .arg(file)
+                    .output()
+                    .expect("rustfmt must be installed");
+                assert!(
+                    out.status.success(),
+                    "template '{template}' emits unformatted {}:\n{}",
+                    file.display(),
+                    String::from_utf8_lossy(&out.stdout)
+                );
+            }
         }
     }
 
