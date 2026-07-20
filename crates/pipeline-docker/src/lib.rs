@@ -85,12 +85,22 @@ pub async fn build(
     run("docker", &cli, None).await
 }
 
-pub async fn run_image(
+/// Build the argv for `docker run` · pure, so call sites can be asserted.
+///
+/// `volumes` are `(host, container)` pairs → `-v host:container`.
+/// ! Bind mounts must go here, ✗ into `env`: a mount smuggled through `env`
+/// becomes `-e MOUNT=/host:/work` and the container never sees the files.
+pub fn run_image_args(
     image: &str,
     cmd: &[&str],
     env: &[(String, String)],
-) -> Result<CommandOutput, DockerError> {
+    volumes: &[(&str, &str)],
+) -> Vec<String> {
     let mut args: Vec<String> = vec!["run".into(), "--rm".into()];
+    for (host, container) in volumes {
+        args.push("-v".into());
+        args.push(format!("{host}:{container}"));
+    }
     for (k, v) in env {
         args.push("-e".into());
         args.push(format!("{k}={v}"));
@@ -99,6 +109,16 @@ pub async fn run_image(
     for c in cmd {
         args.push((*c).to_owned());
     }
+    args
+}
+
+pub async fn run_image(
+    image: &str,
+    cmd: &[&str],
+    env: &[(String, String)],
+    volumes: &[(&str, &str)],
+) -> Result<CommandOutput, DockerError> {
+    let args = run_image_args(image, cmd, env, volumes);
     let cli: Vec<&str> = args.iter().map(String::as_str).collect();
     run("docker", &cli, None).await
 }
@@ -253,5 +273,40 @@ mod tests {
     async fn nonzero_returns_nonzero_exit_code() {
         let out = run("false", &[], None).await.expect("spawn");
         assert!(!out.ok());
+    }
+
+    #[test]
+    fn a_volume_becomes_a_bind_mount_not_an_env_var() {
+        // ! Regression: callers passed "/host:/work" as an env pair, so docker
+        // got `-e MOUNT=/host:/work` and hadolint/k6 never saw the files.
+        let args = run_image_args("img", &["lint"], &[], &[("/host", "/work")]);
+        let i = args.iter().position(|a| a == "-v").expect("no -v emitted");
+        assert_eq!(args[i + 1], "/host:/work");
+        assert!(!args.contains(&"-e".to_owned()));
+    }
+
+    #[test]
+    fn mounts_precede_the_image_and_command_stays_last() {
+        // docker rejects flags placed after the image ref.
+        let args = run_image_args(
+            "img",
+            &["run", "/work/s.js"],
+            &[("K".into(), "V".into())],
+            &[("/host", "/work")],
+        );
+        let img = args.iter().position(|a| a == "img").expect("image");
+        assert!(args.iter().position(|a| a == "-v").unwrap() < img);
+        assert!(args.iter().position(|a| a == "-e").unwrap() < img);
+        assert_eq!(
+            &args[img + 1..],
+            &["run".to_owned(), "/work/s.js".to_owned()]
+        );
+    }
+
+    #[test]
+    fn several_volumes_each_get_their_own_flag() {
+        let args = run_image_args("img", &[], &[], &[("/a", "/a"), ("/b", "/c")]);
+        assert_eq!(args.iter().filter(|a| *a == "-v").count(), 2);
+        assert!(args.contains(&"/b:/c".to_owned()));
     }
 }

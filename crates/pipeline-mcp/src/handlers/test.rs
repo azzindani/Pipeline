@@ -6,9 +6,9 @@
 //! - `ac_to_test(feature_id)` reads a feature blob from memory_kv and emits
 //!   one `#[test]` per acceptance criterion. Stub bodies use `todo!()`.
 //!
-//! coverage · mutation_run · property_generate · validation_create ·
-//! flake_detect return not_implemented (need cargo-llvm-cov, mutmut/Stryker,
-//! proptest macros · MVP week 5).
+//! - `coverage(threshold?)` runs cargo-llvm-cov. Threshold defaults to
+//!   `gates.coverage` from pipeline.yaml · ! never to 0.0, which gated on
+//!   nothing. An unparseable report is an error, ✗ a reported 0%.
 
 #![allow(clippy::doc_markdown)]
 
@@ -35,8 +35,61 @@ pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
     }
 }
 
+/// Resolve the gate threshold · explicit arg wins, else `gates.coverage` from
+/// pipeline.yaml.
+///
+/// ! Defaulting to 0.0 made the gate `0.0 >= 0.0` — structurally incapable of
+/// failing, so every default call reported a pass regardless of coverage. When
+/// neither source supplies a number there is no gate to enforce; say so in
+/// `source` rather than pretending 0 is a threshold.
+fn resolve_threshold(args: &Value, configured: Option<u8>) -> (f64, &'static str) {
+    if let Some(t) = args.get("threshold").and_then(Value::as_f64) {
+        return (t, "arg");
+    }
+    match configured {
+        Some(c) => (f64::from(c), "gates.coverage"),
+        None => (0.0, "none · no gate configured"),
+    }
+}
+
+/// Read the three totals out of an llvm-cov report.
+///
+/// ! `Err`, ✗ a 0.0 fallback. A pointer that does not resolve means the report
+/// shape changed or the output is not a report at all — reporting that as
+/// `lines_percent: 0.0` makes a parse failure indistinguishable from measured
+/// zero, and the old code then returned `ok: true` alongside it.
+fn parse_coverage_totals(raw: &str) -> Result<(f64, f64, f64), String> {
+    let parsed: Value = serde_json::from_str(raw).map_err(|e| {
+        format!(
+            "cargo llvm-cov output is not JSON: {e} · got: {}",
+            tail(raw)
+        )
+    })?;
+    let pct = |key: &str| -> Result<f64, String> {
+        parsed
+            .pointer(&format!("/data/0/totals/{key}/percent"))
+            .and_then(Value::as_f64)
+            .ok_or_else(|| {
+                format!("llvm-cov JSON has no /data/0/totals/{key}/percent · report shape changed")
+            })
+    };
+    Ok((pct("lines")?, pct("functions")?, pct("regions")?))
+}
+
+/// Last 300 chars of an unparseable payload · enough to diagnose.
+fn tail(s: &str) -> String {
+    let t = s.trim();
+    let start = t.len().saturating_sub(300);
+    let start = (start..t.len())
+        .find(|i| t.is_char_boundary(*i))
+        .unwrap_or(t.len());
+    t[start..].to_owned()
+}
+
 async fn coverage(args: &Value) -> ToolResponse {
-    let threshold = args.get("threshold").and_then(Value::as_f64).unwrap_or(0.0);
+    // Config is advisory here · an absent pipeline.yaml leaves the arg in charge.
+    let configured = load_config_in_cwd().ok().and_then(|c| c.gates.coverage);
+    let (threshold, threshold_source) = resolve_threshold(args, configured);
     let cwd = match std::env::current_dir() {
         Ok(p) => p,
         Err(e) => return err(format!("cwd: {e}")),
@@ -63,24 +116,17 @@ async fn coverage(args: &Value) -> ToolResponse {
     }
     let raw = String::from_utf8_lossy(&output.stdout).into_owned();
     // llvm-cov emits a JSON object with `data[0].totals.lines.percent` etc.
-    let parsed: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-    let lines_pct = parsed
-        .pointer("/data/0/totals/lines/percent")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
-    let funcs_pct = parsed
-        .pointer("/data/0/totals/functions/percent")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
-    let regions_pct = parsed
-        .pointer("/data/0/totals/regions/percent")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
+    let (lines_pct, funcs_pct, regions_pct) = match parse_coverage_totals(&raw) {
+        Ok(t) => t,
+        // ! An unreadable report is an error, ✗ a measurement of zero.
+        Err(e) => return err(format!("coverage not measured · {e}")),
+    };
     let ok = lines_pct >= threshold;
     ToolResponse {
         ok,
         data: json!({
             "threshold": threshold,
+            "threshold_source": threshold_source,
             "lines_percent": lines_pct,
             "functions_percent": funcs_pct,
             "regions_percent": regions_pct,
@@ -573,6 +619,67 @@ mod tests {
         // The message is a Rust string literal · an unescaped quote would not compile.
         let msg_line = out.lines().find(|l| l.contains("unimplemented!")).unwrap();
         assert_eq!(msg_line.matches('"').count(), 2, "{msg_line}");
+    }
+
+    #[test]
+    fn coverage_defaults_to_the_configured_gate() {
+        // ! Regression: threshold defaulted to 0.0 and gates.coverage was never
+        // read, so the default call evaluated 0.0 >= 0.0 and always passed.
+        let (t, src) = resolve_threshold(&json!({}), Some(80));
+        assert!((t - 80.0).abs() < f64::EPSILON, "{t}");
+        assert_eq!(src, "gates.coverage");
+    }
+
+    #[test]
+    fn an_explicit_threshold_overrides_the_configured_gate() {
+        let (t, src) = resolve_threshold(&json!({"threshold": 95.0}), Some(80));
+        assert!((t - 95.0).abs() < f64::EPSILON);
+        assert_eq!(src, "arg");
+    }
+
+    #[test]
+    fn an_absent_gate_is_labelled_rather_than_silently_zero() {
+        // 0.0 with no gate configured still passes everything · the caller has
+        // to be able to see that no gate was applied.
+        let (t, src) = resolve_threshold(&json!({}), None);
+        assert!((t - 0.0).abs() < f64::EPSILON);
+        assert!(src.contains("no gate configured"), "{src}");
+    }
+
+    #[test]
+    fn unparseable_coverage_output_is_an_error_not_zero_percent() {
+        // ! Regression: every pointer fell back to 0.0 and the tool returned
+        // ok:true reporting lines_percent 0.0 — a parse failure was
+        // indistinguishable from measured-zero, and both read as success.
+        let e = parse_coverage_totals("error: no such command: `llvm-cov`").unwrap_err();
+        assert!(e.contains("not JSON"), "{e}");
+
+        // Valid JSON with the wrong shape must also fail, ✗ report 0%.
+        let e = parse_coverage_totals(r#"{"data":[{"totals":{}}]}"#).unwrap_err();
+        assert!(e.contains("report shape changed"), "{e}");
+    }
+
+    #[test]
+    fn a_well_formed_report_yields_all_three_percentages() {
+        let raw = r#"{"data":[{"totals":{
+            "lines":{"percent":91.5},
+            "functions":{"percent":88.0},
+            "regions":{"percent":79.25}}}]}"#;
+        let (l, f, r) = parse_coverage_totals(raw).expect("parses");
+        assert!((l - 91.5).abs() < f64::EPSILON);
+        assert!((f - 88.0).abs() < f64::EPSILON);
+        assert!((r - 79.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_genuine_zero_is_still_reported_as_zero() {
+        // Measured zero is a real result · only unreadable output is an error.
+        let raw = r#"{"data":[{"totals":{
+            "lines":{"percent":0.0},
+            "functions":{"percent":0.0},
+            "regions":{"percent":0.0}}}]}"#;
+        let (l, _, _) = parse_coverage_totals(raw).expect("parses");
+        assert!((l - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]

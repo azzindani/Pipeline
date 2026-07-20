@@ -109,16 +109,8 @@ fn build_tool_list() -> Vec<Value> {
         .map(|t| {
             json!({
                 "name": t.name.as_str(),
-                "description": format!("{} Actions: {}", t.summary, t.actions.join("|")),
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "action": {"type": "string", "enum": t.actions},
-                        "args": {"type": "object", "additionalProperties": true}
-                    },
-                    "required": ["action"],
-                    "additionalProperties": false
-                }
+                "description": t.describe(),
+            "inputSchema": t.input_schema()
             })
         })
         .collect()
