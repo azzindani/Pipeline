@@ -106,7 +106,12 @@ fn scaffold(args: &Value) -> ToolResponse {
                 "//! {component} binary · scaffolded\n\nfn main() {{ println!(\"hello from {component}\"); }}\n"
             ),
         ),
-        other => return err(format!("unknown kind '{other}' · module|test|bin")),
+        // A workspace member · the unit of layering for any project big enough to
+        // need one. Emitting the manifest + lib.rs is not enough on its own: an
+        // unregistered crate is invisible to cargo, so `crate` also edits the
+        // workspace members list (see add_workspace_member).
+        "crate" => return scaffold_crate(&cwd, &component, args),
+        other => return err(format!("unknown kind '{other}' · module|test|bin|crate")),
     };
     let path = cwd.join(&rel);
     if path.exists() {
@@ -123,6 +128,122 @@ fn scaffold(args: &Value) -> ToolResponse {
     ToolResponse::ok(
         json!({"component": component, "kind": kind, "path": path.display().to_string()}),
     )
+}
+
+/// Scaffold a workspace member crate under `crates/<name>/`.
+///
+/// Writes the manifest + lib.rs (or main.rs for a bin) and registers the crate in
+/// the workspace `members` list. ! Registration matters: a crate cargo has not been
+/// told about builds fine in isolation and is silently absent from
+/// `--workspace` — so it never reaches the gate.
+fn scaffold_crate(cwd: &std::path::Path, name: &str, args: &Value) -> ToolResponse {
+    let root = cwd.join("crates").join(name);
+    if root.exists() {
+        return err(format!("refusing to overwrite {}", root.display()));
+    }
+    let is_bin = args.get("bin").and_then(Value::as_bool).unwrap_or(false);
+    let description = args
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("Scaffolded by pipeline_project.scaffold.");
+    // Inherit from the workspace so version/edition/lints stay in one place.
+    let manifest = format!(
+        "[package]\nname = \"{name}\"\nversion.workspace = true\nedition.workspace = true\n\
+         rust-version.workspace = true\ndescription = \"{description}\"\n\n[dependencies]\n\n\
+         [lints]\nworkspace = true\n"
+    );
+    let (src_rel, src_body) = if is_bin {
+        (
+            "src/main.rs",
+            format!("//! {name} · {description}\n\nfn main() {{\n    println!(\"{name}\");\n}}\n"),
+        )
+    } else {
+        ("src/lib.rs", format!("//! {name} · {description}\n"))
+    };
+
+    if let Err(e) = std::fs::create_dir_all(root.join("src")) {
+        return err(format!("mkdir: {e}"));
+    }
+    if let Err(e) = std::fs::write(root.join("Cargo.toml"), manifest) {
+        return err(format!("write manifest: {e}"));
+    }
+    if let Err(e) = std::fs::write(root.join(src_rel), src_body) {
+        return err(format!("write {src_rel}: {e}"));
+    }
+
+    let registered = match add_workspace_member(cwd, name) {
+        Ok(r) => r,
+        Err(e) => return err(e),
+    };
+
+    ToolResponse {
+        ok: true,
+        data: json!({
+            "crate": name,
+            "root": root.display().to_string(),
+            "manifest": root.join("Cargo.toml").display().to_string(),
+            "source": root.join(src_rel).display().to_string(),
+            "workspace_registered": registered,
+        }),
+        next_suggested: vec!["pipeline_run.stage(fast)".into()],
+        memory_refs: vec![],
+        error: None,
+    }
+}
+
+/// Add `crates/<name>` to the root manifest's `[workspace] members`.
+///
+/// Line-oriented edit, ✗ a toml round-trip: the root manifest carries comments
+/// and ordering a serializer would discard. Returns false when the member was
+/// already listed (idempotent) or no workspace table exists.
+fn add_workspace_member(cwd: &std::path::Path, name: &str) -> Result<bool, String> {
+    use std::fmt::Write as _;
+
+    let path = cwd.join("Cargo.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(false); // no root manifest · standalone crate, nothing to register
+    };
+    let entry = format!("crates/{name}");
+    if text.contains(&format!("\"{entry}\"")) {
+        return Ok(true);
+    }
+    let mut out = String::with_capacity(text.len() + entry.len() + 8);
+    let mut in_members = false;
+    let mut done = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !done && trimmed.starts_with("members") && trimmed.contains('[') {
+            in_members = true;
+            out.push_str(line);
+            out.push('\n');
+            // Single-line members = [...] · splice before the closing bracket.
+            if trimmed.contains(']') {
+                let spliced = out
+                    .trim_end()
+                    .rsplit_once(']')
+                    .map(|(head, tail)| format!("{head}, \"{entry}\"]{tail}\n"));
+                if let Some(s) = spliced {
+                    out.truncate(out.trim_end().len() - trimmed.len());
+                    out.push_str(s.trim_start_matches('\n'));
+                }
+                in_members = false;
+                done = true;
+            }
+            continue;
+        }
+        if in_members && trimmed == "]" {
+            let _ = writeln!(out, "    \"{entry}\",");
+            in_members = false;
+            done = true;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !done {
+        return Ok(false);
+    }
+    std::fs::write(&path, out).map_err(|e| format!("write workspace manifest: {e}"))?;
+    Ok(true)
 }
 
 fn template_register(args: &Value) -> ToolResponse {
@@ -171,5 +292,55 @@ fn err(msg: String) -> ToolResponse {
         next_suggested: vec![],
         memory_refs: vec![],
         error: Some(msg),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    const WS: &str = "[workspace]\nresolver = \"3\"\n# a comment that must survive\nmembers = [\n    \"crates/alpha\",\n]\n\n[workspace.package]\nversion = \"0.1.0\"\n";
+
+    #[test]
+    fn registers_a_new_member_and_keeps_comments() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), WS).unwrap();
+        assert!(add_workspace_member(dir.path(), "beta").unwrap());
+        let out = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+        assert!(out.contains("\"crates/alpha\""));
+        assert!(out.contains("\"crates/beta\""));
+        assert!(out.contains("# a comment that must survive"));
+        assert!(out.contains("[workspace.package]"));
+    }
+
+    #[test]
+    fn registering_twice_is_idempotent() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), WS).unwrap();
+        add_workspace_member(dir.path(), "beta").unwrap();
+        let once = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+        add_workspace_member(dir.path(), "beta").unwrap();
+        let twice = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn handles_a_single_line_members_list() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/alpha\"]\n",
+        )
+        .unwrap();
+        assert!(add_workspace_member(dir.path(), "beta").unwrap());
+        let out = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+        assert!(out.contains("\"crates/alpha\", \"crates/beta\""), "{out}");
+    }
+
+    #[test]
+    fn no_root_manifest_is_not_an_error() {
+        let dir = tempdir().unwrap();
+        assert!(!add_workspace_member(dir.path(), "beta").unwrap());
     }
 }
