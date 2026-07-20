@@ -32,13 +32,25 @@ async fn db_provision(args: &Value) -> ToolResponse {
         .and_then(Value::as_str)
         .unwrap_or("postgres");
     let version = args.get("version").and_then(Value::as_str);
+    // Extensions decide the IMAGE, not just a startup step. `postgres:16` has no
+    // pgvector, so a schema doing `CREATE EXTENSION vector` fails at migrate time
+    // with a compose file that looked fine. Ask for the extension, get an image
+    // that actually carries it.
+    let extensions: Vec<&str> = args
+        .get("extensions")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
     let cwd = match std::env::current_dir() {
         Ok(p) => p,
         Err(e) => return err(format!("cwd: {e}")),
     };
     let path = cwd.join("docker-compose.db.yml");
     let body = match engine {
-        "postgres" => compose_postgres(version.unwrap_or("16")),
+        "postgres" => match postgres_image(version.unwrap_or("16"), &extensions) {
+            Ok(image) => compose_postgres(&image),
+            Err(e) => return err(e),
+        },
         "mysql" => compose_mysql(version.unwrap_or("8")),
         "redis" => compose_redis(version.unwrap_or("7")),
         "mongo" => compose_mongo(version.unwrap_or("7")),
@@ -150,9 +162,50 @@ async fn seed(args: &Value) -> ToolResponse {
     }
 }
 
-fn compose_postgres(v: &str) -> String {
+/// Pick the Postgres image that actually carries the requested extensions.
+///
+/// ! Refuses rather than silently handing back stock `postgres:N` for an
+/// extension it cannot supply — a compose file that looks right and then fails
+/// at `CREATE EXTENSION` is the expensive kind of wrong.
+fn postgres_image(version: &str, extensions: &[&str]) -> Result<String, String> {
+    // Bundled in the stock image · no special image needed.
+    const CONTRIB: &[&str] = &[
+        "pg_trgm",
+        "btree_gin",
+        "btree_gist",
+        "hstore",
+        "uuid-ossp",
+        "pgcrypto",
+        "unaccent",
+        "citext",
+        "ltree",
+        "tablefunc",
+    ];
+    let needs_vector = extensions
+        .iter()
+        .any(|e| matches!(*e, "vector" | "pgvector" | "vectors"));
+    let unknown: Vec<&str> = extensions
+        .iter()
+        .filter(|e| !CONTRIB.contains(*e) && !matches!(**e, "vector" | "pgvector" | "vectors"))
+        .copied()
+        .collect();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "postgres extension(s) {} need an image Pipeline does not know · \
+             pass an explicit image, or install them in your own Dockerfile",
+            unknown.join(", ")
+        ));
+    }
+    Ok(if needs_vector {
+        format!("pgvector/pgvector:pg{version}")
+    } else {
+        format!("postgres:{version}")
+    })
+}
+
+fn compose_postgres(image: &str) -> String {
     format!(
-        "services:\n  postgres:\n    image: postgres:{v}\n    environment:\n      POSTGRES_USER: app\n      POSTGRES_PASSWORD: app\n      POSTGRES_DB: app\n    ports:\n      - \"5432:5432\"\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -U app\"]\n      interval: 5s\n      timeout: 2s\n      retries: 5\n"
+        "services:\n  postgres:\n    image: {image}\n    environment:\n      POSTGRES_USER: app\n      POSTGRES_PASSWORD: app\n      POSTGRES_DB: app\n    ports:\n      - \"5432:5432\"\n    healthcheck:\n      test: [\"CMD-SHELL\", \"pg_isready -U app\"]\n      interval: 5s\n      timeout: 2s\n      retries: 5\n"
     )
 }
 fn compose_mysql(v: &str) -> String {
@@ -571,6 +624,23 @@ mod tests {
                 ]
             }]
         })
+    }
+
+    #[test]
+    fn pgvector_asks_for_an_image_that_actually_has_pgvector() {
+        // Regression: db_provision emitted stock postgres:16 regardless, so a schema
+        // doing CREATE EXTENSION vector failed at migrate time against a compose
+        // file that looked correct.
+        assert_eq!(
+            postgres_image("16", &["vector"]).unwrap(),
+            "pgvector/pgvector:pg16"
+        );
+        assert_eq!(postgres_image("16", &[]).unwrap(), "postgres:16");
+        // Contrib extensions ship in the stock image.
+        assert_eq!(postgres_image("16", &["pg_trgm"]).unwrap(), "postgres:16");
+        // ✗ silently hand back an image that cannot supply the extension.
+        let e = postgres_image("16", &["timescaledb"]).unwrap_err();
+        assert!(e.contains("timescaledb"), "{e}");
     }
 
     #[test]

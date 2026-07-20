@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "pipeline": {
+      "command": "pipeline",
+      "args": ["mcp", "--transport", "stdio"]
+    },
+    "pipeline_vera": {
+      "command": "pipeline",
+      "args": ["mcp", "--transport", "stdio", "--project", "/root/Vera"]
+    }
+  }
+}
