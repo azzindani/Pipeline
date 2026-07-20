@@ -240,7 +240,20 @@ fn add_workspace_member(cwd: &std::path::Path, name: &str) -> Result<bool, Strin
         out.push('\n');
     }
     if !done {
-        return Ok(false);
+        // No [workspace] table yet · the project was scaffolded single-package.
+        // Create one rather than silently declining to register: the first
+        // `scaffold crate` call is exactly the moment a project becomes a workspace.
+        // A workspace root may also be a package, so an existing [package] stays.
+        let mut seeded = text.clone();
+        if !seeded.ends_with('\n') {
+            seeded.push('\n');
+        }
+        let _ = write!(
+            seeded,
+            "\n[workspace]\nresolver = \"3\"\nmembers = [\n    \"{entry}\",\n]\n"
+        );
+        std::fs::write(&path, seeded).map_err(|e| format!("write workspace manifest: {e}"))?;
+        return Ok(true);
     }
     std::fs::write(&path, out).map_err(|e| format!("write workspace manifest: {e}"))?;
     Ok(true)
@@ -336,6 +349,31 @@ mod tests {
         assert!(add_workspace_member(dir.path(), "beta").unwrap());
         let out = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
         assert!(out.contains("\"crates/alpha\", \"crates/beta\""), "{out}");
+    }
+
+    #[test]
+    fn seeds_a_workspace_table_when_the_project_was_single_package() {
+        // The first `scaffold crate` call is the moment a project becomes a
+        // workspace · declining to register would leave the crate invisible.
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"vera\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        assert!(add_workspace_member(dir.path(), "vera-core").unwrap());
+        let out = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+        assert!(out.contains("[workspace]"));
+        assert!(out.contains("\"crates/vera-core\""));
+        assert!(
+            out.contains("[package]"),
+            "existing package table must survive"
+        );
+        // …and a second crate joins the table just created.
+        assert!(add_workspace_member(dir.path(), "vera-store").unwrap());
+        let out = std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap();
+        assert!(out.contains("\"crates/vera-core\""));
+        assert!(out.contains("\"crates/vera-store\""));
     }
 
     #[test]

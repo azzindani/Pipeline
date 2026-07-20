@@ -99,10 +99,21 @@ fn enter_project(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// ! Logs go to **stderr**, never stdout.
+///
+/// On the stdio MCP transport stdout carries the JSON-RPC framing: one message
+/// per line, nothing else. A single tracing line on stdout corrupts the stream
+/// and the client's next parse fails — which is exactly what a real client hit
+/// the first time a tool logged. stderr is also correct for the CLI, where
+/// stdout is reserved for data a caller might pipe.
 fn init_tracing() {
     use tracing_subscriber::{EnvFilter, fmt};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(filter).with_target(false).init();
+    fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
 }
 
 async fn run_profile(profile_arg: &str) -> anyhow::Result<()> {
