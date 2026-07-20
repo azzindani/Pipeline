@@ -243,70 +243,22 @@ async fn deps_install(args: &Value) -> ToolResponse {
         Ok(p) => p,
         Err(e) => return err(format!("cwd: {e}")),
     };
-    let packages: Vec<String> = args
-        .get("packages")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
-    // Which member of a workspace · ignored by stacks with a single manifest.
-    let manifest = args.get("manifest").and_then(Value::as_str);
-
-    let mut cmd_args: Vec<String> = Vec::new();
-    let program = match (stack, packages.is_empty()) {
-        ("rust", true) => {
-            cmd_args.push("fetch".into());
-            "cargo"
-        }
-        ("rust", false) => {
-            cmd_args.push("add".into());
-            cmd_args.extend(packages.iter().cloned());
-            if let Some(m) = manifest {
-                cmd_args.push("--manifest-path".into());
-                cmd_args.push(m.to_owned());
-            }
-            "cargo"
-        }
-        ("node" | "ts" | "typescript", empty) => {
-            cmd_args.push("install".into());
-            if !empty {
-                cmd_args.extend(packages.iter().cloned());
-            }
-            "npm"
-        }
-        ("bun", true) => {
-            cmd_args.push("install".into());
-            "bun"
-        }
-        ("bun", false) => {
-            cmd_args.push("add".into());
-            cmd_args.extend(packages.iter().cloned());
-            "bun"
-        }
-        ("python" | "python-uv" | "uv", true) => {
-            cmd_args.push("sync".into());
-            "uv"
-        }
-        ("python" | "python-uv" | "uv", false) => {
-            cmd_args.push("add".into());
-            cmd_args.extend(packages.iter().cloned());
-            "uv"
-        }
-        ("go" | "golang", true) => {
-            cmd_args.extend(["mod".to_owned(), "download".to_owned()]);
-            "go"
-        }
-        ("go" | "golang", false) => {
-            cmd_args.push("get".into());
-            cmd_args.extend(packages.iter().cloned());
-            "go"
-        }
-        (other, _) => return err(format!("unsupported stack '{other}'")),
+    let packages = string_array(args, "packages");
+    let spec = DepSpec {
+        // Which member of a workspace · ignored by single-manifest stacks.
+        manifest: args.get("manifest").and_then(Value::as_str),
+        // Test-only deps belong in [dev-dependencies] · shipping a test runtime
+        // to production users is a real dependency-hygiene failure.
+        dev: args.get("dev").and_then(Value::as_bool).unwrap_or(false),
+        // ! Cargo features are not expressible in a package name, so without
+        // this a caller can add `serde` but never `serde/derive` — the form
+        // almost every Rust project actually wants.
+        features: string_array(args, "features"),
     };
 
+    let Some((program, cmd_args)) = build_dep_command(stack, &packages, &spec) else {
+        return err(format!("unsupported stack '{stack}'"));
+    };
     let borrowed: Vec<&str> = cmd_args.iter().map(String::as_str).collect();
     let label = if packages.is_empty() {
         format!("deps_install({stack})")
@@ -314,6 +266,101 @@ async fn deps_install(args: &Value) -> ToolResponse {
         format!("deps_install({stack}) + {}", packages.join(" "))
     };
     run_capture(program, &borrowed, &cwd, &label).await
+}
+
+/// Modifiers that change *how* a dependency is added, independent of stack.
+struct DepSpec<'a> {
+    manifest: Option<&'a str>,
+    dev: bool,
+    features: Vec<String>,
+}
+
+fn string_array(args: &Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Map (stack, packages) to the command that actually does the job.
+///
+/// ! Named packages take the stack's **add** command; only an empty list means
+/// sync. `packages` used to be ignored entirely, so every call ran `cargo fetch`
+/// or `npm install` and reported success while adding nothing.
+fn build_dep_command(
+    stack: &str,
+    packages: &[String],
+    spec: &DepSpec<'_>,
+) -> Option<(&'static str, Vec<String>)> {
+    let mut a: Vec<String> = Vec::new();
+    let adding = !packages.is_empty();
+    let program = match stack {
+        "rust" => {
+            if adding {
+                a.push("add".into());
+                a.extend(packages.iter().cloned());
+                if spec.dev {
+                    a.push("--dev".into());
+                }
+                if !spec.features.is_empty() {
+                    a.push("--features".into());
+                    a.push(spec.features.join(","));
+                }
+                if let Some(m) = spec.manifest {
+                    a.push("--manifest-path".into());
+                    a.push(m.to_owned());
+                }
+            } else {
+                a.push("fetch".into());
+            }
+            "cargo"
+        }
+        "node" | "ts" | "typescript" => {
+            a.push("install".into());
+            if adding {
+                a.extend(packages.iter().cloned());
+                if spec.dev {
+                    a.push("--save-dev".into());
+                }
+            }
+            "npm"
+        }
+        "bun" => {
+            a.push(if adding { "add" } else { "install" }.into());
+            if adding {
+                a.extend(packages.iter().cloned());
+                if spec.dev {
+                    a.push("--dev".into());
+                }
+            }
+            "bun"
+        }
+        "python" | "python-uv" | "uv" => {
+            a.push(if adding { "add" } else { "sync" }.into());
+            if adding {
+                a.extend(packages.iter().cloned());
+                if spec.dev {
+                    a.push("--dev".into());
+                }
+            }
+            "uv"
+        }
+        "go" | "golang" => {
+            if adding {
+                a.push("get".into());
+                a.extend(packages.iter().cloned());
+            } else {
+                a.extend(["mod".to_owned(), "download".to_owned()]);
+            }
+            "go"
+        }
+        _ => return None,
+    };
+    Some((program, a))
 }
 
 async fn deps_audit() -> ToolResponse {
@@ -427,5 +474,75 @@ mod tests {
         let out = truncate(&"x".repeat(50), 10);
         assert!(out.starts_with("xxxxxxxxxx"));
         assert!(out.contains("truncated"));
+    }
+}
+
+#[cfg(test)]
+mod dep_command_tests {
+    use super::*;
+
+    fn spec<'a>(dev: bool, features: &[&str], manifest: Option<&'a str>) -> DepSpec<'a> {
+        DepSpec {
+            manifest,
+            dev,
+            features: features.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn named_packages_add_rather_than_sync() {
+        // Regression: `packages` was ignored, so every call ran `cargo fetch`
+        // and reported ok while adding nothing.
+        let (prog, args) =
+            build_dep_command("rust", &["serde".to_owned()], &spec(false, &[], None)).unwrap();
+        assert_eq!(prog, "cargo");
+        assert_eq!(args[0], "add");
+        assert!(args.contains(&"serde".to_owned()));
+        assert!(!args.contains(&"fetch".to_owned()));
+    }
+
+    #[test]
+    fn no_packages_still_means_sync() {
+        let (prog, args) = build_dep_command("rust", &[], &spec(false, &[], None)).unwrap();
+        assert_eq!(
+            (prog, args.as_slice()),
+            ("cargo", &["fetch".to_owned()][..])
+        );
+    }
+
+    #[test]
+    fn features_dev_and_manifest_all_reach_the_command() {
+        let (_, args) = build_dep_command(
+            "rust",
+            &["tokio".to_owned()],
+            &spec(
+                true,
+                &["macros", "rt-multi-thread"],
+                Some("crates/x/Cargo.toml"),
+            ),
+        )
+        .unwrap();
+        assert!(args.contains(&"--dev".to_owned()));
+        assert!(args.contains(&"macros,rt-multi-thread".to_owned()));
+        assert!(args.contains(&"crates/x/Cargo.toml".to_owned()));
+    }
+
+    #[test]
+    fn every_supported_stack_distinguishes_add_from_sync() {
+        for stack in ["rust", "node", "bun", "python", "go"] {
+            let (_, sync) = build_dep_command(stack, &[], &spec(false, &[], None)).unwrap();
+            let (_, add) =
+                build_dep_command(stack, &["pkg".to_owned()], &spec(false, &[], None)).unwrap();
+            assert_ne!(sync, add, "{stack} must not treat add as sync");
+            assert!(
+                add.contains(&"pkg".to_owned()),
+                "{stack} dropped the package"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_stack_is_rejected_not_guessed() {
+        assert!(build_dep_command("cobol", &[], &spec(false, &[], None)).is_none());
     }
 }
