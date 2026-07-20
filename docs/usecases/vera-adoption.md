@@ -149,6 +149,12 @@ The exercise reordered the build queue by demand rather than by plan:
 - **Adopt is the common path, scaffold is the rare one.** The tool surface was built the
   other way round. Worth re-examining wherever else Pipeline assumes it created the thing
   it is looking at.
+- **The agent skipped the gate and CI caught it.** This work was validated with
+  `cargo clippy` + `cargo test` run directly — and the first push went red on
+  `cargo fmt --check`. `pipeline run fast` runs fmt as its *first* static check and
+  would have caught it in 6 seconds. The inner loop only works if the agent actually
+  uses it; reaching for the underlying tool is the failure mode Pipeline exists to
+  remove, and it took one push to fall into it.
 - **Pipeline had never been consumed as an MCP server by an agent** — `mcpServers` was
   `{}` in every Claude Code scope. Its dogfooding covered its own CI, not its own
   protocol. Three of the four findings above were invisible from inside the test suite
