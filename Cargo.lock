@@ -1378,6 +1378,7 @@ dependencies = [
  "pipeline-memory",
  "pipeline-stages",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

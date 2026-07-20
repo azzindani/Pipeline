@@ -26,3 +26,6 @@ pipeline-config = { path = "../pipeline-config" }
 pipeline-mcp = { path = "../pipeline-mcp" }
 pipeline-memory = { path = "../pipeline-memory" }
 pipeline-stages = { path = "../pipeline-stages" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
