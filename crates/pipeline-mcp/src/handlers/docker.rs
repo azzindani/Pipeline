@@ -6,6 +6,8 @@
 
 #![allow(clippy::doc_markdown)]
 
+use crate::handlers::security;
+use crate::scanners;
 use crate::server::ServerState;
 use crate::tools::{ToolRequest, ToolResponse};
 use pipeline_docker::CommandOutput;
@@ -13,6 +15,9 @@ use serde_json::{Value, json};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// In-container mount point for the working tree.
+const MOUNT_POINT: &str = "/work";
 
 pub async fn handle(req: ToolRequest, _state: Arc<ServerState>) -> ToolResponse {
     match req.action.as_str() {
@@ -94,7 +99,7 @@ async fn run_image(args: &Value) -> ToolResponse {
         })
         .unwrap_or_default();
 
-    match pipeline_docker::run_image(&image, &cmd_refs, &env_pairs).await {
+    match pipeline_docker::run_image(&image, &cmd_refs, &env_pairs, &[]).await {
         Ok(out) => command_output_response(&out, &format!("run {image}")),
         Err(e) => err(e.to_string()),
     }
@@ -242,29 +247,81 @@ async fn image_push(args: &Value) -> ToolResponse {
 async fn dockerfile_lint(args: &Value) -> ToolResponse {
     // hadolint runs as a Docker container · pulls on first invocation.
     let path = args
-        .get("dockerfile")
+        .get("path")
         .and_then(Value::as_str)
         .unwrap_or("Dockerfile");
     let cwd = match cwd() {
         Ok(p) => p,
         Err(e) => return err(e),
     };
-    let mount = format!("{}:/work", cwd.display());
-    match pipeline_docker::run_image(
-        "hadolint/hadolint:latest",
-        &["hadolint", &format!("/work/{path}")],
+    // ! The file must reach the container: without the mount hadolint failed
+    // with `withBinaryFile: does not exist` while the response advertised a
+    // bind mount that was never created.
+    if !cwd.join(path).is_file() {
+        return err(format!("no Dockerfile at {}", cwd.join(path).display()));
+    }
+    let host = cwd.display().to_string();
+    let target = format!("{MOUNT_POINT}/{path}");
+    let out = match pipeline_docker::run_image(
+        scanners::HADOLINT_IMAGE,
+        &["hadolint", "--format", "json", &target],
         &[],
+        &[(host.as_str(), MOUNT_POINT)],
     )
     .await
     {
-        Ok(out) => {
-            let mut resp = command_output_response(&out, "dockerfile_lint");
-            // hadolint exits non-zero on findings; surface them but don't mark as transport error.
-            resp.next_suggested = vec!["pipeline_docker.dockerfile_generate".into()];
-            resp.data["mount"] = json!(mount);
-            resp
-        }
-        Err(e) => err(e.to_string()),
+        Ok(o) => o,
+        Err(e) => return err(e.to_string()),
+    };
+    hadolint_response(path, &out)
+}
+
+/// hadolint exits 1 on findings · that exit is the gate, ✗ a transport error.
+fn hadolint_response(path: &str, out: &CommandOutput) -> ToolResponse {
+    let findings: Vec<Value> = serde_json::from_str(out.stdout.trim()).unwrap_or_default();
+    // No parseable report and a nonzero exit means hadolint never linted · say
+    // so rather than let an empty finding list read as a clean Dockerfile.
+    let ran = !out.stdout.trim().is_empty() || out.ok();
+    let ok = out.ok() && findings.is_empty();
+    let error = if ok {
+        None
+    } else if ran {
+        Some(format!(
+            "dockerfile_lint({path}) · {} finding(s)",
+            findings.len()
+        ))
+    } else {
+        Some(format!(
+            "dockerfile_lint({path}) did not run · UNKNOWN, ✗ clean · exit {} · {}",
+            out.exit_code,
+            scanners::tail(&out.stderr, 400)
+        ))
+    };
+    ToolResponse {
+        ok,
+        data: json!({
+            "command": format!("dockerfile_lint({path})"),
+            "path": path,
+            "linter": "hadolint",
+            "status": lint_status(ok, ran),
+            "exit_code": out.exit_code,
+            "findings_count": findings.len(),
+            "findings": findings,
+            "stderr": truncate(&out.stderr, 4_000),
+        }),
+        next_suggested: vec!["pipeline_docker.dockerfile_generate".into()],
+        memory_refs: vec![],
+        error,
+    }
+}
+
+fn lint_status(ok: bool, ran: bool) -> &'static str {
+    if ok {
+        "clean"
+    } else if ran {
+        "findings"
+    } else {
+        "linter_unavailable"
     }
 }
 
@@ -316,23 +373,23 @@ async fn image_scan(args: &Value) -> ToolResponse {
         Some(i) => i.to_owned(),
         None => return err("missing 'image'".into()),
     };
-    // Docker run trivy against the image.
-    match pipeline_docker::run_image(
-        "aquasec/trivy:latest",
-        &[
-            "image",
-            "--severity",
-            "CRITICAL,HIGH",
-            "--no-progress",
-            &image,
-        ],
-        &[],
+    let severity = match scanners::normalise_severity(
+        args.get("severity")
+            .and_then(Value::as_str)
+            .unwrap_or("CRITICAL,HIGH"),
+    ) {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
+    // ! The socket is what lets trivy resolve a locally-built tag · without it
+    // every scan of an unpublished image dies as "unable to find the image".
+    security::run_trivy(
+        scanners::TrivyTarget::Image(&image),
+        &severity,
+        &[("/var/run/docker.sock", "/var/run/docker.sock")],
+        &format!("image_scan({image})"),
     )
     .await
-    {
-        Ok(out) => command_output_response(&out, &format!("image_scan({image})")),
-        Err(e) => err(e.to_string()),
-    }
 }
 
 async fn image_promote(args: &Value) -> ToolResponse {
@@ -422,5 +479,93 @@ fn err(msg: String) -> ToolResponse {
         next_suggested: vec![],
         memory_refs: vec![],
         error: Some(msg),
+    }
+}
+
+#[cfg(test)]
+mod scan_and_lint_tests {
+    use super::{MOUNT_POINT, hadolint_response};
+    use crate::scanners::{TrivyTarget, trivy_cmd};
+    use pipeline_docker::{CommandOutput, run_image_args};
+
+    fn out(code: i32, stdout: &str, stderr: &str) -> CommandOutput {
+        CommandOutput {
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            exit_code: code,
+            duration_ms: 1,
+        }
+    }
+
+    const HADOLINT_JSON: &str = r#"[{"code":"DL3008","column":1,"file":"/work/Dockerfile","level":"warning","line":20,"message":"Pin versions in apt get install"}]"#;
+
+    #[test]
+    fn a_lint_that_finds_problems_fails_the_call() {
+        let resp = hadolint_response("Dockerfile", &out(1, HADOLINT_JSON, ""));
+        assert!(!resp.ok);
+        assert_eq!(resp.data["status"], "findings");
+        assert_eq!(resp.data["findings_count"], 1);
+        assert_eq!(resp.data["findings"][0]["code"], "DL3008");
+    }
+
+    #[test]
+    fn a_clean_dockerfile_passes_the_call() {
+        let resp = hadolint_response("Dockerfile", &out(0, "[]", ""));
+        assert!(resp.ok);
+        assert_eq!(resp.data["status"], "clean");
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn a_linter_that_never_ran_is_unknown_not_clean() {
+        // ! Verified live before the mount fix: hadolint died with
+        // `withBinaryFile: does not exist` and produced no findings.
+        let resp = hadolint_response(
+            "Dockerfile",
+            &out(
+                1,
+                "",
+                "hadolint: /work/Dockerfile: withBinaryFile: does not exist",
+            ),
+        );
+        assert!(!resp.ok);
+        assert_eq!(resp.data["status"], "linter_unavailable");
+        assert!(resp.error.unwrap().contains("UNKNOWN"));
+    }
+
+    #[test]
+    fn the_lint_response_no_longer_advertises_a_mount_it_did_not_create() {
+        // Regression: the old response carried a "mount" field asserting a bind
+        // mount that run_image never emitted.
+        let resp = hadolint_response("Dockerfile", &out(0, "[]", ""));
+        assert!(resp.data.get("mount").is_none());
+    }
+
+    #[test]
+    fn the_lint_command_bind_mounts_the_worktree() {
+        let args = run_image_args(
+            "hadolint/hadolint:latest",
+            &["hadolint", "--format", "json", "/work/Dockerfile"],
+            &[],
+            &[("/host/repo", MOUNT_POINT)],
+        );
+        assert!(args.contains(&"/host/repo:/work".to_owned()));
+    }
+
+    #[test]
+    fn image_scan_mounts_the_docker_socket_and_fails_on_findings() {
+        // ! Without the socket trivy cannot resolve a locally-built tag and
+        // returns FATAL — a scan that passes everything by never running.
+        let cmd = trivy_cmd(TrivyTarget::Image("local:dev"), "CRITICAL,HIGH");
+        let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        let args = run_image_args(
+            "aquasec/trivy:latest",
+            &refs,
+            &[],
+            &[("/var/run/docker.sock", "/var/run/docker.sock")],
+        );
+        assert!(args.contains(&"/var/run/docker.sock:/var/run/docker.sock".to_owned()));
+        let i = args.iter().position(|a| a == "--exit-code").expect("flag");
+        assert_eq!(args[i + 1], "1");
     }
 }

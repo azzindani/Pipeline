@@ -185,12 +185,15 @@ async fn load_simulate(args: &Value) -> ToolResponse {
             return err(format!("write: {e}"));
         }
     }
-    let mount = format!("{}:/work", cwd.display());
+    // ! The script must be bind-mounted · passing the mount as an env pair
+    // emitted `-e MOUNT=...` and k6 never saw the file.
+    let host = cwd.display().to_string();
     let script_rel = format!("/work/load/{profile}.js");
     match pipeline_docker::run_image(
         "grafana/k6:latest",
         &["run", &script_rel],
-        &[("MOUNT".into(), mount)],
+        &[],
+        &[(host.as_str(), "/work")],
     )
     .await
     {

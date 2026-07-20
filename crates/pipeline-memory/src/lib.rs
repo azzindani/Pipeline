@@ -466,6 +466,22 @@ impl Memory {
         Ok(rows)
     }
 
+    /// Enumerate every scope that actually holds a row for `project_id`,
+    /// alphabetically.
+    ///
+    /// ! Callers must never hardcode a scope list: `remember` writes to
+    /// `"default"` when none is given, and any caller may invent a scope. A
+    /// fixed list silently omits whatever it did not predict.
+    pub async fn scopes(&self, project_id: &str) -> Result<Vec<String>, MemoryError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT scope FROM memory_kv WHERE project_id = ? ORDER BY scope",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(s,)| s).collect())
+    }
+
     /// Delete a single `(scope, key)` entry. Returns `true` if a row was removed.
     pub async fn forget(
         &self,
@@ -1023,6 +1039,25 @@ mod tests {
         let patterns = m.failure_patterns("p1").await.unwrap();
         assert_eq!(patterns[0], ("unit".to_owned(), 2));
         assert_eq!(patterns[1], ("static".to_owned(), 1));
+    }
+
+    #[tokio::test]
+    async fn scopes_enumerates_whatever_was_written_including_default() {
+        // Callers used to hardcode a scope list that omitted "default" — the scope
+        // `remember` uses when none is given — so those memories were invisible.
+        let m = fresh().await;
+        m.remember("p1", "default", "k", "v").await.unwrap();
+        m.remember("p1", "feature", "f1", "{}").await.unwrap();
+        m.remember("p1", "invented", "x", "y").await.unwrap();
+        m.remember("other", "not_mine", "x", "y").await.unwrap();
+        assert_eq!(
+            m.scopes("p1").await.unwrap(),
+            vec![
+                "default".to_owned(),
+                "feature".to_owned(),
+                "invented".to_owned()
+            ]
+        );
     }
 
     #[tokio::test]

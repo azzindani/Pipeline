@@ -3,17 +3,23 @@
 //! Day-6 wires all 3 scan actions via Docker-run on standard images.
 //! threat_model + compliance_check return not_implemented (need framework
 //! catalog and structured gap reports · MVP+ work).
+//!
+//! ! Every action here is a gate an agent may key a push on. Command
+//! construction and verdicts live in `crate::scanners` so the failing flags
+//! (`--fail` · `--exit-code 1`) are asserted by tests, ✗ trusted to review.
 
 #![allow(clippy::doc_markdown)]
 
+use crate::scanners::{
+    self, ScanStatus, SecretScope, TRIVY_IMAGE, TRUFFLEHOG_IMAGE, TrivyTarget, tail,
+};
 use crate::server::ServerState;
 use crate::tools::{ToolRequest, ToolResponse};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::process::Command;
 
-const TRUFFLEHOG_IMAGE: &str = "trufflesecurity/trufflehog:latest";
-const TRIVY_IMAGE: &str = "aquasec/trivy:latest";
+const MOUNT_POINT: &str = "/work";
 
 pub async fn handle(req: ToolRequest, _state: Arc<ServerState>) -> ToolResponse {
     match req.action.as_str() {
@@ -27,69 +33,90 @@ pub async fn handle(req: ToolRequest, _state: Arc<ServerState>) -> ToolResponse 
 }
 
 async fn secret_scan(args: &Value) -> ToolResponse {
-    let scope = args
-        .get("scope")
-        .and_then(Value::as_str)
-        .unwrap_or("filesystem");
+    let scope = match SecretScope::parse(
+        args.get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or("filesystem"),
+    ) {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
     let cwd = match std::env::current_dir() {
         Ok(p) => p,
         Err(e) => return err(format!("cwd: {e}")),
     };
-    let mount = format!("{}:/work", cwd.display());
-    let docker_args: Vec<&str> = vec![
-        "run",
-        "--rm",
-        "-v",
-        &mount,
+    let host = cwd.display().to_string();
+    let cmd = scanners::trufflehog_cmd(scope, MOUNT_POINT);
+    let cmd_refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    let out = match pipeline_docker::run_image(
         TRUFFLEHOG_IMAGE,
-        "filesystem",
-        "--no-update",
-        "/work",
-    ];
-    capture(
-        "docker",
-        &docker_args,
-        &cwd,
-        &format!("secret_scan({scope})"),
+        &cmd_refs,
+        &[],
+        &[(host.as_str(), MOUNT_POINT)],
     )
     .await
+    {
+        Ok(o) => o,
+        // Docker itself did not start · UNKNOWN, ✗ clean.
+        Err(e) => return scanners::secret_scan_response(scope, -1, &[], &e.to_string()),
+    };
+    let findings = scanners::parse_secret_findings(&out.stdout);
+    scanners::secret_scan_response(scope, out.exit_code, &findings, &tail(&out.stderr, 600))
 }
 
 async fn vuln_scan(args: &Value) -> ToolResponse {
     let target = args.get("target").and_then(Value::as_str);
+    let severity = match scanners::normalise_severity(
+        args.get("severity")
+            .and_then(Value::as_str)
+            .unwrap_or("CRITICAL,HIGH"),
+    ) {
+        Ok(s) => s,
+        Err(e) => return err(e),
+    };
     let cwd = match std::env::current_dir() {
         Ok(p) => p,
         Err(e) => return err(format!("cwd: {e}")),
     };
-    let docker_args: Vec<String> = if let Some(image) = target {
-        vec![
-            "run".into(),
-            "--rm".into(),
-            "-v".into(),
-            "/var/run/docker.sock:/var/run/docker.sock".into(),
-            TRIVY_IMAGE.into(),
-            "image".into(),
-            "--severity".into(),
-            "CRITICAL,HIGH".into(),
-            image.to_owned(),
-        ]
-    } else {
-        let mount = format!("{}:/work", cwd.display());
-        vec![
-            "run".into(),
-            "--rm".into(),
-            "-v".into(),
-            mount,
-            TRIVY_IMAGE.into(),
-            "fs".into(),
-            "--severity".into(),
-            "CRITICAL,HIGH".into(),
-            "/work".into(),
-        ]
+    let host = cwd.display().to_string();
+    // Image mode needs the socket to reach locally-built images · fs mode needs
+    // the worktree bound in.
+    let (trivy_target, volume) = match target {
+        Some(image) => (
+            TrivyTarget::Image(image),
+            ("/var/run/docker.sock", "/var/run/docker.sock"),
+        ),
+        None => (
+            TrivyTarget::Filesystem(MOUNT_POINT),
+            (host.as_str(), MOUNT_POINT),
+        ),
     };
-    let arr: Vec<&str> = docker_args.iter().map(String::as_str).collect();
     let label = format!("vuln_scan({})", target.unwrap_or("filesystem"));
-    capture("docker", &arr, &cwd, &label).await
+    run_trivy(trivy_target, &severity, &[volume], &label).await
+}
+
+/// Shared by `security.vuln_scan` and `docker.image_scan` · one command
+/// builder, one verdict path, so neither can drift into passing on findings.
+pub(crate) async fn run_trivy(
+    target: TrivyTarget<'_>,
+    severity: &str,
+    volumes: &[(&str, &str)],
+    label: &str,
+) -> ToolResponse {
+    let cmd = scanners::trivy_cmd(target, severity);
+    let cmd_refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    let out = match pipeline_docker::run_image(TRIVY_IMAGE, &cmd_refs, &[], volumes).await {
+        Ok(o) => o,
+        Err(e) => return scanners::vuln_scan_response(label, severity, -1, None, &e.to_string()),
+    };
+    let report = scanners::parse_trivy_report(&out.stdout);
+    scanners::vuln_scan_response(
+        label,
+        severity,
+        out.exit_code,
+        report.as_ref(),
+        &tail(&out.stderr, 600),
+    )
 }
 
 async fn dep_audit(args: &Value) -> ToolResponse {
@@ -98,57 +125,108 @@ async fn dep_audit(args: &Value) -> ToolResponse {
         Ok(p) => p,
         Err(e) => return err(format!("cwd: {e}")),
     };
-    let (program, cmd_args): (&str, Vec<&str>) = match stack {
-        "rust" => ("cargo", vec!["audit"]),
-        "node" | "ts" | "typescript" => ("npm", vec!["audit", "--audit-level=high"]),
-        "bun" => ("bun", vec!["pm", "audit"]),
-        "python" | "python-uv" => ("pip-audit", vec![]),
-        other => return err(format!("unsupported stack '{other}'")),
+    let (program, cmd_args) = match dep_audit_command(stack) {
+        Ok(c) => c,
+        Err(e) => return err(e),
     };
-    capture(program, &cmd_args, &cwd, &format!("dep_audit({stack})")).await
-}
-
-async fn capture(program: &str, args: &[&str], cwd: &std::path::Path, label: &str) -> ToolResponse {
     let output = match Command::new(program)
-        .args(args)
-        .current_dir(cwd)
+        .args(&cmd_args)
+        .current_dir(&cwd)
         .output()
         .await
     {
         Ok(o) => o,
-        Err(e) => return err(format!("{program} spawn: {e} · is it installed?")),
+        // ! Binary absent → UNKNOWN. Reporting this as a failed audit is as
+        // wrong as reporting it clean: neither says whether a CVE exists.
+        Err(e) => {
+            return dep_audit_response(
+                stack,
+                program,
+                ScanStatus::ScannerUnavailable,
+                -1,
+                "",
+                &format!("spawn: {e}"),
+            );
+        }
     };
-    let ok = output.status.success();
-    ToolResponse {
-        ok,
-        data: json!({
-            "command": label,
-            "exit_code": output.status.code().unwrap_or(-1),
-            "stdout": truncate(&String::from_utf8_lossy(&output.stdout), 8_000),
-            "stderr": truncate(&String::from_utf8_lossy(&output.stderr), 8_000),
-        }),
-        next_suggested: vec![],
-        memory_refs: vec![],
-        error: if ok {
-            None
-        } else {
-            Some(format!(
-                "{label} exit {}",
-                output.status.code().unwrap_or(-1)
-            ))
-        },
+    let code = output.status.code().unwrap_or(-1);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let status = classify_dep_audit(code, &stderr);
+    dep_audit_response(
+        stack,
+        program,
+        status,
+        code,
+        &tail(&String::from_utf8_lossy(&output.stdout), 6_000),
+        &tail(&stderr, 2_000),
+    )
+}
+
+fn dep_audit_command(stack: &str) -> Result<(&'static str, Vec<&'static str>), String> {
+    match stack {
+        "rust" => Ok(("cargo", vec!["audit"])),
+        "node" | "ts" | "typescript" => Ok(("npm", vec!["audit", "--audit-level=high"])),
+        "bun" => Ok(("bun", vec!["pm", "audit"])),
+        "python" | "python-uv" => Ok(("pip-audit", vec![])),
+        other => Err(format!("unsupported stack '{other}'")),
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_owned()
+/// A present launcher with an absent subcommand (`cargo audit` without
+/// cargo-audit installed) is still an absent scanner · exit code alone cannot
+/// tell that from a CVE, so the stderr shape decides.
+fn classify_dep_audit(code: i32, stderr: &str) -> ScanStatus {
+    let s = stderr.to_lowercase();
+    let missing = s.contains("no such command")
+        || s.contains("command not found")
+        || s.contains("not recognized")
+        || s.contains("unknown command");
+    if missing {
+        ScanStatus::ScannerUnavailable
+    } else if code == 0 {
+        ScanStatus::Clean
     } else {
-        format!(
-            "{}\n... [truncated · {} more bytes]",
-            &s[..max],
-            s.len() - max
-        )
+        ScanStatus::Findings
+    }
+}
+
+fn dep_audit_response(
+    stack: &str,
+    program: &str,
+    status: ScanStatus,
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+) -> ToolResponse {
+    // "pass" reads clearer than "clean" for an audit · the other two names are
+    // shared with the scan actions so a gate branches on one vocabulary.
+    let status_str = match status {
+        ScanStatus::Clean => "pass",
+        ScanStatus::Findings => "findings",
+        ScanStatus::ScannerUnavailable => "scanner_missing",
+    };
+    let error = match status {
+        ScanStatus::Clean => None,
+        ScanStatus::Findings => Some(format!("dep_audit({stack}) reported advisories")),
+        ScanStatus::ScannerUnavailable => Some(format!(
+            "dep_audit({stack}) UNKNOWN · '{program}' unavailable · ✗ pass, ✗ fail · install it to get a verdict"
+        )),
+    };
+    ToolResponse {
+        ok: status.is_ok(),
+        data: json!({
+            "command": format!("dep_audit({stack})"),
+            "stack": stack,
+            "scanner": program,
+            "status": status_str,
+            "determined": status != ScanStatus::ScannerUnavailable,
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+        }),
+        next_suggested: vec![],
+        memory_refs: vec![],
+        error,
     }
 }
 
@@ -245,5 +323,92 @@ fn err(msg: String) -> ToolResponse {
         next_suggested: vec![],
         memory_refs: vec![],
         error: Some(msg),
+    }
+}
+
+#[cfg(test)]
+mod dep_audit_tests {
+    use super::{ScanStatus, classify_dep_audit, dep_audit_command, dep_audit_response};
+
+    #[test]
+    fn each_supported_stack_maps_to_its_audit_binary() {
+        assert_eq!(dep_audit_command("rust").unwrap().0, "cargo");
+        assert_eq!(dep_audit_command("bun").unwrap().0, "bun");
+        assert_eq!(dep_audit_command("python-uv").unwrap().0, "pip-audit");
+        assert!(dep_audit_command("cobol").is_err());
+    }
+
+    #[test]
+    fn a_missing_scanner_is_unknown_never_pass_and_never_fail() {
+        // ! Regression: a missing binary and a real CVE both produced ok:false
+        // with no way to tell them apart, so a gate could not distinguish
+        // "you have a vulnerability" from "nothing was checked".
+        let resp = dep_audit_response(
+            "rust",
+            "cargo",
+            ScanStatus::ScannerUnavailable,
+            -1,
+            "",
+            "spawn: No such file",
+        );
+        assert!(!resp.ok, "unavailable must not read as pass");
+        assert_eq!(resp.data["status"], "scanner_missing");
+        assert_eq!(resp.data["determined"], false);
+        assert!(resp.error.unwrap().contains("UNKNOWN"));
+    }
+
+    #[test]
+    fn a_real_advisory_is_findings_and_is_marked_determined() {
+        let resp = dep_audit_response("rust", "cargo", ScanStatus::Findings, 1, "RUSTSEC", "");
+        assert!(!resp.ok);
+        assert_eq!(resp.data["status"], "findings");
+        assert_eq!(resp.data["determined"], true);
+    }
+
+    #[test]
+    fn a_clean_audit_passes_and_is_marked_determined() {
+        let resp = dep_audit_response("rust", "cargo", ScanStatus::Clean, 0, "0 vulns", "");
+        assert!(resp.ok);
+        assert_eq!(resp.data["status"], "pass");
+        assert_eq!(resp.data["determined"], true);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn the_three_dep_audit_states_have_three_distinct_status_strings() {
+        let s = |st| {
+            dep_audit_response("rust", "cargo", st, 0, "", "").data["status"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let all = [
+            s(ScanStatus::Clean),
+            s(ScanStatus::Findings),
+            s(ScanStatus::ScannerUnavailable),
+        ];
+        let mut uniq = all.to_vec();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 3, "states collapsed: {all:?}");
+    }
+
+    #[test]
+    fn cargo_present_but_cargo_audit_absent_is_still_a_missing_scanner() {
+        // `cargo audit` without cargo-audit exits 101 — indistinguishable from
+        // an advisory by exit code alone.
+        assert_eq!(
+            classify_dep_audit(101, "error: no such command: `audit`"),
+            ScanStatus::ScannerUnavailable
+        );
+    }
+
+    #[test]
+    fn a_nonzero_audit_with_ordinary_stderr_is_a_finding() {
+        assert_eq!(
+            classify_dep_audit(1, "2 vulnerabilities found"),
+            ScanStatus::Findings
+        );
+        assert_eq!(classify_dep_audit(0, ""), ScanStatus::Clean);
     }
 }

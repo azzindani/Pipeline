@@ -75,14 +75,10 @@ impl ServerHandler for PipelineRmcpHandler {
             .map(|t| {
                 let mut tool = Tool::new(
                     Cow::Owned(t.name.as_str().to_owned()),
-                    Cow::Owned(format!("{} Actions: {}", t.summary, t.actions.join("|"))),
-                    Arc::new(input_schema(t.actions)),
+                    Cow::Owned(t.describe()),
+                    Arc::new(t.input_schema()),
                 );
-                tool.description = Some(Cow::Owned(format!(
-                    "{} Actions: {}",
-                    t.summary,
-                    t.actions.join("|")
-                )));
+                tool.description = Some(Cow::Owned(t.describe()));
                 tool
             })
             .collect();
@@ -120,33 +116,6 @@ impl ServerHandler for PipelineRmcpHandler {
         result.is_error = Some(is_error);
         Ok(result)
     }
-}
-
-fn input_schema(actions: &[&str]) -> serde_json::Map<String, serde_json::Value> {
-    let mut props = serde_json::Map::new();
-    props.insert(
-        "action".into(),
-        serde_json::json!({
-            "type": "string",
-            "enum": actions,
-        }),
-    );
-    props.insert(
-        "args".into(),
-        serde_json::json!({
-            "type": "object",
-            "additionalProperties": true,
-        }),
-    );
-    let mut schema = serde_json::Map::new();
-    schema.insert("type".into(), serde_json::json!("object"));
-    schema.insert("properties".into(), serde_json::Value::Object(props));
-    schema.insert("required".into(), serde_json::json!(["action"]));
-    schema.insert(
-        "additionalProperties".into(),
-        serde_json::Value::Bool(false),
-    );
-    schema
 }
 
 /// Run the rmcp-backed MCP server on stdio · blocks until stdin closes.

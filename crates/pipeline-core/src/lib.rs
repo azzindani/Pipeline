@@ -66,6 +66,17 @@ impl StageProfile {
         }
     }
 
+    /// Whether a skipped stage fails the run.
+    ///
+    /// ! `Preflight` is the documented pre-push gate — "all green → push
+    /// allowed". That promise only holds if every stage in the profile
+    /// genuinely executed, so a skip is a failure there. `Fast`/`Full`/
+    /// `Confirm` are inner-loop profiles: they tolerate a skip (no Dockerfile,
+    /// no daemon) but the runner still surfaces it in the summary.
+    pub const fn is_strict(self) -> bool {
+        matches!(self, Self::Preflight)
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "fast" => Some(Self::Fast),
@@ -159,6 +170,16 @@ mod tests {
     fn preflight_profile_includes_security() {
         let stages = StageProfile::Preflight.stages();
         assert!(stages.contains(&StageKind::Security));
+    }
+
+    #[test]
+    fn only_preflight_is_strict() {
+        // ! preflight is the pre-push gate · a skipped stage there means the
+        // gate never checked the thing it claims to check.
+        assert!(StageProfile::Preflight.is_strict());
+        assert!(!StageProfile::Fast.is_strict());
+        assert!(!StageProfile::Full.is_strict());
+        assert!(!StageProfile::Confirm.is_strict());
     }
 
     #[test]

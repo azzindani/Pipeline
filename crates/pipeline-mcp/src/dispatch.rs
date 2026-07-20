@@ -16,6 +16,48 @@ pub async fn call_tool(name: &str, req: ToolRequest, state: Arc<ServerState>) ->
         };
     };
 
+    // ! Validate before dispatch, for every transport. Clients are not obliged
+    // to enforce a published schema, so this is the only place the contract
+    // actually binds — an argument the handler would silently drop dies here
+    // instead of surfacing later as a confidently wrong result.
+    if let Some(desc) = crate::registry::descriptor_for(name) {
+        if let Err(e) = desc.validate(&req.action, &req.args) {
+            return ToolResponse {
+                ok: false,
+                data: serde_json::json!({}),
+                next_suggested: vec![],
+                memory_refs: vec![],
+                error: Some(e),
+            };
+        }
+        // ! A `Planned` action is refused HERE, before its handler runs.
+        //
+        // Centralised on purpose. Fixing 41 fabricating handlers individually
+        // leaves nothing stopping the 42nd — and several are worse than useless
+        // when reached: `e2e.record` spawns an interactive tool with no timeout
+        // and blocks forever; `docs.publish` swallows a spawn failure into
+        // success. Refusing at the boundary makes the fidelity marker
+        // self-enforcing: flipping an action to `Real` is the only thing that
+        // lets its handler run, so the marker cannot drift from behaviour.
+        if let Some(spec) = desc.action(&req.action) {
+            if spec.fidelity == crate::spec::Fidelity::Planned {
+                return ToolResponse {
+                    ok: false,
+                    data: serde_json::json!({
+                        "action": format!("{name}.{}", req.action),
+                        "fidelity": "planned",
+                    }),
+                    next_suggested: vec![],
+                    memory_refs: vec![],
+                    error: Some(format!(
+                        "{name}.{} is not implemented · {} · ✗ retry: this refusal is deliberate, not transient",
+                        req.action, spec.summary
+                    )),
+                };
+            }
+        }
+    }
+
     match tool {
         ToolName::Session => handlers::session::handle(req, state).await,
         ToolName::Plan => handlers::plan::handle(req, state).await,

@@ -160,10 +160,31 @@ async fn logs_aggregate(args: &Value) -> ToolResponse {
         Ok(o) => o,
         Err(e) => return err(format!("docker compose logs: {e}")),
     };
+    // ! A dead daemon exits non-zero with empty stdout · reporting that as
+    // ok:true, logs:"" reads as "the services produced no output".
+    if !output.status.success() {
+        return err(tool_failed(
+            "docker compose logs",
+            output.status.code(),
+            &output.stderr,
+        ));
+    }
     ToolResponse::ok(json!({
         "env": env,
         "logs": String::from_utf8_lossy(&output.stdout).into_owned(),
     }))
+}
+
+/// Uniform message for a child process that ran but refused the work.
+fn tool_failed(tool: &str, code: Option<i32>, stderr: &[u8]) -> String {
+    let detail = String::from_utf8_lossy(stderr);
+    let detail = detail.trim();
+    let code = code.map_or_else(|| "signal".to_owned(), |c| c.to_string());
+    if detail.is_empty() {
+        format!("{tool} exited {code} · no stderr")
+    } else {
+        format!("{tool} exited {code} · {detail}")
+    }
 }
 
 #[allow(clippy::unused_async)]
@@ -204,7 +225,14 @@ async fn alerts_define(args: &Value) -> ToolResponse {
             return err(format!("mkdir: {e}"));
         }
     }
-    let mut existing = std::fs::read_to_string(&path).unwrap_or_default();
+    // ! Only "absent" means empty. Treating a permission/encoding error as an
+    // empty file makes the write below silently destroy every existing rule and
+    // still report ok.
+    let mut existing = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return err(format!("read {}: {e}", path.display())),
+    };
     if existing.is_empty() {
         existing.push_str("groups:\n  - name: pipeline\n    rules:\n");
     }
@@ -226,42 +254,68 @@ async fn optimize_suggest(_args: &Value, state: Arc<ServerState>) -> ToolRespons
         Ok(m) => m,
         Err(e) => return err(format!("memory: {e}")),
     };
-    let runs = mem.run_history(&cfg.project, 50).await.unwrap_or_default();
-    let mut suggestions: Vec<&str> = Vec::new();
+    match optimize_payload(&mem, &cfg.project).await {
+        Ok(v) => ToolResponse::ok(v),
+        Err(e) => err(e),
+    }
+}
+
+/// ! A DB error propagates. Reporting `avg_static_ms:0, suggestions:[]` on a
+/// failed read tells the agent its pipeline is fast · that is a fabricated
+/// measurement. Zero recorded runs is `null` + a note, ✗ a measured zero.
+async fn optimize_payload(mem: &pipeline_memory::Memory, project: &str) -> Result<Value, String> {
+    let runs = mem
+        .run_history(project, 50)
+        .await
+        .map_err(|e| format!("run_history: {e}"))?;
+    if runs.is_empty() {
+        return Ok(json!({
+            "runs_analyzed": 0,
+            "avg_static_ms": Value::Null,
+            "avg_unit_ms": Value::Null,
+            "suggestions": [],
+            "note": "no runs recorded yet · insufficient data · ✗ evidence the pipeline is fast",
+        }));
+    }
     let avg_static = avg_duration(&runs, "static");
     let avg_unit = avg_duration(&runs, "unit");
-    if avg_static > 5_000 {
+    let mut suggestions: Vec<&str> = Vec::new();
+    if avg_static.is_some_and(|v| v > 5_000) {
         suggestions.push("Static stage > 5s · consider --offline + cargo-chef caching");
     }
-    if avg_unit > 30_000 {
+    if avg_unit.is_some_and(|v| v > 30_000) {
         suggestions.push("Unit stage > 30s · split test crates · use cargo-nextest");
     }
-    if avg_static + avg_unit > 10_000 {
+    // Only meaningful once at least one of the two stages was actually measured.
+    if (avg_static.is_some() || avg_unit.is_some())
+        && avg_static.unwrap_or(0) + avg_unit.unwrap_or(0) > 10_000
+    {
         suggestions
             .push("Inner loop > 10s target (PLAN.md §8) · profile slow tests with --report-time");
     }
-    ToolResponse::ok(json!({
+    Ok(json!({
+        "runs_analyzed": runs.len(),
         "avg_static_ms": avg_static,
         "avg_unit_ms": avg_unit,
         "suggestions": suggestions,
     }))
 }
 
-fn avg_duration(runs: &[pipeline_memory::RunRecord], stage: &str) -> i64 {
+/// `None` when the stage never ran · ✗ 0, which is indistinguishable from an
+/// instant stage and silently satisfies every "is it fast?" threshold below.
+fn avg_duration(runs: &[pipeline_memory::RunRecord], stage: &str) -> Option<i64> {
     let filtered: Vec<i64> = runs
         .iter()
         .filter(|r| r.stage == stage)
         .map(|r| r.duration_ms)
         .collect();
     if filtered.is_empty() {
-        0
-    } else {
-        #[allow(clippy::cast_possible_wrap)]
-        let sum: i64 = filtered.iter().sum();
-        #[allow(clippy::cast_possible_wrap)]
-        let n = filtered.len() as i64;
-        sum / n
+        return None;
     }
+    let sum: i64 = filtered.iter().sum();
+    #[allow(clippy::cast_possible_wrap)]
+    let n = filtered.len() as i64;
+    Some(sum / n)
 }
 
 async fn image_size_optimize(args: &Value) -> ToolResponse {
@@ -286,14 +340,40 @@ async fn image_size_optimize(args: &Value) -> ToolResponse {
             Ok(o) => o,
             Err(e) => return err(format!("docker history: {e}")),
         };
-        ToolResponse::ok(json!({
-            "image": img,
-            "history": String::from_utf8_lossy(&output.stdout).into_owned(),
-            "tip": "biggest layer first · merge RUN steps · clean apt lists · multi-stage",
-        }))
+        // ! A nonexistent image exits non-zero · ok:true with an empty history
+        // plus a canned tip reads as a completed analysis of a tiny image.
+        if !output.status.success() {
+            return err(tool_failed(
+                "docker history",
+                output.status.code(),
+                &output.stderr,
+            ));
+        }
+        let history = String::from_utf8_lossy(&output.stdout);
+        ToolResponse::ok(layer_analysis(img, &history))
     } else {
         err("missing 'image' · pass an image tag to inspect".into())
     }
+}
+
+/// Advice is emitted only when layer data was actually obtained · a tip printed
+/// over zero layers is a claim about an image nobody read.
+fn layer_analysis(image: &str, history: &str) -> Value {
+    let layers = history.lines().filter(|l| !l.trim().is_empty()).count();
+    if layers == 0 {
+        return json!({
+            "image": image,
+            "layers": 0,
+            "history": history,
+            "note": "docker history returned no layers · nothing to analyse",
+        });
+    }
+    json!({
+        "image": image,
+        "layers": layers,
+        "history": history,
+        "tip": "biggest layer first · merge RUN steps · clean apt lists · multi-stage",
+    })
 }
 
 async fn query_optimize(args: &Value) -> ToolResponse {
@@ -302,11 +382,10 @@ async fn query_optimize(args: &Value) -> ToolResponse {
         None => return err("missing 'sql'".into()),
     };
     let dsn = args.get("dsn").and_then(Value::as_str);
+    // ! No DSN → no EXPLAIN ran → ✗ ok. Success for zero work done invites the
+    // agent to treat an unanalysed query as analysed.
     let Some(dsn) = dsn else {
-        return ToolResponse::ok(json!({
-            "sql": sql,
-            "note": "no DSN provided · cannot run EXPLAIN · supply 'dsn' (postgres-only)",
-        }));
+        return err("no 'dsn' · EXPLAIN was not run · supply a postgres DSN".into());
     };
     let cwd = match std::env::current_dir() {
         Ok(p) => p,
@@ -322,6 +401,11 @@ async fn query_optimize(args: &Value) -> ToolResponse {
         Ok(o) => o,
         Err(e) => return err(format!("psql: {e}")),
     };
+    // ! Syntax error, auth failure and unreachable host all exit non-zero with
+    // empty stdout · ok:true, explain:"" claims the plan was read.
+    if !output.status.success() {
+        return err(tool_failed("psql", output.status.code(), &output.stderr));
+    }
     ToolResponse::ok(json!({
         "sql": sql,
         "explain": String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -340,5 +424,136 @@ fn err(msg: String) -> ToolResponse {
         next_suggested: vec![],
         memory_refs: vec![],
         error: Some(msg),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pipeline_memory::{Memory, NewRun};
+
+    async fn fresh() -> Memory {
+        let m = Memory::open_in_memory().await.expect("open");
+        m.upsert_project("p1", "pipeline", "rust")
+            .await
+            .expect("upsert");
+        m
+    }
+
+    /// Closed pool → every query errors · stands in for an unreadable memory.db.
+    async fn broken() -> Memory {
+        let m = fresh().await;
+        m.pool().close().await;
+        m
+    }
+
+    async fn run(m: &Memory, stage: &str, ms: u128) {
+        m.log_run(&NewRun {
+            project_id: "p1",
+            session_id: None,
+            profile: "fast",
+            stage,
+            status: "pass",
+            duration_ms: ms,
+            triggered_by: None,
+            commit_sha: None,
+            stdout: None,
+            stderr: None,
+            failure_json: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_database_error_is_never_reported_as_a_fast_pipeline() {
+        // Regression: run_history().unwrap_or_default() made an unreadable DB report
+        // avg_static_ms:0, suggestions:[] — "your pipeline is fast" from the code
+        // path that means "I could not read the runs".
+        let e = optimize_payload(&broken().await, "p1")
+            .await
+            .expect_err("a failed read must not produce timings");
+        assert!(e.contains("run_history"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn no_runs_recorded_is_insufficient_data_not_a_measured_zero() {
+        let v = optimize_payload(&fresh().await, "p1").await.unwrap();
+        assert_eq!(v["runs_analyzed"], 0);
+        assert!(v["avg_static_ms"].is_null(), "✗ 0, which reads as instant");
+        assert!(v["note"].as_str().unwrap().contains("insufficient data"));
+    }
+
+    #[tokio::test]
+    async fn a_stage_that_never_ran_is_null_not_zero() {
+        let m = fresh().await;
+        run(&m, "static", 1_000).await;
+        let v = optimize_payload(&m, "p1").await.unwrap();
+        assert_eq!(v["avg_static_ms"], 1_000);
+        // ! unit never ran · 0 would silently satisfy the "< 30s" threshold.
+        assert!(v["avg_unit_ms"].is_null());
+        assert_eq!(v["runs_analyzed"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_slow_stage_still_produces_its_suggestion() {
+        let m = fresh().await;
+        run(&m, "static", 6_000).await;
+        let v = optimize_payload(&m, "p1").await.unwrap();
+        let s = v["suggestions"].as_array().unwrap();
+        assert!(
+            s.iter()
+                .any(|x| x.as_str().unwrap().contains("Static stage > 5s"))
+        );
+    }
+
+    #[test]
+    fn avg_duration_distinguishes_no_samples_from_a_zero_average() {
+        let runs: Vec<pipeline_memory::RunRecord> = vec![];
+        assert_eq!(avg_duration(&runs, "static"), None);
+    }
+
+    #[test]
+    fn a_failed_child_process_names_the_tool_and_its_stderr() {
+        // Regression: exit status was never checked, so a dead docker daemon or a
+        // nonexistent image returned ok:true with an empty payload.
+        let msg = tool_failed("docker history", Some(1), b"No such image: nope\n");
+        assert!(msg.contains("docker history"), "{msg}");
+        assert!(msg.contains("No such image"), "{msg}");
+        assert!(msg.contains('1'), "{msg}");
+        // A process killed by a signal has no code · still reported, ✗ swallowed.
+        assert!(tool_failed("psql", None, b"").contains("signal"));
+    }
+
+    #[test]
+    fn no_layer_data_means_no_canned_advice() {
+        // Regression: the "biggest layer first" tip was emitted unconditionally,
+        // whether or not any layer was ever read.
+        let v = layer_analysis("nope:latest", "");
+        assert_eq!(v["layers"], 0);
+        assert!(v["tip"].is_null(), "✗ advice about an image nobody read");
+        assert!(v["note"].as_str().unwrap().contains("no layers"));
+    }
+
+    #[test]
+    fn real_layer_data_is_analysed() {
+        let v = layer_analysis("app:1", "10MB\tRUN apt-get\n2MB\tCOPY .\n");
+        assert_eq!(v["layers"], 2);
+        assert!(v["tip"].as_str().unwrap().contains("biggest layer first"));
+    }
+
+    #[tokio::test]
+    async fn query_optimize_without_a_dsn_is_a_refusal_not_a_success() {
+        // Regression: no DSN returned ok:true for zero work done, inviting the agent
+        // to treat an unanalysed query as analysed.
+        let r = query_optimize(&json!({"sql": "SELECT 1"})).await;
+        assert!(!r.ok, "no EXPLAIN ran · ✗ ok");
+        assert!(r.error.unwrap().contains("dsn"));
+    }
+
+    #[tokio::test]
+    async fn query_optimize_still_requires_sql() {
+        let r = query_optimize(&json!({})).await;
+        assert!(!r.ok);
     }
 }

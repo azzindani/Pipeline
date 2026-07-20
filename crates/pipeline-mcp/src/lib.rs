@@ -19,13 +19,16 @@ mod oauth;
 mod ratelimit;
 mod registry;
 mod rmcp_transport;
+mod scanners;
 mod server;
+pub mod spec;
 pub mod templates;
 mod tools;
 
 pub use dispatch::call_tool;
 pub use registry::{ToolDescriptor, registry};
 pub use server::ServerState;
+pub use spec::{ActionSpec, ArgSet, ArgSpec, ArgType, Fidelity};
 pub use tools::{ToolName, ToolRequest, ToolResponse};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
