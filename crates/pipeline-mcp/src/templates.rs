@@ -186,11 +186,7 @@ fn scaffold_lib_rust(root: &Path, name: &str, sc: &mut Scaffold) -> Result<(), I
     Ok(())
 }
 
-fn scaffold_microservice_rust(
-    root: &Path,
-    name: &str,
-    sc: &mut Scaffold,
-) -> Result<(), InitError> {
+fn scaffold_microservice_rust(root: &Path, name: &str, sc: &mut Scaffold) -> Result<(), InitError> {
     write(
         root,
         "Cargo.toml",
@@ -219,11 +215,7 @@ fn scaffold_microservice_rust(
     Ok(())
 }
 
-fn scaffold_mcp_server_rust(
-    root: &Path,
-    name: &str,
-    sc: &mut Scaffold,
-) -> Result<(), InitError> {
+fn scaffold_mcp_server_rust(root: &Path, name: &str, sc: &mut Scaffold) -> Result<(), InitError> {
     write(
         root,
         "Cargo.toml",
@@ -266,12 +258,7 @@ fn infer_stack(template: &str) -> String {
     }
 }
 
-fn write(
-    root: &Path,
-    rel: &str,
-    content: &str,
-    sc: &mut Scaffold,
-) -> Result<(), InitError> {
+fn write(root: &Path, rel: &str, content: &str, sc: &mut Scaffold) -> Result<(), InitError> {
     let path = root.join(rel);
     // ! Adopt never clobbers. The user's file wins; Pipeline records the skip so
     // the agent can see what it did NOT get to configure.
@@ -441,8 +428,7 @@ mod tests {
         std::fs::write(root.join("README.md"), "# hand written\n").unwrap();
         std::fs::write(root.join("src/main.rs"), "fn main() { /* mine */ }\n").unwrap();
 
-        let outcome =
-            init_project_with(dir.path(), "existing", "cli-rust", "", true).unwrap();
+        let outcome = init_project_with(dir.path(), "existing", "cli-rust", "", true).unwrap();
         assert!(outcome.adopted);
 
         let name_of = |v: &Vec<PathBuf>| -> Vec<String> {
@@ -487,7 +473,8 @@ mod tests {
         init_project(dir.path(), "srv", "mcp-server-rust", "").unwrap();
         let text = std::fs::read_to_string(dir.path().join("srv/pipeline.yaml")).unwrap();
 
-        let cfg = pipeline_config::PipelineConfig::parse(&text).expect("scaffolded yaml must parse");
+        let cfg =
+            pipeline_config::PipelineConfig::parse(&text).expect("scaffolded yaml must parse");
         let std_cfg = cfg.standards;
         assert_eq!(std_cfg.project_type.as_deref(), Some("MCP server"));
         assert_eq!(std_cfg.languages, vec!["rust".to_owned()]);
