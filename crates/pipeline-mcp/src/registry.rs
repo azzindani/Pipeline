@@ -1813,7 +1813,7 @@ mod tests {
     #[test]
     fn the_fidelity_split_is_recorded() {
         // Not a threshold — a tripwire. If this moves, the surface changed and
-        // docs/usecases/tool-fidelity.md needs the same edit.
+        // docs/tool-fidelity.md needs the same edit.
         let (mut real, mut scaffold, mut planned) = (0, 0, 0);
         for t in registry() {
             for a in t.actions {

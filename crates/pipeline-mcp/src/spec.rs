@@ -3,7 +3,7 @@
 //! Every action declares what it takes and **how much of its name it actually
 //! delivers**. Both halves exist because of a live dogfooding audit that found
 //! ~60 actions returning `ok: true` while doing nothing, doing the wrong thing,
-//! or emitting fabricated data (`docs/usecases/vera-adoption.md`).
+//! or emitting fabricated data (`docs/tool-fidelity.md`).
 //!
 //! ! The rule this module enforces: *a tool that refuses is more useful than a
 //! tool that lies.* An agent cannot verify a result it did not compute — the
