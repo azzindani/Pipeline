@@ -68,9 +68,17 @@ impl Fidelity {
 pub enum ArgType {
     Str,
     Int,
+    /// Any number · fractional thresholds (`0.5%` drift, `10.5` pct) are real
+    /// inputs and `Int` would reject them at the boundary.
+    Num,
     Bool,
     List,
     Obj,
+    /// Genuinely polymorphic. ! Use only where the *schema* decides the type —
+    /// `meta.config_set.value` is a string, integer, boolean, or list depending
+    /// on which key it accompanies, so the arg layer cannot know. ✗ a shortcut
+    /// for "I did not check": that is what [`ArgSet::Unspecified`] is for.
+    Any,
 }
 
 impl ArgType {
@@ -78,9 +86,12 @@ impl ArgType {
         match self {
             Self::Str => "string",
             Self::Int => "integer",
+            Self::Num => "number",
             Self::Bool => "boolean",
             Self::List => "array",
             Self::Obj => "object",
+            // JSON Schema spells "any type" as the absence of a constraint.
+            Self::Any => "",
         }
     }
 }
@@ -195,10 +206,14 @@ impl ActionSpec {
         let mut props = serde_json::Map::new();
         let mut required = Vec::new();
         for a in self.args.args() {
-            props.insert(
-                a.name.to_owned(),
-                json!({"type": a.ty.as_json_type(), "description": a.help}),
-            );
+            // ! `Any` omits `type` entirely · emitting `"type": ""` would be an
+            // invalid schema that rejects every value.
+            let entry = if matches!(a.ty, ArgType::Any) {
+                json!({"description": a.help})
+            } else {
+                json!({"type": a.ty.as_json_type(), "description": a.help})
+            };
+            props.insert(a.name.to_owned(), entry);
             if a.required {
                 required.push(Value::String(a.name.to_owned()));
             }

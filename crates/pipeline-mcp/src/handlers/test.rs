@@ -9,6 +9,13 @@
 //! - `coverage(threshold?)` runs cargo-llvm-cov. Threshold defaults to
 //!   `gates.coverage` from pipeline.yaml · ! never to 0.0, which gated on
 //!   nothing. An unparseable report is an error, ✗ a reported 0%.
+//!
+//! - `flake_detect(iterations?, filter?, package?)` actually reruns the target
+//!   and counts outcomes. ! Flaky and broken are DIFFERENT verdicts: a test that
+//!   fails every time is broken (read the assertion), one that fails sometimes
+//!   is flaky (hunt shared state · ordering · time · env). The old version
+//!   reran nothing and called any stage with ≥1 pass and ≥1 fail in history
+//!   flaky, which labelled every fixed regression a flake.
 
 #![allow(clippy::doc_markdown)]
 
@@ -30,7 +37,7 @@ pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
         "mutation_run" => mutation_run(&req.args).await,
         "property_generate" => property_generate(&req.args).await,
         "validation_create" => validation_create(&req.args).await,
-        "flake_detect" => flake_detect(&req.args, state).await,
+        "flake_detect" => flake_detect(&req.args).await,
         other => err(format!("unknown action 'pipeline_test.{other}'")),
     }
 }
@@ -531,41 +538,242 @@ async fn validation_create(args: &Value) -> ToolResponse {
     ToolResponse::ok(json!({"spec": spec, "path": path.display().to_string()}))
 }
 
-async fn flake_detect(args: &Value, state: Arc<ServerState>) -> ToolResponse {
-    let _ = args;
-    // Heuristic: stage that has both pass and fail in run history is flaky.
-    let cfg = match load_config_in_cwd() {
-        Ok(c) => c,
-        Err(e) => return err(format!("config: {e}")),
-    };
-    let mem = match ensure_memory(&state).await {
-        Ok(m) => m,
-        Err(e) => return err(format!("memory: {e}")),
-    };
-    let runs = mem.run_history(&cfg.project, 200).await.unwrap_or_default();
-    let mut by_stage: std::collections::BTreeMap<String, (u32, u32)> =
-        std::collections::BTreeMap::new();
-    for r in &runs {
-        let entry = by_stage.entry(r.stage.clone()).or_insert((0, 0));
-        if r.status == "pass" {
-            entry.0 += 1;
-        } else if r.status == "fail" {
-            entry.1 += 1;
+// ---------- flake detection ----------
+
+/// Rerun budget · a flake hunt is N full test runs, so an unbounded N is a hang
+/// the caller cannot cancel. 5 is the smallest sample that distinguishes a
+/// one-in-five flake from noise while staying inside an agent's inner loop.
+const FLAKE_DEFAULT_ITERATIONS: u64 = 5;
+const FLAKE_MAX_ITERATIONS: u64 = 50;
+
+/// Outcome of a rerun campaign.
+///
+/// ! `Broken` and `Flaky` are deliberately distinct. They route to completely
+/// different fixes — broken → read the assertion, the code is wrong; flaky →
+/// hunt shared state · ordering · clock · env — and collapsing them (as "≥1
+/// pass and ≥1 fail in history" did) sends the agent down the wrong one.
+///
+/// ! `Indeterminate` is UNKNOWN, ✗ pass and ✗ fail · a runner that never
+/// started has measured nothing, and zero observed failures must never read as
+/// stability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlakeVerdict {
+    /// Passed every iteration.
+    Stable,
+    /// Failed every iteration · deterministic, and genuinely failing.
+    Broken,
+    /// Both outcomes observed · non-deterministic.
+    Flaky,
+    /// No verdict produced · the runner did not complete.
+    Indeterminate,
+}
+
+impl FlakeVerdict {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Broken => "broken",
+            Self::Flaky => "flaky",
+            Self::Indeterminate => "indeterminate",
         }
     }
-    let flaky: Vec<Value> = by_stage
-        .iter()
-        .filter(|(_, (p, f))| *p > 0 && *f > 0)
-        .map(|(stage, (p, f))| {
-            let pct = (f64::from(*f) / f64::from(*p + *f)) * 100.0;
-            json!({"stage": stage, "pass": p, "fail": f, "fail_rate": pct})
-        })
-        .collect();
-    ToolResponse::ok(json!({
-        "stages_seen": by_stage.len(),
-        "flaky": flaky,
-        "tip": if flaky.is_empty() { "no flaky stages detected" } else { "investigate · pin seeds / time-of-day / env vars" },
-    }))
+
+    /// Only a run that passed every iteration is `ok` · a deterministic failure
+    /// and an unmeasured one are both non-green, for different reasons.
+    fn is_ok(self) -> bool {
+        self == Self::Stable
+    }
+
+    /// Whether the same input produced the same outcome every time. Reported
+    /// explicitly: `Broken` is deterministic too, which is the whole point.
+    fn deterministic(self) -> Option<bool> {
+        match self {
+            Self::Stable | Self::Broken => Some(true),
+            Self::Flaky => Some(false),
+            Self::Indeterminate => None,
+        }
+    }
+}
+
+/// Classify observed outcomes · pure, so the broken-vs-flaky split is testable
+/// without spawning cargo.
+fn classify_flake(passes: u64, failures: u64) -> FlakeVerdict {
+    match (passes, failures) {
+        (0, 0) => FlakeVerdict::Indeterminate,
+        (_, 0) => FlakeVerdict::Stable,
+        (0, _) => FlakeVerdict::Broken,
+        _ => FlakeVerdict::Flaky,
+    }
+}
+
+/// Reject an iteration count that cannot answer the question · 0 reruns
+/// determines nothing and would otherwise classify as "stable".
+fn resolve_iterations(args: &Value) -> Result<u64, String> {
+    let Some(v) = args.get("iterations") else {
+        return Ok(FLAKE_DEFAULT_ITERATIONS);
+    };
+    let n = v
+        .as_u64()
+        .ok_or_else(|| format!("'iterations' must be a positive integer · got {v}"))?;
+    if n == 0 {
+        return Err("'iterations' must be >= 1 · zero reruns determines nothing".into());
+    }
+    if n > FLAKE_MAX_ITERATIONS {
+        return Err(format!(
+            "'iterations' is capped at {FLAKE_MAX_ITERATIONS} · got {n}"
+        ));
+    }
+    Ok(n)
+}
+
+/// Everything a rerun campaign observed · assembled once, rendered once.
+struct FlakeRun {
+    verdict: FlakeVerdict,
+    command: String,
+    requested: u64,
+    passes: u64,
+    failures: u64,
+    outcomes: Vec<Value>,
+    detail: String,
+}
+
+impl FlakeRun {
+    fn completed(&self) -> u64 {
+        self.passes + self.failures
+    }
+
+    #[allow(clippy::cast_precision_loss)] // iteration counts are <= 50
+    fn flake_rate(&self) -> f64 {
+        let total = self.completed();
+        if total == 0 {
+            return 0.0;
+        }
+        (self.failures as f64 / total as f64) * 100.0
+    }
+}
+
+async fn flake_detect(args: &Value) -> ToolResponse {
+    let iterations = match resolve_iterations(args) {
+        Ok(n) => n,
+        Err(e) => return err(e),
+    };
+    let filter = args.get("filter").and_then(Value::as_str);
+    let package = args.get("package").and_then(Value::as_str);
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    let cmd_args = flake_cmd_args(filter, package);
+    let mut run = FlakeRun {
+        verdict: FlakeVerdict::Indeterminate,
+        command: format!("cargo {}", cmd_args.join(" ")),
+        requested: iterations,
+        passes: 0,
+        failures: 0,
+        outcomes: Vec::new(),
+        detail: String::new(),
+    };
+
+    for i in 1..=iterations {
+        let started = std::time::Instant::now();
+        let o = match Command::new("cargo")
+            .args(&cmd_args)
+            .current_dir(&cwd)
+            .output()
+            .await
+        {
+            Ok(o) => o,
+            // ! Abort · a campaign that lost its runner half-way has measured
+            // nothing about stability, and the iterations it did complete must
+            // not be rendered as a verdict.
+            Err(e) => {
+                run.detail = format!("cargo test spawn failed on iteration {i}: {e}");
+                return flake_response(&run);
+            }
+        };
+        let passed = o.status.success();
+        if passed {
+            run.passes += 1;
+        } else {
+            run.failures += 1;
+        }
+        run.outcomes.push(json!({
+            "iteration": i,
+            "passed": passed,
+            "exit_code": o.status.code().unwrap_or(-1),
+            "duration_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            // Only the failing tail is worth carrying · a green run's stdout is noise.
+            "stderr_tail": if passed { String::new() } else { tail(&String::from_utf8_lossy(&o.stderr)) },
+        }));
+    }
+    run.verdict = classify_flake(run.passes, run.failures);
+    flake_response(&run)
+}
+
+/// `cargo test` argv for one iteration · `package` narrows the rebuild, which is
+/// what makes a 20-iteration campaign affordable.
+fn flake_cmd_args(filter: Option<&str>, package: Option<&str>) -> Vec<String> {
+    let mut a: Vec<String> = vec!["test".into()];
+    match package {
+        Some(p) => {
+            a.push("-p".into());
+            a.push(p.to_owned());
+        }
+        None => a.push("--workspace".into()),
+    }
+    a.push("--no-fail-fast".into());
+    if let Some(f) = filter {
+        a.push(f.to_owned());
+    }
+    a
+}
+
+fn flake_response(run: &FlakeRun) -> ToolResponse {
+    let v = run.verdict;
+    let error = match v {
+        FlakeVerdict::Stable => None,
+        FlakeVerdict::Broken => Some(format!(
+            "BROKEN, ✗ flaky · failed all {}/{} reruns · deterministic failure → fix the assertion, ✗ hunt for timing",
+            run.failures, run.requested
+        )),
+        FlakeVerdict::Flaky => Some(format!(
+            "FLAKY · {} pass / {} fail over {} reruns ({:.1}% failure) · non-deterministic → shared state | ordering | clock | env",
+            run.passes,
+            run.failures,
+            run.requested,
+            run.flake_rate()
+        )),
+        FlakeVerdict::Indeterminate => Some(format!(
+            "flake_detect produced no verdict · UNKNOWN, ✗ stable · {}",
+            run.detail
+        )),
+    };
+    ToolResponse {
+        ok: v.is_ok(),
+        data: json!({
+            "verdict": v.as_str(),
+            "deterministic": v.deterministic(),
+            "determined": v != FlakeVerdict::Indeterminate,
+            "command": run.command,
+            "iterations_requested": run.requested,
+            "iterations_completed": run.completed(),
+            "passes": run.passes,
+            "failures": run.failures,
+            "flake_rate_percent": run.flake_rate(),
+            "outcomes": run.outcomes,
+        }),
+        next_suggested: match v {
+            FlakeVerdict::Stable => vec![],
+            FlakeVerdict::Broken => vec![
+                "pipeline_test.run".into(),
+                "pipeline_memory.suggest_fix".into(),
+            ],
+            FlakeVerdict::Flaky => vec!["pipeline_memory.suggest_fix".into()],
+            FlakeVerdict::Indeterminate => vec!["pipeline_test.run".into()],
+        },
+        memory_refs: vec![],
+        error,
+    }
 }
 
 fn err(msg: String) -> ToolResponse {
@@ -680,6 +888,121 @@ mod tests {
             "regions":{"percent":0.0}}}]}"#;
         let (l, _, _) = parse_coverage_totals(raw).expect("parses");
         assert!((l - 0.0).abs() < f64::EPSILON);
+    }
+
+    // ---------- flake detection ----------
+
+    fn run_of(passes: u64, failures: u64) -> FlakeRun {
+        FlakeRun {
+            verdict: classify_flake(passes, failures),
+            command: "cargo test --workspace".into(),
+            requested: passes + failures,
+            passes,
+            failures,
+            outcomes: vec![],
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_test_that_always_fails_is_broken_not_flaky() {
+        // ! The invariant the whole action exists for. A deterministic failure
+        // and an intermittent one route to completely different fixes: broken →
+        // read the assertion; flaky → hunt shared state / ordering / clock. The
+        // old implementation called every stage with ≥1 pass and ≥1 fail in
+        // history "flaky", so a genuine regression that was later fixed scored
+        // identically to a real flake.
+        assert_eq!(classify_flake(0, 5), FlakeVerdict::Broken);
+        let resp = flake_response(&run_of(0, 5));
+        assert_eq!(resp.data["verdict"], "broken");
+        assert_eq!(resp.data["deterministic"], true);
+        assert!(!resp.ok, "a test failing every time is not a pass");
+        let e = resp.error.unwrap();
+        assert!(e.contains("BROKEN"), "{e}");
+        assert!(e.contains("✗ flaky"), "the verdict must exclude flaky: {e}");
+    }
+
+    #[test]
+    fn a_test_that_fails_only_sometimes_is_flaky_and_reports_its_rate() {
+        assert_eq!(classify_flake(3, 1), FlakeVerdict::Flaky);
+        let resp = flake_response(&run_of(3, 1));
+        assert_eq!(resp.data["verdict"], "flaky");
+        assert_eq!(resp.data["deterministic"], false);
+        assert!(!resp.ok);
+        let rate = resp.data["flake_rate_percent"].as_f64().unwrap();
+        assert!((rate - 25.0).abs() < f64::EPSILON, "{rate}");
+    }
+
+    #[test]
+    fn a_test_that_always_passes_is_stable_and_says_so_explicitly() {
+        assert_eq!(classify_flake(7, 0), FlakeVerdict::Stable);
+        let resp = flake_response(&run_of(7, 0));
+        assert!(resp.ok);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.data["verdict"], "stable");
+        // Determinism is reported, ✗ inferred by the caller from a rate of 0.
+        assert_eq!(resp.data["deterministic"], true);
+        assert_eq!(resp.data["iterations_completed"], 7);
+    }
+
+    #[test]
+    fn a_campaign_that_never_ran_is_indeterminate_never_stable() {
+        // ! Zero observed failures because the runner never started is not
+        // stability · the three-state rule from `scanners`.
+        assert_eq!(classify_flake(0, 0), FlakeVerdict::Indeterminate);
+        let mut run = run_of(0, 0);
+        run.requested = 5;
+        run.detail = "cargo test spawn failed on iteration 1: No such file".into();
+        let resp = flake_response(&run);
+        assert!(!resp.ok, "an unmeasured run must never read as pass");
+        assert_eq!(resp.data["verdict"], "indeterminate");
+        assert_eq!(resp.data["determined"], false);
+        assert!(resp.data["deterministic"].is_null());
+        assert!(resp.error.unwrap().contains("UNKNOWN"));
+    }
+
+    #[test]
+    fn the_four_verdicts_never_collapse_into_one_another() {
+        let mut seen: Vec<&str> = [
+            classify_flake(3, 0),
+            classify_flake(0, 3),
+            classify_flake(2, 1),
+            classify_flake(0, 0),
+        ]
+        .iter()
+        .map(|v| v.as_str())
+        .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 4, "verdicts collapsed: {seen:?}");
+    }
+
+    #[test]
+    fn iterations_are_honoured_bounded_and_never_silently_zero() {
+        // ! Regression: `let _ = args` discarded every argument, so the action
+        // reran nothing regardless of what the caller asked for.
+        assert_eq!(resolve_iterations(&json!({})).unwrap(), 5);
+        assert_eq!(resolve_iterations(&json!({"iterations": 20})).unwrap(), 20);
+        // Zero would classify as Stable · refuse it rather than answer wrongly.
+        assert!(resolve_iterations(&json!({"iterations": 0})).is_err());
+        assert!(resolve_iterations(&json!({"iterations": 999})).is_err());
+        assert!(resolve_iterations(&json!({"iterations": "five"})).is_err());
+    }
+
+    #[test]
+    fn the_filter_and_package_reach_the_rerun_command() {
+        // A flake hunt that ignores its filter reruns the whole workspace and
+        // attributes some other test's failure to the target.
+        let a = flake_cmd_args(Some("test_login"), Some("vera-core"));
+        assert!(a.contains(&"test_login".to_owned()), "{a:?}");
+        assert_eq!(
+            a.iter().position(|x| x == "-p").map(|i| &a[i + 1]).unwrap(),
+            "vera-core"
+        );
+        assert!(!a.contains(&"--workspace".to_owned()));
+        // No package → workspace-wide, which is the honest default.
+        let b = flake_cmd_args(None, None);
+        assert!(b.contains(&"--workspace".to_owned()));
     }
 
     #[test]
