@@ -29,6 +29,11 @@ enum Command {
         /// HTTP bind address · ignored for stdio transport · default 127.0.0.1:8080
         #[arg(long)]
         bind: Option<String>,
+        /// Project root the server operates on · default: the cwd it was spawned in.
+        /// Handlers resolve pipeline.yaml + .pipeline/ from the cwd, so this chdirs
+        /// once at startup — letting an agent drive project B from a session in A.
+        #[arg(long)]
+        project: Option<PathBuf>,
     },
     /// Run a stage profile against the current project
     Run {
@@ -58,11 +63,20 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
     let cli = Cli::parse();
     match cli.command {
-        Command::Mcp { transport, bind } => match transport.as_str() {
-            "stdio" => pipeline_mcp::serve_stdio().await?,
-            "http" => pipeline_mcp::serve_http(bind.as_deref()).await?,
-            other => anyhow::bail!("unknown transport '{other}' · valid: stdio · http"),
-        },
+        Command::Mcp {
+            transport,
+            bind,
+            project,
+        } => {
+            if let Some(root) = project {
+                enter_project(&root)?;
+            }
+            match transport.as_str() {
+                "stdio" => pipeline_mcp::serve_stdio().await?,
+                "http" => pipeline_mcp::serve_http(bind.as_deref()).await?,
+                other => anyhow::bail!("unknown transport '{other}' · valid: stdio · http"),
+            }
+        }
         Command::Run { profile } => run_profile(&profile).await?,
         Command::Dev => println!("[stub] dev (mcp + watch) · POC week 1"),
         Command::Watch => println!("[stub] watch · POC week 1"),
@@ -70,6 +84,18 @@ async fn main() -> anyhow::Result<()> {
         Command::Report => report().await?,
         Command::Config => print_config()?,
     }
+    Ok(())
+}
+
+/// Point the server at a project root. Every handler reads pipeline.yaml and
+/// `.pipeline/` relative to the cwd, so one chdir at startup is the whole
+/// mechanism — ✗ a second source of truth for "where is the project".
+fn enter_project(root: &Path) -> anyhow::Result<()> {
+    if !root.is_dir() {
+        anyhow::bail!("--project '{}' is not a directory", root.display());
+    }
+    std::env::set_current_dir(root)
+        .map_err(|e| anyhow::anyhow!("--project '{}': {e}", root.display()))?;
     Ok(())
 }
 

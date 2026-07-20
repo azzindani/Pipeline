@@ -33,6 +33,36 @@ pub struct InitOutcome {
     pub stack: String,
     pub root: PathBuf,
     pub files_written: Vec<PathBuf>,
+    /// Adopt mode only · files that already existed and were left untouched.
+    pub files_skipped: Vec<PathBuf>,
+    pub adopted: bool,
+}
+
+/// Write accumulator · carries the one policy bit that separates the two modes.
+///
+/// ```text
+/// scaffold (adopt = false) → root must be empty · every file is written
+/// adopt    (adopt = true)  → root may hold a live repo · existing files are
+///                            recorded and skipped, ✗ overwritten
+/// ```
+struct Scaffold {
+    adopt: bool,
+    written: Vec<PathBuf>,
+    skipped: Vec<PathBuf>,
+}
+
+impl Scaffold {
+    fn new(adopt: bool) -> Self {
+        Self {
+            adopt,
+            written: Vec::new(),
+            skipped: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, path: PathBuf) {
+        self.written.push(path);
+    }
 }
 
 /// Templates available at scaffold time. Stable order · agents iterate.
@@ -62,10 +92,26 @@ pub fn init_project(
     template: &str,
     stack: &str,
 ) -> Result<InitOutcome, InitError> {
+    init_project_with(parent, name, template, stack, false)
+}
+
+/// Scaffold, or **adopt** an existing project.
+///
+/// Adopt exists because greenfield is the rare case: a real project usually
+/// already has a git history, docs, and source before Pipeline ever sees it.
+/// Adopt writes only what is missing — pipeline.yaml, the CI lane, the
+/// scaffold gaps — and ✗ touches a file that is already there.
+pub fn init_project_with(
+    parent: &Path,
+    name: &str,
+    template: &str,
+    stack: &str,
+    adopt: bool,
+) -> Result<InitOutcome, InitError> {
     let root = parent.join(name);
     if root.exists() {
         let mut rd = std::fs::read_dir(&root)?;
-        if rd.next().is_some() {
+        if rd.next().is_some() && !adopt {
             return Err(InitError::NotEmpty(root.display().to_string()));
         }
     } else {
@@ -79,22 +125,22 @@ pub fn init_project(
         stack.to_owned()
     };
 
-    let mut written: Vec<PathBuf> = Vec::new();
+    let mut sc = Scaffold::new(adopt);
 
-    write(&root, ".gitignore", GITIGNORE, &mut written)?;
-    write(&root, "README.md", &readme(name, template), &mut written)?;
+    write(&root, ".gitignore", GITIGNORE, &mut sc)?;
+    write(&root, "README.md", &readme(name, template), &mut sc)?;
     write(
         &root,
         "pipeline.yaml",
         &pipeline_yaml(name, &stack, template),
-        &mut written,
+        &mut sc,
     )?;
 
     match template {
-        "cli-rust" => scaffold_cli_rust(&root, name, &mut written)?,
-        "lib-rust" => scaffold_lib_rust(&root, name, &mut written)?,
-        "microservice-rust" => scaffold_microservice_rust(&root, name, &mut written)?,
-        "mcp-server-rust" => scaffold_mcp_server_rust(&root, name, &mut written)?,
+        "cli-rust" => scaffold_cli_rust(&root, name, &mut sc)?,
+        "lib-rust" => scaffold_lib_rust(&root, name, &mut sc)?,
+        "microservice-rust" => scaffold_microservice_rust(&root, name, &mut sc)?,
+        "mcp-server-rust" => scaffold_mcp_server_rust(&root, name, &mut sc)?,
         "custom" => {} // base files already written
         _ => unreachable!("template_or_default narrows to known set"),
     }
@@ -104,13 +150,15 @@ pub fn init_project(
         template: template.to_owned(),
         stack,
         root,
-        files_written: written,
+        files_written: sc.written,
+        files_skipped: sc.skipped,
+        adopted: adopt,
     })
 }
 
 // ---------- per-template scaffolding ----------
 
-fn scaffold_cli_rust(root: &Path, name: &str, written: &mut Vec<PathBuf>) -> Result<(), InitError> {
+fn scaffold_cli_rust(root: &Path, name: &str, sc: &mut Scaffold) -> Result<(), InitError> {
     write(
         root,
         "Cargo.toml",
@@ -118,22 +166,22 @@ fn scaffold_cli_rust(root: &Path, name: &str, written: &mut Vec<PathBuf>) -> Res
             name,
             &["clap = { version = \"4\", features = [\"derive\"] }"],
         ),
-        written,
+        sc,
     )?;
     std::fs::create_dir_all(root.join("src"))?;
-    write(root, "src/main.rs", &cli_rust_main(name), written)?;
-    write(root, "Dockerfile", &rust_dockerfile(name), written)?;
+    write(root, "src/main.rs", &cli_rust_main(name), sc)?;
+    write(root, "Dockerfile", &rust_dockerfile(name), sc)?;
     Ok(())
 }
 
-fn scaffold_lib_rust(root: &Path, name: &str, written: &mut Vec<PathBuf>) -> Result<(), InitError> {
-    write(root, "Cargo.toml", &cargo_lib_manifest(name), written)?;
+fn scaffold_lib_rust(root: &Path, name: &str, sc: &mut Scaffold) -> Result<(), InitError> {
+    write(root, "Cargo.toml", &cargo_lib_manifest(name), sc)?;
     std::fs::create_dir_all(root.join("src"))?;
     write(
         root,
         "src/lib.rs",
         "//! Crate documentation lives here.\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn it_works() {\n        assert_eq!(2 + 2, 4);\n    }\n}\n",
-        written,
+        sc,
     )?;
     Ok(())
 }
@@ -141,7 +189,7 @@ fn scaffold_lib_rust(root: &Path, name: &str, written: &mut Vec<PathBuf>) -> Res
 fn scaffold_microservice_rust(
     root: &Path,
     name: &str,
-    written: &mut Vec<PathBuf>,
+    sc: &mut Scaffold,
 ) -> Result<(), InitError> {
     write(
         root,
@@ -155,18 +203,18 @@ fn scaffold_microservice_rust(
                 "serde_json = \"1\"",
             ],
         ),
-        written,
+        sc,
     )?;
     std::fs::create_dir_all(root.join("src"))?;
-    write(root, "src/main.rs", MICROSERVICE_MAIN, written)?;
-    write(root, "Dockerfile", &rust_dockerfile(name), written)?;
+    write(root, "src/main.rs", MICROSERVICE_MAIN, sc)?;
+    write(root, "Dockerfile", &rust_dockerfile(name), sc)?;
     write(
         root,
         "docker-compose.yml",
         &format!(
             "services:\n  {name}:\n    build: .\n    ports:\n      - \"8080:8080\"\n    healthcheck:\n      test: [\"CMD\", \"curl\", \"-f\", \"http://localhost:8080/health\"]\n      interval: 5s\n      timeout: 2s\n      retries: 5\n"
         ),
-        written,
+        sc,
     )?;
     Ok(())
 }
@@ -174,7 +222,7 @@ fn scaffold_microservice_rust(
 fn scaffold_mcp_server_rust(
     root: &Path,
     name: &str,
-    written: &mut Vec<PathBuf>,
+    sc: &mut Scaffold,
 ) -> Result<(), InitError> {
     write(
         root,
@@ -188,10 +236,10 @@ fn scaffold_mcp_server_rust(
                 "anyhow = \"1\"",
             ],
         ),
-        written,
+        sc,
     )?;
     std::fs::create_dir_all(root.join("src"))?;
-    write(root, "src/main.rs", MCP_SERVER_MAIN, written)?;
+    write(root, "src/main.rs", MCP_SERVER_MAIN, sc)?;
     Ok(())
 }
 
@@ -222,14 +270,20 @@ fn write(
     root: &Path,
     rel: &str,
     content: &str,
-    written: &mut Vec<PathBuf>,
+    sc: &mut Scaffold,
 ) -> Result<(), InitError> {
     let path = root.join(rel);
+    // ! Adopt never clobbers. The user's file wins; Pipeline records the skip so
+    // the agent can see what it did NOT get to configure.
+    if sc.adopt && path.exists() {
+        sc.skipped.push(path);
+        return Ok(());
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&path, content)?;
-    written.push(path);
+    sc.push(path);
     Ok(())
 }
 
@@ -245,9 +299,60 @@ fn pipeline_yaml(name: &str, stack: &str, template: &str) -> String {
     } else {
         "  services: []\n"
     };
+    let standards = standards_block(stack, template);
     format!(
-        "project: {name}\nversion: 0.0.1\n\nstack:\n  runtime: {stack}\n{services}\nstages:\n  fast:\n    - static\n    - unit\n  full:\n    - static\n    - unit\n    - container\n    - integration\n  preflight:\n    - static\n    - unit\n    - container\n    - integration\n    - security\n\ngates:\n  coverage: 70\n  image_size_mb: 200\n  critical_vulns: 0\n"
+        "project: {name}\nversion: 0.0.1\n\nstack:\n  runtime: {stack}\n{services}\nstages:\n  fast:\n    - static\n    - unit\n  full:\n    - static\n    - unit\n    - container\n    - integration\n  preflight:\n    - static\n    - unit\n    - container\n    - integration\n    - security\n\ngates:\n  coverage: 70\n  image_size_mb: 200\n  critical_vulns: 0\n\n{standards}"
     )
+}
+
+/// The `standards:` block · what binds a scaffolded project to the corpus.
+///
+/// ! Without this every scaffolded project is born unable to route standards —
+/// `pipeline_standards.route` fails on a fresh `pipeline.yaml`. The template
+/// seeds the routing keys it can infer; the agent refines them.
+///
+/// The `project_type` + `surfaces` values are ROUTER keys owned by the Standards
+/// corpus, ✗ by Pipeline. If the corpus renames one, `route` reports it under
+/// `unknown_routes` rather than silently dropping the binding.
+fn standards_block(stack: &str, template: &str) -> String {
+    use std::fmt::Write as _;
+
+    let (project_type, surfaces) = match template {
+        "mcp-server-rust" => ("MCP server", &["Command line"][..]),
+        "microservice-rust" => (
+            "REST/gRPC service (Go/Rust)",
+            &["HTTP / gRPC API", "Deployed service"][..],
+        ),
+        "lib-rust" => ("Library / SDK", &["Public package"][..]),
+        // cli-rust + custom: the corpus has no matching type key · surface +
+        // language routes still bind, and the agent can set project_type later.
+        "cli-rust" => ("", &["Command line"][..]),
+        _ => ("", &[][..]),
+    };
+
+    let mut out = String::from(
+        "standards:\n  # Corpus location · unset → Pipeline's own cache.\n  \
+         # Run `pipeline standards fetch`, or point at a local clone:\n  \
+         # source: /path/to/Standards\n",
+    );
+    if !project_type.is_empty() {
+        let _ = writeln!(out, "  project_type: {project_type}");
+    }
+    if !stack.is_empty() && stack != "unknown" {
+        let _ = writeln!(out, "  languages: [{stack}]");
+    }
+    if surfaces.is_empty() {
+        out.push_str("  surfaces: []\n");
+    } else {
+        out.push_str("  surfaces:\n");
+        for s in surfaces {
+            let _ = writeln!(out, "    - {s}");
+        }
+    }
+    // ✗ a `# pin: <sha>` placeholder — pipeline_standards.pin appends the real key
+    // below it, leaving a dangling comment. A plain hint reads correctly either way.
+    out.push_str("  # `pipeline_standards.pin` records the corpus commit here\n");
+    out
 }
 
 fn cargo_bin_manifest(name: &str, deps: &[&str]) -> String {
@@ -325,6 +430,79 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert!(written.iter().any(|n| n == "docker-compose.yml"));
+    }
+
+    #[test]
+    fn adopt_writes_the_gaps_and_never_clobbers() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("existing");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // A live project: hand-written source + a README the user cares about.
+        std::fs::write(root.join("README.md"), "# hand written\n").unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() { /* mine */ }\n").unwrap();
+
+        let outcome =
+            init_project_with(dir.path(), "existing", "cli-rust", "", true).unwrap();
+        assert!(outcome.adopted);
+
+        let name_of = |v: &Vec<PathBuf>| -> Vec<String> {
+            v.iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        let written = name_of(&outcome.files_written);
+        let skipped = name_of(&outcome.files_skipped);
+
+        // The gaps got filled…
+        assert!(written.iter().any(|n| n == "pipeline.yaml"));
+        assert!(written.iter().any(|n| n == "Cargo.toml"));
+        // …and the user's files were reported, not rewritten.
+        assert!(skipped.iter().any(|n| n == "README.md"));
+        assert!(skipped.iter().any(|n| n == "main.rs"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("README.md")).unwrap(),
+            "# hand written\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/main.rs")).unwrap(),
+            "fn main() { /* mine */ }\n"
+        );
+    }
+
+    #[test]
+    fn init_without_adopt_still_refuses_a_non_empty_root() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("existing");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("README.md"), "mine\n").unwrap();
+        let result = init_project(dir.path(), "existing", "cli-rust", "");
+        assert!(matches!(result, Err(InitError::NotEmpty(_))));
+    }
+
+    #[test]
+    fn scaffolded_config_parses_and_carries_routing_keys() {
+        // Regression: a scaffolded pipeline.yaml used to omit `standards:` entirely,
+        // so pipeline_standards.route failed on every project Pipeline created.
+        let dir = tempdir().unwrap();
+        init_project(dir.path(), "srv", "mcp-server-rust", "").unwrap();
+        let text = std::fs::read_to_string(dir.path().join("srv/pipeline.yaml")).unwrap();
+
+        let cfg = pipeline_config::PipelineConfig::parse(&text).expect("scaffolded yaml must parse");
+        let std_cfg = cfg.standards;
+        assert_eq!(std_cfg.project_type.as_deref(), Some("MCP server"));
+        assert_eq!(std_cfg.languages, vec!["rust".to_owned()]);
+        assert_eq!(std_cfg.surfaces, vec!["Command line".to_owned()]);
+    }
+
+    #[test]
+    fn every_template_emits_parseable_config() {
+        for (template, _) in list_templates() {
+            let dir = tempdir().unwrap();
+            init_project(dir.path(), "p", template, "").unwrap();
+            let text = std::fs::read_to_string(dir.path().join("p/pipeline.yaml")).unwrap();
+            pipeline_config::PipelineConfig::parse(&text)
+                .unwrap_or_else(|e| panic!("template '{template}' emits invalid yaml: {e}"));
+        }
     }
 
     #[test]
