@@ -10,6 +10,7 @@ use crate::handlers::{ensure_memory, load_config_in_cwd};
 use crate::server::ServerState;
 use crate::tools::{ToolRequest, ToolResponse};
 use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -54,21 +55,55 @@ async fn metrics_setup(args: &Value) -> ToolResponse {
     }))
 }
 
+/// How many recorded runs are read when measuring · a window, ✗ all history,
+/// so a baseline reflects the code as it is now.
+const PERF_WINDOW: i64 = 200;
+/// Samples a stage needs before its mean is worth calling a baseline.
+const PERF_MIN_RUNS: u64 = 3;
+/// Percent slower than baseline that fails the call by default.
+const PERF_THRESHOLD_PCT: f64 = 10.0;
+
+/// Measured timings for one stage.
+struct StageStat {
+    samples: u64,
+    mean_ms: i64,
+    min_ms: i64,
+    max_ms: i64,
+}
+
+/// Measure a performance baseline from **recorded** stage durations.
+///
+/// ! This used to store whatever `metrics` the caller passed, defaulting to
+/// `{}` — so every regression gate built on it was inert, and a baseline of
+/// nothing compared equal to everything. The numbers now come from
+/// `run_history`, the same genuinely measured data `optimize_suggest` reads.
 async fn perf_baseline(args: &Value, state: Arc<ServerState>) -> ToolResponse {
     let suite = args
         .get("suite")
         .and_then(Value::as_str)
         .unwrap_or("default");
-    let metrics = args.get("metrics").cloned().unwrap_or(json!({}));
-    let project = match cfg_project(&state).await {
-        Ok(p) => p,
+    let profile = args.get("profile").and_then(Value::as_str);
+    let stages = string_set(args.get("stages"));
+    let min_runs = args
+        .get("min_runs")
+        .and_then(Value::as_u64)
+        .unwrap_or(PERF_MIN_RUNS)
+        .max(1);
+    let (mem, project) = match memory_and_project(&state).await {
+        Ok(v) => v,
         Err(e) => return err(e),
     };
-    let mem = match ensure_memory(&state).await {
-        Ok(m) => m,
+    let runs = match mem.run_history(&project, PERF_WINDOW).await {
+        Ok(r) => r,
+        // ! A failed read is UNKNOWN · storing an empty baseline here would
+        // define "fast" as "any number at all".
+        Err(e) => return err(format!("run_history: {e}")),
+    };
+    let measured = measure_stages(&runs, profile, stages.as_ref());
+    let blob = match baseline_blob(suite, profile, &measured, min_runs) {
+        Ok(b) => b,
         Err(e) => return err(e),
     };
-    let blob = json!({"suite": suite, "metrics": metrics, "ts": pipeline_memory::now_rfc3339()});
     if let Err(e) = mem
         .remember(&project, "perf_baseline", suite, &blob.to_string())
         .await
@@ -78,53 +113,248 @@ async fn perf_baseline(args: &Value, state: Arc<ServerState>) -> ToolResponse {
     ToolResponse::ok(blob)
 }
 
+/// ! Only passing runs are samples. A failed run's duration measures how fast
+/// the suite broke, ✗ how fast it is — mixing them makes a baseline that moves
+/// whenever the failure mode changes.
+fn measure_stages(
+    runs: &[pipeline_memory::RunRecord],
+    profile: Option<&str>,
+    stages: Option<&BTreeSet<String>>,
+) -> BTreeMap<String, StageStat> {
+    let mut buckets: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+    for r in runs {
+        if r.status != "pass" {
+            continue;
+        }
+        if profile.is_some_and(|p| p != r.profile) {
+            continue;
+        }
+        if stages.is_some_and(|s| !s.contains(&r.stage)) {
+            continue;
+        }
+        buckets
+            .entry(r.stage.clone())
+            .or_default()
+            .push(r.duration_ms);
+    }
+    buckets
+        .into_iter()
+        .map(|(stage, ms)| {
+            let sum: i64 = ms.iter().sum();
+            let n = i64::try_from(ms.len()).unwrap_or(1).max(1);
+            let stat = StageStat {
+                samples: ms.len() as u64,
+                mean_ms: sum / n,
+                min_ms: ms.iter().copied().min().unwrap_or(0),
+                max_ms: ms.iter().copied().max().unwrap_or(0),
+            };
+            (stage, stat)
+        })
+        .collect()
+}
+
+/// Build the stored baseline · pure, so "insufficient history refuses" is
+/// testable without a database.
+fn baseline_blob(
+    suite: &str,
+    profile: Option<&str>,
+    measured: &BTreeMap<String, StageStat>,
+    min_runs: u64,
+) -> Result<Value, String> {
+    let kept: Vec<(&String, &StageStat)> = measured
+        .iter()
+        .filter(|(_, s)| s.samples >= min_runs)
+        .collect();
+    if kept.is_empty() {
+        let best = measured.values().map(|s| s.samples).max().unwrap_or(0);
+        return Err(format!(
+            "insufficient history · no stage has {min_runs} passing runs recorded (best: {best}) \
+             · run the suite {} more time(s) · ✗ storing an empty baseline",
+            min_runs - best
+        ));
+    }
+    let dropped: Vec<&String> = measured
+        .iter()
+        .filter(|(_, s)| s.samples < min_runs)
+        .map(|(k, _)| k)
+        .collect();
+    let mut stages = serde_json::Map::new();
+    let mut metrics = serde_json::Map::new();
+    let mut total = 0_u64;
+    for (stage, s) in &kept {
+        total += s.samples;
+        stages.insert(
+            (*stage).clone(),
+            json!({"samples": s.samples, "mean_ms": s.mean_ms,
+                   "min_ms": s.min_ms, "max_ms": s.max_ms}),
+        );
+        metrics.insert(format!("{stage}_ms"), json!(s.mean_ms));
+    }
+    Ok(json!({
+        "suite": suite,
+        "profile": profile,
+        "source": "run_history",
+        "measured": true,
+        "runs_analyzed": total,
+        "min_runs": min_runs,
+        "stages": stages,
+        "metrics": metrics,
+        "stages_below_min_runs": dropped,
+        "ts": pipeline_memory::now_rfc3339(),
+    }))
+}
+
+/// Compare current timings against the stored baseline and **rule on them**.
+///
+/// ! This used to return raw deltas with no threshold, so a +400% regression
+/// still came back `ok:true` — a gate that cannot fail is not a gate.
 async fn perf_compare(args: &Value, state: Arc<ServerState>) -> ToolResponse {
     let suite = args
         .get("suite")
         .and_then(Value::as_str)
         .unwrap_or("default");
-    let current = args.get("metrics").cloned().unwrap_or(json!({}));
-    let project = match cfg_project(&state).await {
-        Ok(p) => p,
+    let threshold = args
+        .get("threshold_pct")
+        .and_then(Value::as_f64)
+        .unwrap_or(PERF_THRESHOLD_PCT);
+    let (mem, project) = match memory_and_project(&state).await {
+        Ok(v) => v,
         Err(e) => return err(e),
     };
-    let mem = match ensure_memory(&state).await {
-        Ok(m) => m,
+    let baseline = match load_baseline(&mem, &project, suite).await {
+        Ok(b) => b,
         Err(e) => return err(e),
     };
-    let baseline = match mem.recall(&project, "perf_baseline", suite).await {
-        Ok(Some(s)) => match serde_json::from_str::<Value>(&s) {
-            Ok(v) => v,
-            Err(e) => return err(format!("corrupt baseline: {e}")),
-        },
-        Ok(None) => {
-            return err(format!(
-                "no baseline for suite '{suite}' · call perf_baseline first"
-            ));
-        }
-        Err(e) => return err(e.to_string()),
+    // Caller-supplied readings win · otherwise measure the same way the baseline
+    // was measured, rather than comparing the baseline against an empty object.
+    let supplied = args
+        .get("metrics")
+        .filter(|m| m.as_object().is_some_and(|o| !o.is_empty()));
+    let current = if let Some(m) = supplied {
+        m.clone()
+    } else {
+        let runs = match mem.run_history(&project, PERF_WINDOW).await {
+            Ok(r) => r,
+            Err(e) => return err(format!("run_history: {e}")),
+        };
+        let profile = baseline.get("profile").and_then(Value::as_str);
+        metrics_of(&measure_stages(&runs, profile, None))
     };
     let baseline_metrics = baseline.get("metrics").cloned().unwrap_or(json!({}));
-    let mut deltas = serde_json::Map::new();
-    if let (Some(b_obj), Some(c_obj)) = (baseline_metrics.as_object(), current.as_object()) {
-        for (k, b_val) in b_obj {
-            if let (Some(b_n), Some(c_val)) = (b_val.as_f64(), c_obj.get(k)) {
-                if let Some(c_n) = c_val.as_f64() {
-                    let delta = c_n - b_n;
-                    let pct = if b_n.abs() > f64::EPSILON {
-                        (delta / b_n) * 100.0
-                    } else {
-                        0.0
-                    };
-                    deltas.insert(
-                        k.clone(),
-                        json!({"baseline": b_n, "current": c_n, "delta": delta, "pct": pct}),
-                    );
-                }
-            }
-        }
+    let (deltas, regressions) = match compare_metrics(&baseline_metrics, &current, threshold) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    ToolResponse {
+        ok: regressions.is_empty(),
+        data: json!({
+            "suite": suite,
+            "threshold_pct": threshold,
+            "verdict": if regressions.is_empty() { "pass" } else { "regression" },
+            "deltas": deltas,
+            "regressions": regressions,
+        }),
+        next_suggested: vec![],
+        memory_refs: vec![],
+        error: if regressions.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "performance regression beyond {threshold}% on: {}",
+                regressions.join(", ")
+            ))
+        },
     }
-    ToolResponse::ok(json!({"suite": suite, "deltas": deltas}))
+}
+
+/// Per-key delta plus the keys that breached the threshold.
+///
+/// ! An empty intersection is an error, ✗ "no regressions". Comparing two
+/// objects that share no key is zero work, and zero work must not read as a
+/// pass.
+fn compare_metrics(
+    baseline: &Value,
+    current: &Value,
+    threshold_pct: f64,
+) -> Result<(serde_json::Map<String, Value>, Vec<String>), String> {
+    let (Some(b_obj), Some(c_obj)) = (baseline.as_object(), current.as_object()) else {
+        return Err("baseline or current metrics are not objects · nothing was compared".into());
+    };
+    let mut deltas = serde_json::Map::new();
+    let mut regressions = Vec::new();
+    for (k, b_val) in b_obj {
+        let (Some(b_n), Some(c_n)) = (b_val.as_f64(), c_obj.get(k).and_then(Value::as_f64)) else {
+            continue;
+        };
+        let delta = c_n - b_n;
+        // A zero baseline has no percentage · reporting 0.0 there silently puts
+        // every possible regression inside the threshold.
+        let (pct, over) = if b_n.abs() > f64::EPSILON {
+            let p = delta / b_n * 100.0;
+            (json!(p), p > threshold_pct)
+        } else {
+            (Value::Null, c_n > 0.0)
+        };
+        if over {
+            regressions.push(k.clone());
+        }
+        deltas.insert(
+            k.clone(),
+            json!({"baseline": b_n, "current": c_n, "delta": delta,
+                   "pct": pct, "regression": over}),
+        );
+    }
+    if deltas.is_empty() {
+        return Err(
+            "no metric key is present in both the baseline and the current reading · \
+             nothing was compared · ✗ a pass"
+                .into(),
+        );
+    }
+    Ok((deltas, regressions))
+}
+
+fn metrics_of(measured: &BTreeMap<String, StageStat>) -> Value {
+    Value::Object(
+        measured
+            .iter()
+            .map(|(stage, s)| (format!("{stage}_ms"), json!(s.mean_ms)))
+            .collect(),
+    )
+}
+
+fn string_set(v: Option<&Value>) -> Option<BTreeSet<String>> {
+    let arr = v?.as_array()?;
+    let set: BTreeSet<String> = arr
+        .iter()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect();
+    if set.is_empty() { None } else { Some(set) }
+}
+
+async fn load_baseline(
+    mem: &pipeline_memory::Memory,
+    project: &str,
+    suite: &str,
+) -> Result<Value, String> {
+    match mem.recall(project, "perf_baseline", suite).await {
+        Ok(Some(s)) => {
+            serde_json::from_str::<Value>(&s).map_err(|e| format!("corrupt baseline: {e}"))
+        }
+        Ok(None) => Err(format!(
+            "no baseline for suite '{suite}' · call perf_baseline first"
+        )),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+async fn memory_and_project(
+    state: &Arc<ServerState>,
+) -> Result<(pipeline_memory::Memory, String), String> {
+    let project = cfg_project(state).await?;
+    let mem = ensure_memory(state).await?;
+    Ok((mem, project))
 }
 
 async fn cfg_project(state: &Arc<ServerState>) -> Result<String, String> {
@@ -555,5 +785,125 @@ mod tests {
     async fn query_optimize_still_requires_sql() {
         let r = query_optimize(&json!({})).await;
         assert!(!r.ok);
+    }
+
+    // ───────────────────────── perf baseline / compare ─────────────────────────
+
+    fn record(stage: &str, status: &str, ms: i64) -> pipeline_memory::RunRecord {
+        pipeline_memory::RunRecord {
+            id: format!("{stage}-{ms}-{status}"),
+            project_id: "p1".into(),
+            session_id: None,
+            profile: "fast".into(),
+            stage: stage.into(),
+            status: status.into(),
+            duration_ms: ms,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            stdout: None,
+            stderr: None,
+            failure_json: None,
+        }
+    }
+
+    #[test]
+    fn a_baseline_is_measured_not_supplied() {
+        // Regression: perf_baseline stored whatever `metrics` the caller passed,
+        // so the gate compared a fiction against a fiction. The numbers must come
+        // from recorded stage durations.
+        let runs = vec![
+            record("static", "pass", 1_000),
+            record("static", "pass", 2_000),
+            record("static", "pass", 3_000),
+        ];
+        let measured = measure_stages(&runs, None, None);
+        let b = baseline_blob("default", None, &measured, 3).unwrap();
+        assert_eq!(b["measured"], json!(true));
+        assert_eq!(b["source"], "run_history");
+        assert_eq!(b["metrics"]["static_ms"], 2_000);
+        assert_eq!(b["stages"]["static"]["samples"], 3);
+        assert_eq!(b["stages"]["static"]["min_ms"], 1_000);
+        assert_eq!(b["stages"]["static"]["max_ms"], 3_000);
+        assert_eq!(b["runs_analyzed"], 3);
+    }
+
+    #[test]
+    fn insufficient_history_refuses_rather_than_storing_an_empty_baseline() {
+        // ! An empty baseline compares equal to everything · the gate is then
+        // inert forever, and nobody finds out.
+        let measured = measure_stages(&[record("static", "pass", 900)], None, None);
+        let e = baseline_blob("default", None, &measured, 3).unwrap_err();
+        assert!(e.contains("insufficient history"), "{e}");
+        assert!(
+            e.contains("2 more time(s)"),
+            "must say how many are needed: {e}"
+        );
+        // No history at all is the same refusal, ✗ a zero baseline.
+        let e = baseline_blob("default", None, &BTreeMap::new(), 3).unwrap_err();
+        assert!(e.contains("insufficient history"), "{e}");
+    }
+
+    #[test]
+    fn a_failed_run_is_not_a_performance_sample() {
+        // A failed run's duration measures how fast the suite broke · including
+        // it makes the baseline move whenever the failure mode changes.
+        let runs = vec![
+            record("unit", "pass", 1_000),
+            record("unit", "fail", 10),
+            record("unit", "pass", 3_000),
+        ];
+        let m = measure_stages(&runs, None, None);
+        assert_eq!(m["unit"].samples, 2);
+        assert_eq!(m["unit"].mean_ms, 2_000);
+    }
+
+    #[test]
+    fn a_stage_short_of_samples_is_dropped_visibly_not_silently() {
+        let runs = vec![
+            record("static", "pass", 100),
+            record("static", "pass", 200),
+            record("unit", "pass", 5_000),
+        ];
+        let b = baseline_blob("default", None, &measure_stages(&runs, None, None), 2).unwrap();
+        assert!(b["metrics"]["static_ms"].is_number());
+        assert!(b["metrics"]["unit_ms"].is_null(), "unit has 1 sample");
+        assert_eq!(b["stages_below_min_runs"], json!(["unit"]));
+    }
+
+    #[test]
+    fn a_regression_beyond_threshold_fails_the_call() {
+        // Regression: perf_compare returned raw deltas with no threshold, so a
+        // +400% blow-up still came back ok:true. A gate that cannot fail is not a
+        // gate.
+        let base = json!({"unit_ms": 1_000});
+        let (deltas, regressions) =
+            compare_metrics(&base, &json!({"unit_ms": 5_000}), 10.0).unwrap();
+        assert_eq!(regressions, vec!["unit_ms".to_owned()]);
+        assert_eq!(deltas["unit_ms"]["pct"], json!(400.0));
+        assert_eq!(deltas["unit_ms"]["regression"], json!(true));
+
+        // Within threshold · still reported, but ✗ a failure.
+        let (_, ok) = compare_metrics(&base, &json!({"unit_ms": 1_050}), 10.0).unwrap();
+        assert!(ok.is_empty());
+        // Faster than baseline is never a regression.
+        let (_, faster) = compare_metrics(&base, &json!({"unit_ms": 10}), 10.0).unwrap();
+        assert!(faster.is_empty());
+    }
+
+    #[test]
+    fn nothing_in_common_is_an_error_not_a_pass() {
+        // ! Zero comparisons must not read as zero regressions — that is exactly
+        // how the empty-baseline gate stayed green.
+        let e = compare_metrics(&json!({"unit_ms": 10}), &json!({}), 10.0).unwrap_err();
+        assert!(e.contains("nothing was compared"), "{e}");
+    }
+
+    #[test]
+    fn a_zero_baseline_has_no_percentage_and_any_slowdown_is_a_regression() {
+        // Regression: pct was forced to 0.0 when the baseline was 0, putting every
+        // possible slowdown inside the threshold.
+        let (deltas, regressions) =
+            compare_metrics(&json!({"unit_ms": 0}), &json!({"unit_ms": 900}), 10.0).unwrap();
+        assert!(deltas["unit_ms"]["pct"].is_null(), "✗ 0.0");
+        assert_eq!(regressions, vec!["unit_ms".to_owned()]);
     }
 }

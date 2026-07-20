@@ -62,6 +62,14 @@ async fn deps_lock(args: &Value) -> ToolResponse {
     run_capture(program, &cmd_args, &cwd, &format!("deps_lock({stack})")).await
 }
 
+/// Pin a runtime in `.tool-versions` and, when a version manager is present,
+/// actually install it.
+///
+/// ! Two separate claims, reported separately: `pinned` and `installed`. The old
+/// implementation collapsed them into one lie — it skipped the write whenever the
+/// runtime was already listed at *any* version, then returned `ok:true` echoing the
+/// version that was requested. Asking for rust 1.89 over a file pinning 1.75 left
+/// 1.75 on disk and told the agent it had 1.89.
 async fn runtime_provision(args: &Value) -> ToolResponse {
     let name = match args.get("name").and_then(Value::as_str) {
         Some(n) => n.to_owned(),
@@ -70,29 +78,158 @@ async fn runtime_provision(args: &Value) -> ToolResponse {
     let version = args
         .get("version")
         .and_then(Value::as_str)
-        .unwrap_or("stable");
+        .unwrap_or("latest")
+        .to_owned();
+    // install=false → declare the version without touching the machine.
+    let install = args.get("install").and_then(Value::as_bool).unwrap_or(true);
     let cwd = match std::env::current_dir() {
         Ok(p) => p,
         Err(e) => return err(format!("cwd: {e}")),
     };
-    // Strategy: write a `.tool-versions` file (asdf-compatible) so the
-    // runtime is declarable in the repo. Actually fetching it is
-    // delegated to the host (asdf, mise, etc.) or to the devcontainer.
     let path = cwd.join(".tool-versions");
-    let mut existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
-    let line = format!("{name} {version}\n");
-    if !existing.lines().any(|l| l.starts_with(&format!("{name} "))) {
-        existing.push_str(&line);
-        if let Err(e) = tokio::fs::write(&path, &existing).await {
-            return err(format!("write .tool-versions: {e}"));
+    let previous = match pin_tool_version(&path, &name, &version).await {
+        Ok(p) => p,
+        Err(e) => return err(e),
+    };
+    let mut data = json!({
+        "name": name,
+        "requested_version": version,
+        "pinned": true,
+        "previous_version": previous,
+        "pin_file": path.display().to_string(),
+    });
+    let manager = if install {
+        detect_manager().await
+    } else {
+        None
+    };
+    let Some(manager) = manager else {
+        data["installed"] = json!(false);
+        data["note"] = json!(if install {
+            "no mise/asdf on PATH · pinned in .tool-versions, ✗ installed"
+        } else {
+            "install=false · pinned in .tool-versions, ✗ installed"
+        });
+        return ToolResponse::ok(data);
+    };
+    install_runtime(manager, &name, &version, &cwd, data).await
+}
+
+/// Rewrite `.tool-versions` so `name` is pinned at `version` · returns the version
+/// it replaced, when there was one.
+async fn pin_tool_version(
+    path: &std::path::Path,
+    name: &str,
+    version: &str,
+) -> Result<Option<String>, String> {
+    let existing = tokio::fs::read_to_string(path).await.unwrap_or_default();
+    let prefix = format!("{name} ");
+    let mut previous = None;
+    let mut lines: Vec<String> = Vec::new();
+    for line in existing.lines() {
+        if line.starts_with(&prefix) {
+            // ! Rewrite the conflicting entry · skipping it was the whole defect.
+            previous = Some(line[prefix.len()..].trim().to_owned());
+            lines.push(format!("{name} {version}"));
+        } else {
+            lines.push(line.to_owned());
         }
     }
-    ToolResponse::ok(json!({
-        "name": name,
-        "version": version,
-        "path": path.display().to_string(),
-        "note": "asdf/mise compatible · run `asdf install` to materialize",
-    }))
+    if previous.is_none() {
+        lines.push(format!("{name} {version}"));
+    }
+    tokio::fs::write(path, lines.join("\n") + "\n")
+        .await
+        .map_err(|e| format!("write .tool-versions: {e}"))?;
+    Ok(previous.filter(|p| p != version))
+}
+
+/// mise first · it reads `.tool-versions` too and is the maintained successor.
+async fn detect_manager() -> Option<&'static str> {
+    for m in ["mise", "asdf"] {
+        if Command::new(m)
+            .arg("--version")
+            .output()
+            .await
+            .is_ok_and(|o| o.status.success())
+        {
+            return Some(m);
+        }
+    }
+    None
+}
+
+async fn install_runtime(
+    manager: &'static str,
+    name: &str,
+    version: &str,
+    cwd: &std::path::Path,
+    mut data: Value,
+) -> ToolResponse {
+    let spec = format!("{name}@{version}");
+    let argv: Vec<&str> = if manager == "mise" {
+        vec!["install", spec.as_str()]
+    } else {
+        vec!["install", name, version]
+    };
+    let output = match Command::new(manager)
+        .args(&argv)
+        .current_dir(cwd)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(e) => return err(format!("{manager} spawn: {e}")),
+    };
+    let ok = output.status.success();
+    let exit = output.status.code().unwrap_or(-1);
+    data["manager"] = json!(manager);
+    data["installed"] = json!(ok);
+    data["exit_code"] = json!(exit);
+    data["stdout"] = json!(truncate(&String::from_utf8_lossy(&output.stdout), 4_000));
+    data["stderr"] = json!(truncate(&String::from_utf8_lossy(&output.stderr), 4_000));
+    // ! The installed version is read back from the manager, ✗ echoed from the
+    // request: "latest" is a request, never an answer.
+    if ok {
+        data["verified_version"] = json!(current_version(manager, name, cwd).await);
+    }
+    ToolResponse {
+        ok,
+        data,
+        next_suggested: vec![],
+        memory_refs: vec![],
+        error: if ok {
+            None
+        } else {
+            Some(format!("{manager} install {spec} exit {exit}"))
+        },
+    }
+}
+
+/// Ask the manager what is actually active for this directory.
+async fn current_version(manager: &str, name: &str, cwd: &std::path::Path) -> Value {
+    let Ok(o) = Command::new(manager)
+        .args(["current", name])
+        .current_dir(cwd)
+        .output()
+        .await
+    else {
+        return Value::Null;
+    };
+    if !o.status.success() {
+        return Value::Null;
+    }
+    let text = String::from_utf8_lossy(&o.stdout);
+    let Some(line) = text.lines().find(|l| !l.trim().is_empty()) else {
+        return Value::Null;
+    };
+    // mise prints the bare version · asdf prints "<name> <version> <source>".
+    let token = if manager == "asdf" {
+        line.split_whitespace().nth(1)
+    } else {
+        line.split_whitespace().next()
+    };
+    token.map_or(Value::Null, |t| json!(t))
 }
 
 async fn tooling_install(args: &Value) -> ToolResponse {
@@ -150,6 +287,19 @@ async fn secrets_inject(args: &Value) -> ToolResponse {
     }))
 }
 
+/// Stays unimplemented · deliberately.
+///
+/// ! The URI authority VS Code needs is `dev-container+<hex-encoded-json>`, and the
+/// JSON payload is an internal structure of the Dev Containers extension whose
+/// fields change between releases. Constructing one from a guess is precisely the
+/// fabrication this codebase refuses: it would resolve on the author's machine and
+/// silently fail everywhere else. The previous code passed the literal authority
+/// `dev-container+pipeline` — which can never resolve — alongside a contradictory
+/// `.` argument, and reported `launched: <exit status of code>` as if it had worked.
+///
+/// No stable public CLI opens a folder in its devcontainer, so this refuses and
+/// hands back the manual path instead.
+#[allow(clippy::unused_async)] // signature locked by the dispatcher's action table
 async fn devcontainer_open(args: &Value) -> ToolResponse {
     let editor = args.get("editor").and_then(Value::as_str).unwrap_or("code");
     let cwd = match std::env::current_dir() {
@@ -160,32 +310,12 @@ async fn devcontainer_open(args: &Value) -> ToolResponse {
     if !dc.exists() {
         return err("no .devcontainer/devcontainer.json · run pipeline_env.create first".into());
     }
-    // Try to launch the editor with the devcontainer · falls back gracefully if absent.
-    let output = match Command::new(editor)
-        .args([
-            ".",
-            "--folder-uri",
-            "vscode-remote://dev-container+pipeline/workspace",
-        ])
-        .current_dir(&cwd)
-        .output()
-        .await
-    {
-        Ok(o) => o,
-        Err(e) => {
-            return ToolResponse::ok(json!({
-                "editor": editor,
-                "devcontainer": dc.display().to_string(),
-                "launched": false,
-                "note": format!("'{editor}' not found ({e}) · open the folder manually in your IDE"),
-            }));
-        }
-    };
-    ToolResponse::ok(json!({
-        "editor": editor,
-        "devcontainer": dc.display().to_string(),
-        "launched": output.status.success(),
-    }))
+    err(format!(
+        "not implemented · opening a devcontainer needs a hex-encoded URI authority \
+         that is internal to the Dev Containers extension, and no stable CLI exposes \
+         it · open {} in {editor}, then run 'Dev Containers: Reopen in Container'",
+        cwd.display()
+    ))
 }
 
 async fn create(args: &Value) -> ToolResponse {
@@ -544,5 +674,69 @@ mod dep_command_tests {
     #[test]
     fn an_unknown_stack_is_rejected_not_guessed() {
         assert!(build_dep_command("cobol", &[], &spec(false, &[], None)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::pin_tool_version;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn provisioning_over_a_conflicting_pin_updates_it_rather_than_reporting_success() {
+        // ! The original defect verbatim: the write was skipped whenever the runtime
+        // was already listed at ANY version, and ok:true still echoed the requested
+        // one. Asking for rust 1.89 over a file pinning 1.75 left 1.75 on disk.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".tool-versions");
+        std::fs::write(&path, "rust 1.75.0\nnodejs 20.11.0\n").unwrap();
+
+        let previous = pin_tool_version(&path, "rust", "1.89.0").await.unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("rust 1.89.0"), "pin not updated:\n{text}");
+        assert!(!text.contains("1.75.0"), "stale pin survived:\n{text}");
+        assert_eq!(
+            previous.as_deref(),
+            Some("1.75.0"),
+            "must report what it replaced"
+        );
+        assert!(
+            text.contains("nodejs 20.11.0"),
+            "unrelated pin lost:\n{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_runtime_is_appended_and_reports_no_previous() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".tool-versions");
+        std::fs::write(&path, "nodejs 20.11.0\n").unwrap();
+        let previous = pin_tool_version(&path, "rust", "1.89.0").await.unwrap();
+        assert_eq!(previous, None);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("nodejs 20.11.0") && text.contains("rust 1.89.0"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn re_pinning_the_same_version_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".tool-versions");
+        pin_tool_version(&path, "rust", "1.89.0").await.unwrap();
+        let once = std::fs::read_to_string(&path).unwrap();
+        let previous = pin_tool_version(&path, "rust", "1.89.0").await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), once);
+        assert_eq!(previous, None, "an unchanged pin has no previous value");
+    }
+
+    #[tokio::test]
+    async fn a_missing_pin_file_is_created() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".tool-versions");
+        pin_tool_version(&path, "python", "3.12.1").await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "python 3.12.1\n");
     }
 }

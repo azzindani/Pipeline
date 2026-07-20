@@ -17,7 +17,7 @@
 use crate::spec::{
     ActionSpec,
     ArgSet::{None as NoArgs, Of, Unspecified},
-    ArgType::{Bool, Int, List, Obj, Str},
+    ArgType::{Any, Bool, Int, List, Num, Obj, Str},
     opt, req,
 };
 use crate::tools::ToolName;
@@ -203,9 +203,12 @@ fn type_matches(ty: crate::spec::ArgType, v: &serde_json::Value) -> bool {
         // (list vs object) is what this check is for.
         ArgType::Str => v.is_string(),
         ArgType::Int => v.is_number() || v.as_str().is_some_and(|s| s.parse::<i64>().is_ok()),
+        ArgType::Num => v.is_number() || v.as_str().is_some_and(|s| s.parse::<f64>().is_ok()),
         ArgType::Bool => v.is_boolean() || v.as_str().is_some_and(|s| s.parse::<bool>().is_ok()),
         ArgType::List => v.is_array(),
         ArgType::Obj => v.is_object(),
+        // The per-key schema validates this one · see `ArgType::Any`.
+        ArgType::Any => true,
     }
 }
 
@@ -290,9 +293,17 @@ static REGISTRY: [ToolDescriptor; 19] = [
                     "project to unlock · defaults to pipeline.yaml in cwd",
                 )]),
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "start",
-                "Open a session without the lock · ✗ implemented: persists no session row, returns no session_id, handover reports active_session:null. Use lock.",
+                "Open an observer session · ✗ takes the exclusive lock · returns a session_id that end accepts and appears in handover.",
+                Of(&[
+                    opt(
+                        "agent_id",
+                        Str,
+                        "caller identity · defaults to the registered agent",
+                    ),
+                    opt("goal", Str, "what this session intends to do · persisted"),
+                ]),
             ),
             ActionSpec::real(
                 "checkpoint",
@@ -330,9 +341,17 @@ static REGISTRY: [ToolDescriptor; 19] = [
                 "Substring-match a path against the last 20 runs' stdout/stderr · ✗ a file→test graph.",
                 Of(&[req("path", Str, "path as it would appear in run output")]),
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "task_context",
-                "Find prior work related to a task · ✗ implemented: matches the whole description as one substring, so it returns empty and reads as 'no prior work'.",
+                "Rank stored features · notes · decisions by term overlap with a task · reports score + matched terms · no-match is distinct from nothing-stored.",
+                Of(&[
+                    req(
+                        "description",
+                        Str,
+                        "task description · tokenized, ✗ matched as one phrase",
+                    ),
+                    opt("limit", Int, "max results · default 10"),
+                ]),
             ),
             ActionSpec::real(
                 "agent_register",
@@ -365,9 +384,26 @@ static REGISTRY: [ToolDescriptor; 19] = [
                 "Read one research note in full, excerpt included.",
                 Of(&[req("id", Str, "note id from research_notes_list")]),
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "feasibility",
-                "Assess feasibility · ✗ implemented: effort in weeks is keyword-count arithmetic with no disclosed model, verdict 'yes' means only 'a digest file existed', links accepted and never fetched.",
+                "Extract stack + capability signals from text · fetched links · digested repos → a plan skeleton · ✗ an effort figure, ✗ a build/no-build verdict.",
+                Of(&[
+                    opt(
+                        "text",
+                        Str,
+                        "idea or brief · scanned for stack and capability signals",
+                    ),
+                    opt(
+                        "links",
+                        List,
+                        "URLs · fetched and persisted as research notes",
+                    ),
+                    opt(
+                        "repos",
+                        List,
+                        "digested aliases · missing digests reported as gaps",
+                    ),
+                ]),
             ),
             ActionSpec::real(
                 "create",
@@ -397,6 +433,11 @@ static REGISTRY: [ToolDescriptor; 19] = [
                     req("name", Str, "feature name"),
                     opt("description", Str, "what the feature does"),
                     opt("ac", List, "acceptance criteria · strings"),
+                    opt(
+                        "complexity",
+                        Str,
+                        "trivial | small | medium | large | epic · default medium · drives estimate",
+                    ),
                 ]),
             ),
             ActionSpec::real(
@@ -414,6 +455,7 @@ static REGISTRY: [ToolDescriptor; 19] = [
                         Obj,
                         "fields to merge · omitted → remaining args are the patch",
                     ),
+                    opt("complexity", Str, "trivial | small | medium | large | epic"),
                 ]),
             ),
             ActionSpec::real(
@@ -480,9 +522,14 @@ static REGISTRY: [ToolDescriptor; 19] = [
                 ]),
             ),
             ActionSpec::real("risk_list", "List recorded risks.", NoArgs),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "estimate",
-                "Estimate effort from features · ✗ implemented: base = ac_count × 4h annihilates complexity at zero ACs, and features_add never stores complexity, so every feature returns 2.0h.",
+                "Effort from stored complexity + acceptance-criteria count · discloses its arithmetic · measured delivery history reported on its own axis, ✗ folded in.",
+                Of(&[opt(
+                    "feature_id",
+                    Str,
+                    "single feature · omit → every feature",
+                )]),
             ),
         ],
     },
@@ -579,7 +626,7 @@ static REGISTRY: [ToolDescriptor; 19] = [
             ),
             ActionSpec::real(
                 "scaffold",
-                "Add a component · kind=crate writes manifest + source and registers the member in the root Cargo.toml.",
+                "Add a component · reads stack from pipeline.yaml, emits the right file per stack, and registers it so the compiler sees it.",
                 Of(&[
                     req(
                         "component",
@@ -601,16 +648,25 @@ static REGISTRY: [ToolDescriptor; 19] = [
                         Str,
                         "kind=crate only · manifest description field",
                     ),
+                    opt(
+                        "stack",
+                        Str,
+                        "override pipeline.yaml · rust | python-uv | bun | node | go",
+                    ),
                 ]),
             ),
             ActionSpec::real(
                 "template_list",
-                "List the built-in templates · ! static set only, ✗ reads the template_register registry.",
+                "List built-in and registered templates · each row carries origin: builtin | registered.",
                 NoArgs,
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "template_register",
-                "Register a user template · ✗ implemented: writes a registry file nothing reads — init cannot use it, template_list ignores it, source is never validated.",
+                "Register a user template · validates the source (dir exists | git ls-remote reaches it), upserts by name · init can instantiate it.",
+                Of(&[
+                    req("name", Str, "template name · built-ins win a name clash"),
+                    req("source", Str, "local directory path | git URL"),
+                ]),
             ),
         ],
     },
@@ -669,9 +725,18 @@ static REGISTRY: [ToolDescriptor; 19] = [
                     "rust | node | ts | typescript | bun | python | python-uv | uv | go | golang",
                 )]),
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "runtime_provision",
-                "Install a language runtime at a version · ✗ implemented: appends a .tool-versions line, installs nothing; an existing entry at another version is skipped yet ok:true still echoes the requested version.",
+                "Pin a runtime in .tool-versions and install via mise/asdf when present · reports pinned and installed separately · version read back, ✗ echoed.",
+                Of(&[
+                    req("name", Str, "runtime name · rust | python | node | go"),
+                    opt("version", Str, "version to pin · default latest"),
+                    opt(
+                        "install",
+                        Bool,
+                        "false → pin only, touch nothing on the machine · default true",
+                    ),
+                ]),
             ),
             ActionSpec::real(
                 "tooling_install",
@@ -697,7 +762,7 @@ static REGISTRY: [ToolDescriptor; 19] = [
             ),
             ActionSpec::planned(
                 "devcontainer_open",
-                "Open the project in its devcontainer · ✗ implemented: passes a fabricated container URI VS Code cannot resolve (hex-encoded JSON required).",
+                "Open the project in its devcontainer · ✗ implemented: the URI authority is an internal extension structure that changes across releases · constructing one would resolve on one machine and fail silently elsewhere.",
             ),
         ],
     },
@@ -1002,9 +1067,14 @@ static REGISTRY: [ToolDescriptor; 19] = [
                     opt("id", Str, "alias for feature_id"),
                 ]),
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "flake_detect",
-                "Detect flaky tests · ✗ implemented: reruns nothing, discards every argument · pass+fail in history is not flakiness, a fixed regression scores the same.",
+                "Rerun a test N times and count outcomes · stable | flaky | broken | indeterminate are distinct verdicts · a test that always fails is broken, ✗ flaky.",
+                Of(&[
+                    opt("iterations", Int, "runs · default 5 · capped at 50"),
+                    opt("filter", Str, "test name substring"),
+                    opt("package", Str, "cargo package · omit → whole workspace"),
+                ]),
             ),
         ],
     },
@@ -1023,16 +1093,29 @@ static REGISTRY: [ToolDescriptor; 19] = [
             ),
             ActionSpec::planned(
                 "record",
-                "Record a browser session into test code · ✗ usable: codegen is headed and interactive with no display and no timeout, so the call blocks indefinitely.",
+                "Record a browser session into test code · ✗ implementable synchronously: an interactive recorder needs a display and a human at it.",
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "browser_launch",
-                "Launch a browser at a URL · ✗ implemented: the container sleeps, no browser starts, url only labels the log line.",
+                "Launch persistent headless chromium and navigate · returns the URL actually reached, page title, and HTTP status.",
+                Of(&[
+                    req("url", Str, "page to open"),
+                    opt(
+                        "session",
+                        Str,
+                        "session name · generated unique when omitted",
+                    ),
+                    opt(
+                        "reuse",
+                        Bool,
+                        "attach to an existing session of this name · default false",
+                    ),
+                ]),
             ),
             ActionSpec::real(
                 "browser_close",
-                "Remove the browser container · takes no arguments.",
-                NoArgs,
+                "Close a named browser session, or every labelled session when given none.",
+                Of(&[opt("session", Str, "session name · omit → close all")]),
             ),
             ActionSpec::real(
                 "trace",
@@ -1042,25 +1125,57 @@ static REGISTRY: [ToolDescriptor; 19] = [
             ActionSpec::real(
                 "screenshot",
                 "Launch chromium, navigate, write a full-page PNG · returns the output path.",
-                Of(&[req("url", Str, "page to capture")]),
+                Of(&[
+                    opt(
+                        "url",
+                        Str,
+                        "page to capture · required unless session given",
+                    ),
+                    opt("session", Str, "reuse a live browser_launch session"),
+                ]),
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "visual_regression",
-                "Compare screenshots against baselines · ✗ implemented: writes the baselines it should compare against, so it cannot fail on a fresh project.",
+                "Compare against committed baselines · a missing baseline or an empty suite fails loudly, ✗ passes.",
+                Of(&[
+                    opt("suite", Str, "test file or path filter"),
+                    opt("url", Str, "origin under test → BASE_URL"),
+                    opt("threshold", Num, "pixel difference tolerance"),
+                    opt(
+                        "update_baseline",
+                        Bool,
+                        "regenerate baselines instead of comparing · default false",
+                    ),
+                ]),
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "a11y_check",
-                "Audit a page for accessibility violations · ✗ implemented: requires an axe dependency absent from repo and base image · can only exit MODULE_NOT_FOUND.",
+                "Run axe-core against a live page · returns rule id, impact, and offending selector · fails on configurable impact.",
+                Of(&[
+                    req("url", Str, "page to audit"),
+                    opt(
+                        "fail_on",
+                        Str,
+                        "none | minor | moderate | serious | critical · default critical",
+                    ),
+                    opt("tags", List, "axe tag filters · wcag2a | wcag2aa | …"),
+                ]),
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "against_env",
-                "Run the suite against a deployed environment · ✗ implemented: sets the base URL to an environment name where a URL belongs.",
+                "Run the suite against a deployed environment · resolves env to a real origin from pipeline.yaml · refuses and names the reason when it cannot.",
+                Of(&[
+                    opt("env", Str, "deploy target name · one of env | url required"),
+                    opt("url", Str, "explicit origin · overrides env"),
+                    opt("suite", Str, "test file or path filter"),
+                ]),
             ),
             ActionSpec::real(
                 "devtools_eval",
                 "Navigate chromium to a URL and evaluate JS in page context · result returned as JSON.",
                 Of(&[
-                    req("url", Str, "page to open"),
+                    opt("url", Str, "page to open · required unless session given"),
+                    opt("session", Str, "reuse a live browser_launch session"),
                     req(
                         "js",
                         Str,
@@ -1132,7 +1247,7 @@ static REGISTRY: [ToolDescriptor; 19] = [
             ),
             ActionSpec::real(
                 "target",
-                "Push the image for an env · propagates docker push exit code.",
+                "Push an image and record the deployment (env · digest · commit) so rollback has a prior state.",
                 Of(&[
                     req("image", Str, "fully qualified image ref"),
                     opt(
@@ -1142,9 +1257,27 @@ static REGISTRY: [ToolDescriptor; 19] = [
                     ),
                 ]),
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "rollback",
-                "Roll back a deployment · ✗ implemented: resolves the previous tag, changes nothing.",
+                "Re-point an env's tag at the previously recorded immutable digest · refuses when no prior successful deployment was recorded.",
+                Of(&[
+                    opt("env", Str, "staging | production · default staging"),
+                    opt(
+                        "to",
+                        Str,
+                        "explicit repo@sha256 target · a mutable tag is rejected",
+                    ),
+                    opt(
+                        "tag",
+                        Str,
+                        "mutable tag to re-point · needed when the live record was pushed by digest",
+                    ),
+                    opt(
+                        "dry_run",
+                        Bool,
+                        "resolve the target and report it without pushing · default false",
+                    ),
+                ]),
             ),
             ActionSpec::scaffold(
                 "smoke",
@@ -1166,15 +1299,27 @@ static REGISTRY: [ToolDescriptor; 19] = [
             ),
             ActionSpec::planned(
                 "canary",
-                "Shift traffic to a canary · ✗ implemented: returns 100 - percent, touches no router.",
+                "Shift traffic to a canary · ✗ implemented: requires a traffic router Pipeline neither owns nor can discover.",
             ),
             ActionSpec::planned(
                 "blue_green",
-                "Swap blue/green slots · ✗ implemented: flips a string, reads no live state.",
+                "Swap blue/green slots · ✗ implemented: requires a traffic router Pipeline neither owns nor can discover.",
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "diff",
-                "Diff deployed vs HEAD · ✗ implemented: the revision range is passed unexpanded, so git always fails and an empty log is reported as success.",
+                "List commits between the latest tag and HEAD · refuses when the repo carries no tag rather than reporting an empty log.",
+                Of(&[
+                    opt(
+                        "env",
+                        Str,
+                        "staging | production · default staging · label only",
+                    ),
+                    opt(
+                        "base",
+                        Str,
+                        "override the baseline tag · default latest tag",
+                    ),
+                ]),
             ),
         ],
     },
@@ -1235,56 +1380,78 @@ static REGISTRY: [ToolDescriptor; 19] = [
                     ),
                 ]),
             ),
-            ActionSpec::scaffold(
+            ActionSpec::real(
                 "compare",
-                "Emit side-by-side language histograms · ✗ branches on axis · every axis returns the same payload.",
+                "Diff two digested repos on a chosen axis · arch → dirs + languages · features → capability markers · standards → artifact presence.",
                 Of(&[
                     req("a", Str, "first digested alias"),
                     req("b", Str, "second digested alias"),
                     opt(
                         "axis",
                         Str,
-                        "echoed only · features | arch | standards · default arch",
+                        "arch | features | standards · default arch · unknown axis refused",
                     ),
                 ]),
             ),
             ActionSpec::planned(
                 "port",
-                "Port a repo to another language · ✗ implemented: returns a language histogram plus confidence from a hardcoded table · translates no code.",
+                "Port a repo to another language · ✗ implemented: translation is an agent task · use re_analyze + re_modernize for a plan grounded in real modules.",
             ),
             ActionSpec::real(
                 "port_validate",
                 "Spawn the pipeline binary · run the fast gate inside the ported path.",
                 Of(&[req("path", Str, "directory containing pipeline.yaml")]),
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "apply_standards",
-                "Standards compliance for a digested repo · ✗ implemented: the score is the fraction of four file-existence booleans, not compliance.",
+                "Resolve the real Standards corpus, route it by the repo's dominant language, return binding standards and their obligations · ! scores nothing, and says so.",
+                Of(&[
+                    req("alias", Str, "digested alias"),
+                    opt(
+                        "runtime",
+                        Str,
+                        "override language inference · rust | python | typescript | go | shell",
+                    ),
+                ]),
             ),
             ActionSpec::real(
                 "capability_graph",
                 "Build nodes + edges by reading every digest on disk.",
                 NoArgs,
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "re_analyze",
-                "Reverse-engineering analysis · ✗ implemented: writes a queued job no worker will ever process.",
+                "Scan a codebase synchronously · module boundaries · entry points · test layout · deps from real manifests · binary | service | infra types refused by name.",
+                Of(&[
+                    req("target", Str, "registered alias or filesystem path"),
+                    opt("type", Str, "codebase | auto · anything else refused"),
+                ]),
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "re_status",
-                "RE job status · ✗ implemented: echoes a job file nothing processes · status never advances.",
+                "Report a stored job's target, type, status, and whether it holds an analysis · analysis is synchronous, so a job never sits queued.",
+                Of(&[req("job_id", Str, "id returned by re_analyze")]),
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "re_report",
-                "RE report · ✗ implemented: overwrites status to complete and returns empty module map · contracts · patterns.",
+                "Return the analysis actually computed · refuses a job holding none · states what an empty module map does and does not mean.",
+                Of(&[req("job_id", Str, "id returned by re_analyze")]),
             ),
             ActionSpec::planned(
                 "re_reconstruct",
-                "Reconstruct api | schema | dockerfile · ✗ implemented: writes fixed template text · target appears only in a comment.",
+                "Reconstruct api | schema | dockerfile · ✗ implemented: introspects no target · needs observed traffic, a live DB, or image-layer inspection.",
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "re_modernize",
-                "Modernization plan · ✗ implemented: hardcoded phase list and fixed risk level for every input.",
+                "Phase plan derived from a job's real module map, tested-and-small first · risk signals are facts from the scan · refuses a job with no analysis.",
+                Of(&[
+                    req("job_id", Str, "id of a job holding an analysis"),
+                    opt(
+                        "target_stack",
+                        Str,
+                        "default: dominant source language of the analysis",
+                    ),
+                ]),
             ),
         ],
     },
@@ -1314,17 +1481,40 @@ static REGISTRY: [ToolDescriptor; 19] = [
                     opt("to", Str, "end ref · default HEAD"),
                 ]),
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "diagram",
-                "Diagram the caller's architecture · ✗ implemented: writes a hardcoded diagram of Pipeline's own architecture for every project, parses nothing.",
+                "Derive a crate dependency graph from the project's own manifests as mermaid · non-Rust stacks and sequence/er/c4 kinds are refused, ✗ invented.",
+                Of(&[
+                    opt("kind", Str, "arch | crates · default arch"),
+                    opt("out", Str, "output file · default docs/diagrams/crates.mmd"),
+                    opt(
+                        "overwrite",
+                        Bool,
+                        "replace an existing diagram · default false",
+                    ),
+                ]),
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "publish",
-                "Publish docs to a hosting target · ✗ implemented: nothing is ever published, target echoed and unused, a missing toolchain is swallowed into success.",
+                "Build the docs site locally and report its path and file count · ! ✗ pushes anywhere · a missing toolchain is an error, ✗ silent success.",
+                Of(&[
+                    opt("target", Str, "local · the only supported value"),
+                    opt("out", Str, "output directory · default site"),
+                ]),
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "spec_generate",
-                "Derive an API spec from source · ✗ implemented: source echoed but never opened; emits a fabricated endpoint that then feeds contract tests as a fabricated gate.",
+                "Derive OpenAPI 3.1 from real axum route registrations in Rust source · unparsed registrations reported · ✗ emits a spec when nothing was found.",
+                Of(&[
+                    req("source", Str, "directory of Rust sources to scan"),
+                    opt("format", Str, "openapi · the only supported value"),
+                    opt("out", Str, "output file · default specs/openapi.yaml"),
+                    opt(
+                        "overwrite",
+                        Bool,
+                        "replace an existing spec · default false",
+                    ),
+                ]),
             ),
         ],
     },
@@ -1392,21 +1582,53 @@ static REGISTRY: [ToolDescriptor; 19] = [
                     opt("count", Int, "record count · default 10"),
                 ]),
             ),
-            ActionSpec::planned(
+            ActionSpec::scaffold(
                 "etl_create",
-                "Scaffold an ETL job · ✗ implemented: query and sink table are hardcoded regardless of input.",
+                "Render the caller's ETL job spec to YAML · refuses to overwrite · ! Pipeline ✗ executes the job.",
+                Of(&[
+                    req("source", Obj, "{type, url_env, table | query}"),
+                    req("sink", Obj, "{type, url_env, table}"),
+                    opt("name", Str, "job name · default etl_job"),
+                    opt("path", Str, "output file · default etl/<name>.yaml"),
+                    opt("transform", List, "transform step strings"),
+                    opt("schedule", Str, "cron expression"),
+                ]),
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "quality_check",
-                "Check data quality · ✗ implemented: writes two fixed SQL strings, never connects, never executes, checks nothing.",
+                "Execute assertions against a live database and fail the call on any violation · refuses without a dsn.",
+                Of(&[
+                    req("dsn", Str, "postgres connection string"),
+                    req(
+                        "checks",
+                        List,
+                        "each {table, column, assert: not_null | unique | range | referenced, min?, max?, references?}",
+                    ),
+                ]),
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "db_diff",
-                "Diff two database schemas · ✗ implemented: connection strings are passed unexpanded so the tool can never connect, and a spawn failure is reported as success.",
+                "Diff two live schemas via migra · a missing scanner or unset env var is UNKNOWN, ✗ a clean diff.",
+                Of(&[
+                    opt("dsn_a", Str, "first DSN · one of dsn_a | env_a required"),
+                    opt("env_a", Str, "environment name → reads DATABASE_URL_<ENV>"),
+                    opt("dsn_b", Str, "second DSN · one of dsn_b | env_b required"),
+                    opt("env_b", Str, "environment name → reads DATABASE_URL_<ENV>"),
+                ]),
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "anonymize",
-                "Anonymize a dump · ✗ implemented: writes a rules file and echoes source/target · neither file is ever opened.",
+                "Rewrite a CSV or pg_dump applying per-column strategies · reports how many values each rule changed · refuses without rules.",
+                Of(&[
+                    req("source", Str, "input file"),
+                    req("target", Str, "output file · refuses to overwrite"),
+                    req(
+                        "rules",
+                        Obj,
+                        "column → redact | hash | fake_email | fake_name | null | preserve · ! hash is pseudonymisation, ✗ anonymisation",
+                    ),
+                    opt("format", Str, "csv | sql · default inferred from extension"),
+                ]),
             ),
         ],
     },
@@ -1438,19 +1660,34 @@ static REGISTRY: [ToolDescriptor; 19] = [
                 "Append a Prometheus rule to the alerts file · ✗ validates expr.",
                 Of(&[req("rule", Str, "PromQL expression")]),
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "perf_baseline",
-                "Measure and record a performance baseline · ✗ implemented: stores whatever metrics the caller passes, defaulting to an empty object, so no regression can ever be detected.",
+                "Measure a baseline from recorded passing stage durations · refuses on short history and says how many more runs are needed.",
+                Of(&[
+                    opt("suite", Str, "baseline key · default default"),
+                    opt("profile", Str, "filter samples by run profile"),
+                    opt("stages", List, "stage names · default every observed stage"),
+                    opt(
+                        "min_runs",
+                        Int,
+                        "samples required before a baseline is stored · default 3",
+                    ),
+                ]),
             ),
             ActionSpec::real(
                 "perf_compare",
-                "Diff supplied metrics against the stored baseline · per-key delta + pct.",
+                "Compare against the stored baseline · fails the call when any metric regresses beyond threshold.",
                 Of(&[
                     opt("suite", Str, "baseline key · default default"),
                     opt(
                         "metrics",
                         Obj,
-                        "current numeric readings · compared per shared key",
+                        "current readings · absent → measured from run history like the baseline",
+                    ),
+                    opt(
+                        "threshold_pct",
+                        Num,
+                        "regression tolerance percent · default 10",
                     ),
                 ]),
             ),
@@ -1517,9 +1754,14 @@ static REGISTRY: [ToolDescriptor; 19] = [
                 "Write a STRIDE threat-model skeleton · ✗ reads your code.",
                 Of(&[opt("scope", Str, "heading text only · default application")]),
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "compliance_check",
-                "Gap-analyse against a compliance framework · ✗ implemented: framework is never branched on, so hipaa | pci_dss | gdpr all score identically from five file-existence checks.",
+                "Assess against the routed Standards corpus · obligations returned unscored for the agent to adjudicate · ! every regulatory framework is refused by name, ✗ scored.",
+                Of(&[opt(
+                    "framework",
+                    Str,
+                    "standards · hipaa | pci_dss | gdpr | iso27001 | soc2 | owasp are refused with a reason",
+                )]),
             ),
         ],
     },
@@ -1625,12 +1867,20 @@ static REGISTRY: [ToolDescriptor; 19] = [
             ),
             ActionSpec::real(
                 "config_get",
-                "Read pipeline.yaml gates and stack · omit key → whole config.",
+                "Read pipeline.yaml · omit key → whole config · symmetric with config_set.",
                 Of(&[opt("key", Str, "single key · omit → entire config")]),
             ),
-            ActionSpec::planned(
+            ActionSpec::real(
                 "config_set",
-                "Change project configuration · ✗ effective: writes a file nothing reads; the live config is pipeline.yaml, so every change alters no gate, stage, or deploy.",
+                "Change configuration in pipeline.yaml · dotted keys · comments preserved · refuses an unknown key or a write that would not read back.",
+                Of(&[
+                    req(
+                        "key",
+                        Str,
+                        "dotted path · gates.coverage | stack.runtime · unknown keys refused with the settable list",
+                    ),
+                    req("value", Any, "type checked against the schema for that key"),
+                ]),
             ),
             ActionSpec::real(
                 "self_check",
@@ -1826,7 +2076,7 @@ mod tests {
         }
         assert_eq!(
             (real, scaffold, planned),
-            (120, 20, 35),
+            (148, 20, 7),
             "fidelity split moved · update the fidelity doc too"
         );
         assert_eq!(real + scaffold + planned, 175, "action count drift");

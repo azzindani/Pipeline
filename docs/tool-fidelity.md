@@ -31,7 +31,7 @@ this" must never collapse into "I determined it is fine."
 | **Scaffold** | Writes a template, skeleton, or fixture · ✗ reads · ✗ analyzes your project | Useful as a starting point, worthless as a finding. Badged `[scaffold]` in `tools/list` |
 | **Planned** | Not implemented | Refused in `dispatch` **before the handler runs**. Badged `[planned]`, and the summary states what is missing |
 
-Current split: **120 Real · 20 Scaffold · 35 Planned**. The counts are pinned by
+Current split: **148 Real · 20 Scaffold · 7 Planned**. The counts are pinned by
 `registry::tests::the_fidelity_split_is_recorded` — a tripwire, not a target. If
 it moves, this table needs the same edit.
 
@@ -39,10 +39,10 @@ it moves, this table needs the same edit.
 
 The refusal lives in `dispatch::call_tool`, not in 35 handlers. Three reasons:
 
-- **Fixing handlers one at a time only refills.** Nothing stopped the 36th being
-  written. A central guard makes the marker self-enforcing: flipping an action
-  to `Real` is the only thing that lets its handler execute, so the marker
-  cannot drift from behaviour.
+- **Fixing handlers one at a time only refills.** Nothing stopped the next one
+  being written. A central guard makes the marker self-enforcing: flipping an
+  action to `Real` is the only thing that lets its handler execute, so the
+  marker cannot drift from behaviour.
 - **Some handlers are worse than useless when reached.** `e2e.record` spawned an
   interactive tool with no timeout and blocked forever — the conformance test
   hung on it before the guard existed. `docs.publish` swallowed a spawn failure
@@ -105,16 +105,38 @@ Declaring `Real` before the handler works fails the suite, which is the intent.
 
 ## Known gaps
 
-The 35 `Planned` actions are real capability gaps, not paperwork. The notable
-ones for end-to-end delivery:
+Seven actions remain `Planned`. Each was examined and refused deliberately —
+these are honest boundaries, not backlog.
 
-- **`deploy.rollback` · `canary` · `blue_green` · `diff`** — deployment beyond
-  `target` (image push) and `health` is not implemented. `rollback` previously
-  reported success having only run `git describe`.
-- **`repo.re_*`** — the entire reverse-engineering surface described in
-  CLAUDE.md is unimplemented. `re_analyze` wrote a job file no worker reads.
-- **`session.start`** — use `session.lock`, which is genuinely transactional and
-  survives process restart. `start` persisted no session row.
-- **`observe.perf_baseline`** — stored whatever metrics the caller passed, so
-  every regression gate built on it was inert.
-- **`data.anonymize` · `quality_check` · `db_diff` · `etl_create`**.
+| Action | Why it stays refused |
+|---|---|
+| `deploy.canary` · `deploy.blue_green` | Need a traffic router Pipeline neither owns nor can discover. Compose DNS round-robin only splits across replicas of the *same* service, so it cannot split between two *versions*; blue/green additionally requires reading live state from a router whose identity is unknown. Implementing either means inventing a topology and assuming the user has it |
+| `e2e.record` | `playwright codegen` is headed and interactive. An interactive recorder needs a display and a human at it — there is no honest synchronous MCP shape for it |
+| `env.devcontainer_open` | The VS Code URI authority is `dev-container+<hex-encoded-json>`, and that JSON is an internal structure of the Dev Containers extension whose fields change across releases. A guessed payload would resolve on one machine and fail silently everywhere else |
+| `repo.port` | Language translation is an agent task, not a tool task. A `Real` marker on an action *named* `port` would invite an agent to believe code was translated. Use `re_analyze` + `re_modernize` for a plan grounded in real modules |
+| `repo.re_reconstruct` | Introspects no target. OpenAPI needs observed traffic, schema needs a live DB connection, Dockerfile needs image-layer inspection — none are wired up |
+| `simulate.journey_simulate` | Executing a stored journey requires driving a real target; the current shape returns arithmetic over step counts |
+
+`re_analyze` is `Real` for `type=codebase` and **refuses `binary` / `service` /
+`infra` by name**, listing what each would require. Decompilation, live traffic
+capture, and cloud-state introspection are each a project, not a function.
+
+## Boundaries that are not gaps
+
+Some `Real` actions are deliberately narrower than their name. Each says so in
+its own summary, which is the contract:
+
+- `docs.publish` builds the site locally and **pushes nowhere**. `ok:true` means
+  "built at this path", and the payload carries `published: false`.
+- `data.etl_create` is `Scaffold`: it renders exactly the caller's spec, but no
+  runner consumes the file, so Pipeline executes nothing.
+- `security.compliance_check` assesses `standards` only and emits **no score at
+  all** — prose obligations are unscored by construction, and a number would be
+  the same fabrication in a new shape. `hipaa` · `pci_dss` · `gdpr` · `iso27001`
+  · `soc2` · `owasp` are refused by name with a reason.
+- `data.anonymize`'s `hash` strategy is pseudonymisation, not anonymisation —
+  deterministic so joins survive, which leaves low-entropy columns
+  re-identifiable. `redact` / `null` are the honest choices there.
+- `repo.apply_standards` returns binding standards and their obligations and
+  **scores nothing**, replacing a `score_percent` that was four file-existence
+  booleans labelled "compliance".

@@ -549,6 +549,116 @@ impl Memory {
         .await?;
         Ok(rows)
     }
+
+    // ---------- deployments ----------
+
+    /// Create the deployments table on demand.
+    ///
+    /// ! Lazy rather than in `schema.sql` so a memory.db written by an older
+    /// binary gains the table on first deploy · every read and write below
+    /// funnels through here, so the table cannot be missing at query time.
+    /// ✗ FOREIGN KEY on `project_id`: a deploy must be recordable in a repo
+    /// where no session ever registered the project, else rollback loses the
+    /// only history it has.
+    async fn ensure_deployments_table(&self) -> Result<(), MemoryError> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS deployments (
+                 id            TEXT PRIMARY KEY,
+                 project_id    TEXT NOT NULL,
+                 env           TEXT NOT NULL,
+                 kind          TEXT NOT NULL,
+                 image_ref     TEXT NOT NULL,
+                 image_digest  TEXT,
+                 commit_sha    TEXT,
+                 status        TEXT NOT NULL,
+                 deployed_at   TEXT NOT NULL,
+                 health_json   TEXT
+             )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_deployments_env
+             ON deployments(project_id, env, deployed_at DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record one deployment attempt · returns the row id.
+    ///
+    /// ! Failures are recorded too (`status != "success"`), so history shows
+    /// what was attempted; `rollback` filters to successes itself.
+    pub async fn record_deployment(&self, d: &NewDeployment<'_>) -> Result<String, MemoryError> {
+        self.ensure_deployments_table().await?;
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO deployments
+             (id, project_id, env, kind, image_ref, image_digest, commit_sha,
+              status, deployed_at, health_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(d.project_id)
+        .bind(d.env)
+        .bind(d.kind)
+        .bind(d.image_ref)
+        .bind(d.image_digest)
+        .bind(d.commit_sha)
+        .bind(d.status)
+        .bind(&now)
+        .bind(d.health_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Deployment history for one env · newest first · all statuses.
+    pub async fn deployment_history(
+        &self,
+        project_id: &str,
+        env: &str,
+        limit: i64,
+    ) -> Result<Vec<DeploymentRecord>, MemoryError> {
+        self.ensure_deployments_table().await?;
+        let rows: Vec<DeploymentRecord> = sqlx::query_as::<_, DeploymentRecord>(
+            "SELECT id, project_id, env, kind, image_ref, image_digest, commit_sha,
+                    status, deployed_at, health_json
+             FROM deployments WHERE project_id = ? AND env = ?
+             ORDER BY deployed_at DESC, rowid DESC LIMIT ?",
+        )
+        .bind(project_id)
+        .bind(env)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Most recent successful deployment for one env · `None` when the env has
+    /// never been deployed. ✗ `unwrap_or_default` at any call site: an
+    /// unreadable DB must not read as "never deployed".
+    pub async fn last_successful_deployment(
+        &self,
+        project_id: &str,
+        env: &str,
+    ) -> Result<Option<DeploymentRecord>, MemoryError> {
+        self.ensure_deployments_table().await?;
+        let row: Option<DeploymentRecord> = sqlx::query_as::<_, DeploymentRecord>(
+            "SELECT id, project_id, env, kind, image_ref, image_digest, commit_sha,
+                    status, deployed_at, health_json
+             FROM deployments
+             WHERE project_id = ? AND env = ? AND status = 'success'
+             ORDER BY deployed_at DESC, rowid DESC LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(env)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
 }
 
 /// Extract up to `n` distinctive keywords from an error message · strips
@@ -643,6 +753,39 @@ pub struct RunRecord {
     pub stdout: Option<String>,
     pub stderr: Option<String>,
     pub failure_json: Option<String>,
+}
+
+/// One deployment attempt · written by `pipeline_deploy.target` and by
+/// `rollback`, read by `rollback` to find where to go back to.
+#[derive(Debug, Clone, Copy)]
+pub struct NewDeployment<'a> {
+    pub project_id: &'a str,
+    pub env: &'a str,
+    /// `deploy` | `rollback` · distinguishes a forward release from a revert.
+    pub kind: &'a str,
+    /// What was pushed, as written · usually a mutable tag.
+    pub image_ref: &'a str,
+    /// ! Immutable `repo@sha256:...` · without it a later rollback can only
+    /// re-point a tag at whatever that tag means *now*, which is not a rollback.
+    pub image_digest: Option<&'a str>,
+    pub commit_sha: Option<&'a str>,
+    /// `success` | `failed`.
+    pub status: &'a str,
+    pub health_json: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DeploymentRecord {
+    pub id: String,
+    pub project_id: String,
+    pub env: String,
+    pub kind: String,
+    pub image_ref: String,
+    pub image_digest: Option<String>,
+    pub commit_sha: Option<String>,
+    pub status: String,
+    pub deployed_at: String,
+    pub health_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -1003,6 +1146,99 @@ mod tests {
             .await
             .unwrap();
         assert!(other.is_empty());
+    }
+
+    fn deployment<'a>(
+        env: &'a str,
+        image: &'a str,
+        digest: &'a str,
+        status: &'a str,
+    ) -> NewDeployment<'a> {
+        NewDeployment {
+            project_id: "p1",
+            env,
+            kind: "deploy",
+            image_ref: image,
+            image_digest: Some(digest),
+            commit_sha: None,
+            status,
+            health_json: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn deployments_round_trip_newest_first_and_scoped_by_env() {
+        let m = fresh().await;
+        m.record_deployment(&deployment(
+            "staging",
+            "app:latest",
+            "app@sha256:aa",
+            "success",
+        ))
+        .await
+        .unwrap();
+        m.record_deployment(&deployment(
+            "staging",
+            "app:latest",
+            "app@sha256:bb",
+            "success",
+        ))
+        .await
+        .unwrap();
+        m.record_deployment(&deployment(
+            "production",
+            "app:prod",
+            "app@sha256:cc",
+            "success",
+        ))
+        .await
+        .unwrap();
+
+        let hist = m.deployment_history("p1", "staging", 10).await.unwrap();
+        assert_eq!(
+            hist.len(),
+            2,
+            "production must not leak into staging history"
+        );
+        assert_eq!(hist[0].image_digest.as_deref(), Some("app@sha256:bb"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_deployment_is_never_the_last_successful_one() {
+        let m = fresh().await;
+        m.record_deployment(&deployment(
+            "staging",
+            "app:latest",
+            "app@sha256:aa",
+            "success",
+        ))
+        .await
+        .unwrap();
+        m.record_deployment(&deployment(
+            "staging",
+            "app:latest",
+            "app@sha256:bb",
+            "failed",
+        ))
+        .await
+        .unwrap();
+        let last = m
+            .last_successful_deployment("p1", "staging")
+            .await
+            .unwrap()
+            .expect("one success recorded");
+        assert_eq!(last.image_digest.as_deref(), Some("app@sha256:aa"));
+    }
+
+    #[tokio::test]
+    async fn an_env_never_deployed_reports_none_not_an_error() {
+        let m = fresh().await;
+        assert!(
+            m.last_successful_deployment("p1", "production")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

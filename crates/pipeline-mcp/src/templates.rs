@@ -24,6 +24,10 @@ pub enum InitError {
     NotEmpty(String),
     #[error("unknown template '{0}' · valid: {1}")]
     UnknownTemplate(String, String),
+    #[error("template registry: {0}")]
+    Registry(String),
+    #[error("template source unusable: {0}")]
+    Source(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,16 +112,7 @@ pub fn init_project_with(
     stack: &str,
     adopt: bool,
 ) -> Result<InitOutcome, InitError> {
-    let root = parent.join(name);
-    if root.exists() {
-        let mut rd = std::fs::read_dir(&root)?;
-        if rd.next().is_some() && !adopt {
-            return Err(InitError::NotEmpty(root.display().to_string()));
-        }
-    } else {
-        std::fs::create_dir_all(&root)?;
-    }
-
+    let root = prepare_root(parent, name, adopt)?;
     let template = template_or_default(template)?;
     let stack = if stack.is_empty() {
         infer_stack(template)
@@ -154,6 +149,192 @@ pub fn init_project_with(
         files_skipped: sc.skipped,
         adopted: adopt,
     })
+}
+
+// ---------- user-registered templates ----------
+
+/// A template the user registered · persisted in `.pipeline/templates/registry.json`.
+///
+/// `kind` is decided once, at registration, by the reachability check — ✗ re-sniffed
+/// at init. A source that was never validated is a template that fails at the moment
+/// the agent has already committed to it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisteredTemplate {
+    pub name: String,
+    /// Local directory | git URL, exactly as registered.
+    pub source: String,
+    /// `path` | `git`.
+    pub kind: String,
+    pub registered_at: String,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct RegistryFile {
+    #[serde(default)]
+    templates: Vec<RegisteredTemplate>,
+}
+
+pub fn registry_path(cwd: &Path) -> PathBuf {
+    cwd.join(".pipeline")
+        .join("templates")
+        .join("registry.json")
+}
+
+/// Read the registry · a missing or corrupt file reads as empty, ✗ as an error:
+/// the built-in templates must stay usable when the user registry is broken.
+pub fn load_registry(cwd: &Path) -> Vec<RegisteredTemplate> {
+    let Ok(text) = std::fs::read_to_string(registry_path(cwd)) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<RegistryFile>(&text)
+        .map(|f| f.templates)
+        .unwrap_or_default()
+}
+
+/// Insert or replace by name · returns true when an existing entry was replaced.
+///
+/// ! Upsert, ✗ append. The old implementation appended with no dedup, so two
+/// entries could share a name and nothing defined which one `init` would use.
+pub fn upsert_registered(cwd: &Path, entry: RegisteredTemplate) -> Result<bool, InitError> {
+    let mut all = load_registry(cwd);
+    let replaced = all.iter().any(|t| t.name == entry.name);
+    all.retain(|t| t.name != entry.name);
+    all.push(entry);
+    all.sort_by(|a, b| a.name.cmp(&b.name));
+    let path = registry_path(cwd);
+    if let Some(p) = path.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    let body = serde_json::to_string_pretty(&RegistryFile { templates: all })
+        .map_err(|e| InitError::Registry(e.to_string()))?;
+    std::fs::write(&path, body)?;
+    Ok(replaced)
+}
+
+pub fn find_registered(cwd: &Path, name: &str) -> Option<RegisteredTemplate> {
+    load_registry(cwd).into_iter().find(|t| t.name == name)
+}
+
+/// ! Built-ins win at `init` (see `template_or_default`), so a registered template
+/// shadowing one would silently never be used. Registration refuses the collision.
+pub fn is_builtin(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    TEMPLATES.iter().any(|(n, _)| *n == lower)
+}
+
+/// Never copied out of a template · build output and VCS/tool state belong to the
+/// source checkout, ✗ to the project being created from it.
+const COPY_SKIP: &[&str] = &[
+    ".git",
+    ".pipeline",
+    "target",
+    "node_modules",
+    ".venv",
+    "dist",
+    "build",
+    "__pycache__",
+];
+
+/// Instantiate a registered template from an already-materialized local directory.
+///
+/// Git sources are cloned by the caller · this function is pure filesystem work so
+/// the network path stays async and bounded in the handler.
+pub fn instantiate_registered(
+    parent: &Path,
+    name: &str,
+    template: &str,
+    source_dir: &Path,
+    stack: &str,
+    adopt: bool,
+) -> Result<InitOutcome, InitError> {
+    if !source_dir.is_dir() {
+        return Err(InitError::Source(format!(
+            "'{}' is not a directory",
+            source_dir.display()
+        )));
+    }
+    let root = prepare_root(parent, name, adopt)?;
+    // ! The template's own files always win · Pipeline fills the gaps afterwards.
+    // Scaffold runs in adopt mode regardless of the caller's flag: overwriting a
+    // template's Dockerfile with a generic one defeats the point of the template.
+    let mut sc = Scaffold::new(true);
+    copy_tree(source_dir, &root, &mut sc)?;
+
+    let stack = if stack.is_empty() {
+        "unknown".to_owned()
+    } else {
+        stack.to_owned()
+    };
+    write(&root, ".gitignore", GITIGNORE, &mut sc)?;
+    write(&root, "README.md", &readme(name, template), &mut sc)?;
+    write(
+        &root,
+        "pipeline.yaml",
+        &pipeline_yaml(name, &stack, "custom"),
+        &mut sc,
+    )?;
+    // ! A copied pipeline.yaml carries the TEMPLATE's project name · every memory
+    // row, report, and lock keys off `project`, so leaving it is silent corruption.
+    set_project_name(&root.join("pipeline.yaml"), name)?;
+
+    Ok(InitOutcome {
+        name: name.to_owned(),
+        template: template.to_owned(),
+        stack,
+        root,
+        files_written: sc.written,
+        files_skipped: sc.skipped,
+        adopted: adopt,
+    })
+}
+
+fn copy_tree(src: &Path, dst: &Path, sc: &mut Scaffold) -> Result<(), InitError> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        if COPY_SKIP.contains(&file_name.to_string_lossy().as_ref()) {
+            continue;
+        }
+        let to = dst.join(&file_name);
+        if entry.file_type()?.is_dir() {
+            std::fs::create_dir_all(&to)?;
+            copy_tree(&entry.path(), &to, sc)?;
+        } else if sc.adopt && to.exists() {
+            sc.skipped.push(to);
+        } else {
+            std::fs::copy(entry.path(), &to)?;
+            sc.push(to);
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite the top-level `project:` key · surgical, so template comments survive.
+fn set_project_name(path: &Path, name: &str) -> Result<(), InitError> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Ok(()); // no pipeline.yaml · nothing to rename
+    };
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    match lines.iter_mut().find(|l| l.starts_with("project:")) {
+        Some(line) => *line = format!("project: {name}"),
+        None => lines.insert(0, format!("project: {name}")),
+    }
+    std::fs::write(path, lines.join("\n") + "\n")?;
+    Ok(())
+}
+
+/// Create the project root, enforcing the empty-unless-adopt rule.
+fn prepare_root(parent: &Path, name: &str, adopt: bool) -> Result<PathBuf, InitError> {
+    let root = parent.join(name);
+    if root.exists() {
+        let mut rd = std::fs::read_dir(&root)?;
+        if rd.next().is_some() && !adopt {
+            return Err(InitError::NotEmpty(root.display().to_string()));
+        }
+    } else {
+        std::fs::create_dir_all(&root)?;
+    }
+    Ok(root)
 }
 
 // ---------- per-template scaffolding ----------
@@ -534,5 +715,159 @@ mod tests {
         let dir = tempdir().unwrap();
         let outcome = init_project(dir.path(), "x", "", "").unwrap();
         assert_eq!(outcome.template, "custom");
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn entry(name: &str, source: &str) -> RegisteredTemplate {
+        RegisteredTemplate {
+            name: name.to_owned(),
+            source: source.to_owned(),
+            kind: "path".to_owned(),
+            registered_at: "2026-07-20T00:00:00Z".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_registered_template_survives_a_round_trip() {
+        let dir = tempdir().unwrap();
+        assert!(load_registry(dir.path()).is_empty());
+        assert!(!upsert_registered(dir.path(), entry("svc", "/srv/tpl")).unwrap());
+        let found = find_registered(dir.path(), "svc").expect("registered");
+        assert_eq!(found.source, "/srv/tpl");
+        assert_eq!(found.kind, "path");
+    }
+
+    #[test]
+    fn re_registering_a_name_replaces_it_rather_than_appending() {
+        // Regression: entries were appended with no dedup, so two rows could share a
+        // name and nothing defined which one init would pick.
+        let dir = tempdir().unwrap();
+        upsert_registered(dir.path(), entry("svc", "/old")).unwrap();
+        assert!(upsert_registered(dir.path(), entry("svc", "/new")).unwrap());
+        let all = load_registry(dir.path());
+        assert_eq!(all.len(), 1, "duplicate name persisted: {all:?}");
+        assert_eq!(all[0].source, "/new");
+    }
+
+    #[test]
+    fn a_corrupt_registry_does_not_break_the_built_ins() {
+        // ! The built-in templates must stay usable when the user registry is junk.
+        let dir = tempdir().unwrap();
+        let path = registry_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{ not json").unwrap();
+        assert!(load_registry(dir.path()).is_empty());
+        assert!(is_builtin("cli-rust"));
+    }
+
+    #[test]
+    fn built_ins_are_recognized_case_insensitively() {
+        assert!(is_builtin("cli-rust"));
+        assert!(is_builtin("CLI-Rust"));
+        assert!(!is_builtin("my-template"));
+    }
+
+    #[test]
+    fn a_registered_template_is_instantiated_for_real() {
+        // The loop that was open: register → list → init. This is the init half —
+        // the template's own files land in the new project.
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("tpl");
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        std::fs::create_dir_all(source.join(".git")).unwrap();
+        std::fs::write(source.join("src/app.py"), "print('hi')\n").unwrap();
+        std::fs::write(source.join("Dockerfile"), "FROM python:3.12\n").unwrap();
+        std::fs::write(source.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let parent = dir.path().join("out");
+        std::fs::create_dir_all(&parent).unwrap();
+        let outcome =
+            instantiate_registered(&parent, "myapp", "py-svc", &source, "python-uv", false)
+                .expect("instantiate");
+
+        let root = parent.join("myapp");
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/app.py")).unwrap(),
+            "print('hi')\n"
+        );
+        assert!(root.join("Dockerfile").is_file());
+        // ✗ carry the template's VCS state into the new project.
+        assert!(!root.join(".git").exists(), "source .git was copied");
+        assert_eq!(outcome.template, "py-svc");
+        assert_eq!(outcome.stack, "python-uv");
+
+        // Pipeline filled the gap the template left.
+        let cfg = pipeline_config::PipelineConfig::parse(
+            &std::fs::read_to_string(root.join("pipeline.yaml")).unwrap(),
+        )
+        .expect("parses");
+        assert_eq!(cfg.project, "myapp");
+        assert_eq!(cfg.stack.runtime, "python-uv");
+    }
+
+    #[test]
+    fn a_template_that_ships_its_own_config_keeps_it_but_gets_the_new_name() {
+        // ! A copied pipeline.yaml carries the TEMPLATE's project name · every memory
+        // row and lock keys off `project`, so leaving it is silent corruption.
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("tpl");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("pipeline.yaml"),
+            "# template config · keep this comment\nproject: TEMPLATE\nversion: 2.0.0\nstack:\n  runtime: go\n\ngates:\n  coverage: 90\n",
+        )
+        .unwrap();
+
+        let parent = dir.path().join("out");
+        std::fs::create_dir_all(&parent).unwrap();
+        instantiate_registered(&parent, "myapp", "go-svc", &source, "", false)
+            .expect("instantiate");
+
+        let text = std::fs::read_to_string(parent.join("myapp/pipeline.yaml")).unwrap();
+        let cfg = pipeline_config::PipelineConfig::parse(&text).expect("parses");
+        assert_eq!(cfg.project, "myapp", "project name not rewritten");
+        assert_eq!(
+            cfg.gates.coverage,
+            Some(90),
+            "template's gate was clobbered"
+        );
+        assert_eq!(cfg.stack.runtime, "go", "template's stack was clobbered");
+        assert!(text.contains("# template config"), "comment lost:\n{text}");
+    }
+
+    #[test]
+    fn instantiating_into_a_non_empty_root_is_refused_unless_adopting() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("tpl");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("a.txt"), "from template\n").unwrap();
+
+        let parent = dir.path().join("out");
+        std::fs::create_dir_all(parent.join("myapp")).unwrap();
+        std::fs::write(parent.join("myapp/a.txt"), "mine\n").unwrap();
+
+        let refused = instantiate_registered(&parent, "myapp", "t", &source, "", false);
+        assert!(matches!(refused, Err(InitError::NotEmpty(_))));
+
+        // Adopt fills gaps and ✗ clobbers what is already there.
+        instantiate_registered(&parent, "myapp", "t", &source, "", true).expect("adopt");
+        assert_eq!(
+            std::fs::read_to_string(parent.join("myapp/a.txt")).unwrap(),
+            "mine\n"
+        );
+    }
+
+    #[test]
+    fn a_source_that_is_not_a_directory_is_refused() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("not-a-tree");
+        std::fs::write(&file, "x").unwrap();
+        let e = instantiate_registered(dir.path(), "p", "t", &file, "", false);
+        assert!(matches!(e, Err(InitError::Source(_))), "{e:?}");
     }
 }
