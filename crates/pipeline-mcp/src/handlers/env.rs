@@ -231,21 +231,89 @@ async fn create(args: &Value) -> ToolResponse {
     }
 }
 
+/// Install dependencies · **add** named packages, or sync what is declared.
+///
+/// ! `packages` used to be ignored entirely: every stack ran its sync command
+/// (`cargo fetch`, `npm install`) and reported `ok` with exit 0, so asking to
+/// add a crate was a silent no-op that looked like success. Named packages now
+/// run the stack's *add* command, and `manifest` targets one workspace member.
 async fn deps_install(args: &Value) -> ToolResponse {
     let stack = args.get("stack").and_then(Value::as_str).unwrap_or("rust");
     let cwd = match std::env::current_dir() {
         Ok(p) => p,
         Err(e) => return err(format!("cwd: {e}")),
     };
-    let (program, cmd_args): (&str, Vec<&str>) = match stack {
-        "rust" => ("cargo", vec!["fetch"]),
-        "node" | "ts" | "typescript" => ("npm", vec!["install"]),
-        "bun" => ("bun", vec!["install"]),
-        "python" | "python-uv" | "uv" => ("uv", vec!["sync"]),
-        "go" | "golang" => ("go", vec!["mod", "download"]),
-        other => return err(format!("unsupported stack '{other}'")),
+    let packages: Vec<String> = args
+        .get("packages")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    // Which member of a workspace · ignored by stacks with a single manifest.
+    let manifest = args.get("manifest").and_then(Value::as_str);
+
+    let mut cmd_args: Vec<String> = Vec::new();
+    let program = match (stack, packages.is_empty()) {
+        ("rust", true) => {
+            cmd_args.push("fetch".into());
+            "cargo"
+        }
+        ("rust", false) => {
+            cmd_args.push("add".into());
+            cmd_args.extend(packages.iter().cloned());
+            if let Some(m) = manifest {
+                cmd_args.push("--manifest-path".into());
+                cmd_args.push(m.to_owned());
+            }
+            "cargo"
+        }
+        ("node" | "ts" | "typescript", empty) => {
+            cmd_args.push("install".into());
+            if !empty {
+                cmd_args.extend(packages.iter().cloned());
+            }
+            "npm"
+        }
+        ("bun", true) => {
+            cmd_args.push("install".into());
+            "bun"
+        }
+        ("bun", false) => {
+            cmd_args.push("add".into());
+            cmd_args.extend(packages.iter().cloned());
+            "bun"
+        }
+        ("python" | "python-uv" | "uv", true) => {
+            cmd_args.push("sync".into());
+            "uv"
+        }
+        ("python" | "python-uv" | "uv", false) => {
+            cmd_args.push("add".into());
+            cmd_args.extend(packages.iter().cloned());
+            "uv"
+        }
+        ("go" | "golang", true) => {
+            cmd_args.extend(["mod".to_owned(), "download".to_owned()]);
+            "go"
+        }
+        ("go" | "golang", false) => {
+            cmd_args.push("get".into());
+            cmd_args.extend(packages.iter().cloned());
+            "go"
+        }
+        (other, _) => return err(format!("unsupported stack '{other}'")),
     };
-    run_capture(program, &cmd_args, &cwd, &format!("deps_install({stack})")).await
+
+    let borrowed: Vec<&str> = cmd_args.iter().map(String::as_str).collect();
+    let label = if packages.is_empty() {
+        format!("deps_install({stack})")
+    } else {
+        format!("deps_install({stack}) + {}", packages.join(" "))
+    };
+    run_capture(program, &borrowed, &cwd, &label).await
 }
 
 async fn deps_audit() -> ToolResponse {

@@ -330,18 +330,35 @@ fn integration_test_template(target: &str) -> String {
     )
 }
 
+/// One `#[test]` per acceptance criterion, each `#[ignore]`d until implemented.
+///
+/// ! `#[ignore]`, ✗ a bare `todo!()`. A panicking body turns the whole gate red
+/// the instant this tool is called, so scaffolding one feature blocks every
+/// unrelated change until every criterion is written. Ignored tests keep the
+/// gate honest AND visible: `cargo test` reports them as ignored, and deleting
+/// the attribute is the act of claiming the criterion.
 fn render_ac_tests(feature_name: &str, criteria: &[String]) -> String {
     let mut out = format!(
-        "//! Acceptance tests for feature `{feature_name}` · scaffolded by\n//! pipeline_test.ac_to_test. Replace `todo!()` with real assertions.\n\n"
+        "//! Acceptance tests for feature `{feature_name}` · scaffolded by\n\
+         //! pipeline_test.ac_to_test.\n\
+         //!\n\
+         //! Each test is #[ignore]d until its criterion is implemented. Write the\n\
+         //! assertion, delete the #[ignore], and the gate starts enforcing it.\n\n"
     );
     for (i, criterion) in criteria.iter().enumerate() {
         let test_name = format!("ac_{:02}_{}", i + 1, slugify(criterion));
         let truncated: String = test_name.chars().take(80).collect();
         writeln!(out, "/// {criterion}").ok();
         writeln!(out, "#[test]").ok();
+        writeln!(out, "#[ignore = \"unimplemented acceptance criterion\"]").ok();
         writeln!(out, "fn {truncated}() {{").ok();
         writeln!(out, "    // criterion: {criterion}").ok();
-        writeln!(out, "    todo!(\"implement assertion for: {criterion}\");").ok();
+        writeln!(
+            out,
+            "    unimplemented!(\"assert: {}\");",
+            criterion.replace('"', "'")
+        )
+        .ok();
         writeln!(out, "}}\n").ok();
     }
     out
@@ -532,6 +549,30 @@ mod tests {
         assert!(out.contains("fn ac_01_valid_login"));
         assert!(out.contains("fn ac_02_rejects_bad_token"));
         assert_eq!(out.matches("#[test]").count(), 2);
+    }
+
+    #[test]
+    fn scaffolded_ac_tests_do_not_turn_the_gate_red() {
+        // Regression: a bare todo!() panics, so calling ac_to_test on one feature
+        // made `run.stage(fast)` fail until every criterion was implemented —
+        // blocking unrelated work. Ignored tests stay visible without blocking.
+        let out = render_ac_tests("auth", &["valid login".into()]);
+        assert!(out.contains("#[ignore"), "{out}");
+        assert!(!out.contains("todo!("), "todo! panics under cargo test");
+        // Count attribute LINES · the doc header mentions #[ignore] in prose too.
+        let attrs = out
+            .lines()
+            .filter(|l| l.trim_start().starts_with("#[ignore"))
+            .count();
+        assert_eq!(attrs, out.matches("#[test]").count());
+    }
+
+    #[test]
+    fn a_criterion_containing_quotes_still_emits_valid_rust() {
+        let out = render_ac_tests("x", &["rejects a \"bad\" token".into()]);
+        // The message is a Rust string literal · an unescaped quote would not compile.
+        let msg_line = out.lines().find(|l| l.contains("unimplemented!")).unwrap();
+        assert_eq!(msg_line.matches('"').count(), 2, "{msg_line}");
     }
 
     #[test]
