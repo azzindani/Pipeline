@@ -401,7 +401,7 @@ pipeline_task_context(description)
 
 ```
 pipeline_remember(key, value, scope)
-pipeline_recall(query)
+pipeline_recall(key, scope)
 pipeline_history(entity, limit?)
 pipeline_known_issues()
 pipeline_suggest_fix(error)
