@@ -4,6 +4,8 @@
 
 Audited: `crates/pipeline-mcp/src/auth.rs` (227 LOC) · `oauth.rs` (812) · `ratelimit.rs` (308).
 Standard: [security/TOKENS.md](https://github.com/azzindani/Standards/blob/main/security/TOKENS.md).
+Second pass adds OWASP ASVS 5.0 V9 (Self-contained Tokens) and V10 (OAuth and
+OIDC) read from the primary text, ✗ from summaries.
 
 ---
 
@@ -21,6 +23,7 @@ load-bearing.
 | 1 | Access-token TTL is 24 h against a ≤ 15 min ceiling for user-facing tokens | High · **fixed** |
 | 2 | Refresh-token reuse is rejected but the chain is not revoked | Medium · **fixed** |
 | 3 | No redaction rule at the logging boundary — relies on call sites | Low · open |
+| 4 | PKCE `code_challenge_method` fell back to `plain` | High · **fixed** |
 
 ---
 
@@ -102,7 +105,28 @@ leaking one requires deliberately unwrapping it.
 
 ---
 
-## 6. Not findings
+## 6. Finding 4 — PKCE downgraded to `plain` · High · fixed
+
+Found in the second pass, against the ASVS primary text rather than a summary.
+
+`code_challenge_method` was matched as `Some("S256") => sha256(verifier)` with a
+catch-all `_ => verifier` arm. The comment beside it said a plain challenge
+"proves nothing" — and the code then accepted one. With `plain`, the challenge
+equals the verifier, so anyone able to read the authorization request can
+complete the exchange: PKCE stops protecting against the interception it exists
+for.
+
+The metadata document advertises `S256` alone, so accepting `plain` meant
+honouring a downgrade the server never offered. ASVS 10.4.6 requires the
+authorization server to refuse it.
+
+**Fixed.** Non-`S256` methods, absent included, are refused with
+`invalid_request`. A test asserts the metadata advertises S256 only and that
+every other method takes the refusal path.
+
+---
+
+## 7. Not findings
 
 | Observation | Why it is fine |
 |---|---|
@@ -114,8 +138,9 @@ leaking one requires deliberately unwrapping it.
 
 ---
 
-## 7. Order
+## 8. Order
 
 1. ~~Finding 1~~ — done.
 2. ~~Finding 2~~ — done.
-3. Finding 3 — open · hardening against a leak that has not happened.
+3. ~~Finding 4~~ — done · found only against the primary text.
+4. Finding 3 — open · hardening against a leak that has not happened.
