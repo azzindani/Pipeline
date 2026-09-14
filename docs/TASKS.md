@@ -66,7 +66,7 @@ Blocked items name their blocker. ✗ mark a task done while its verification is
 
 ## 7. Done this session
 
-Pipeline 432 → 505 tests · fmt + clippy clean · `pipeline run fast` green. Standards 43 → 51 · `validate.py` 0 errors. Surface 195 actions / 19 tools, under the 200 ceiling.
+Pipeline 432 → 505 tests · fmt + clippy clean · `pipeline run fast` green. Standards 43 → 54 · `validate.py` · `--check-index` · markdownlint all clean. Surface 195 actions / 19 tools, under the 200 ceiling. Pipeline now routes 32 standards.
 
 | # | Task |
 |---|---|
@@ -98,3 +98,6 @@ Pipeline 432 → 505 tests · fmt + clippy clean · `pipeline run fast` green. S
 | 37 | `design/` producer–consumer completeness — an orphan read is a defect, ✗ an unfinished feature. Scanner run over the workspace: 221 public fields, 0 orphans |
 | 38 | `llm/` standard — `STANDARDS.md` (prompt artifacts · model pinning + migration · output contracts · degradation ladder · token cost) · `EVALUATION.md` (eval sets · graders · gates · adversarial cases) · `SAFETY.md` (injection · tool authorization · agent autonomy · prompt privacy) |
 | 39 | `repo.fleet_health` — every registered repo in one call: state · branch · uncommitted · last run + age · maturity · high findings · blocked tasks, loudest first. Audit and maturity run through the SAME functions the single-project actions use |
+| 40 | Standards: `testing/PROBES.md` · `observability/LOGS.md` · `database/ENGINES.md` — probes with response+log dual assertion · log store as a queryable database · PostgreSQL as the production default |
+| 41 | `index.json` regenerated (was stale by 1,224 lines, so no standard added this session was reaching Pipeline's router) · 26 markdownlint errors cleared — the `\|` density operator was splitting table cells |
+| 42 | Pipeline declares the `Persistent store` surface · `docs/adr/0001` records SQLite under the embedded exception the new engine standard requires |
