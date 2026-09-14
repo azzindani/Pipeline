@@ -20,6 +20,9 @@ pub async fn handle(req: ToolRequest, _state: Arc<ServerState>) -> ToolResponse 
         "template_list" => template_list(),
         "scaffold" => scaffold(&req.args),
         "template_register" => template_register(&req.args).await,
+        "devtool_add" => devtool_add(&req.args),
+        "devtool_list" => devtool_list(),
+        "devtool_run" => devtool_run(&req.args).await,
         other => err(format!("unknown action 'pipeline_project.{other}'")),
     }
 }
@@ -1269,5 +1272,172 @@ mod scaffold_tests {
         assert!(looks_like_git("/srv/templates/tpl.git"));
         assert!(!looks_like_git("/srv/templates/tpl"));
         assert!(!looks_like_git("./tpl"));
+    }
+}
+
+// ── project tools ───────────────────────────────────────────────────────────
+//
+// ! Pipeline HOSTS agent-authored tools · ✗ generates them (docs/MATURITY.md
+// §10.1). Generation needs domain knowledge Pipeline does not have and would
+// emit scaffolds. Pipeline validates the CONTRACT — name, entry point, declared
+// destructiveness — ✗ the logic.
+//
+// Conventions → `primitives/STANDARDS.md` §11: project-local and committed,
+// one documented entry point, destructive tools default to dry-run.
+
+/// Where the registry lives · committed with the project, ✗ in `.pipeline/`,
+/// which is Pipeline's own scratch and gitignored in most projects.
+fn devtools_path(cwd: &std::path::Path) -> std::path::PathBuf {
+    cwd.join("devtools.json")
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct DevTool {
+    name: String,
+    /// Command run from the project root.
+    entry: String,
+    description: String,
+    /// Mutates source | state · such a tool defaults to dry-run.
+    #[serde(default)]
+    destructive: bool,
+    registered_at: String,
+}
+
+fn load_devtools(cwd: &std::path::Path) -> Vec<DevTool> {
+    std::fs::read_to_string(devtools_path(cwd))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_devtools(cwd: &std::path::Path, tools: &[DevTool]) -> Result<(), String> {
+    let body = serde_json::to_string_pretty(tools).map_err(|e| e.to_string())?;
+    std::fs::write(devtools_path(cwd), body).map_err(|e| e.to_string())
+}
+
+/// Register a tool the agent wrote.
+fn devtool_add(args: &Value) -> ToolResponse {
+    let Some(name) = args.get("name").and_then(Value::as_str) else {
+        return err("missing 'name'".into());
+    };
+    let Some(entry) = args.get("entry").and_then(Value::as_str) else {
+        return err("missing 'entry' · the command that runs this tool".into());
+    };
+    // ! Required, ✗ defaulted. A tool that rewrites source and never said so is
+    // the one case where a wrong default does damage, so the caller declares it.
+    let Some(destructive) = args.get("destructive").and_then(Value::as_bool) else {
+        return err(
+            "missing 'destructive' · declare whether this tool mutates source or state".into(),
+        );
+    };
+    let Ok(cwd) = std::env::current_dir() else {
+        return err("cwd unavailable".into());
+    };
+
+    let mut tools = load_devtools(&cwd);
+    let replaced = tools.iter().any(|t| t.name == name);
+    tools.retain(|t| t.name != name);
+    tools.push(DevTool {
+        name: name.to_owned(),
+        entry: entry.to_owned(),
+        description: args
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        destructive,
+        registered_at: pipeline_memory::now_rfc3339(),
+    });
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    if let Err(e) = save_devtools(&cwd, &tools) {
+        return err(format!("write devtools.json: {e}"));
+    }
+    ToolResponse::ok(json!({
+        "name": name,
+        "entry": entry,
+        "destructive": destructive,
+        "replaced": replaced,
+        "path": devtools_path(&cwd).display().to_string(),
+    }))
+}
+
+fn devtool_list() -> ToolResponse {
+    let Ok(cwd) = std::env::current_dir() else {
+        return err("cwd unavailable".into());
+    };
+    let tools = load_devtools(&cwd);
+    ToolResponse::ok(json!({
+        "count": tools.len(),
+        "tools": tools,
+        "path": devtools_path(&cwd).display().to_string(),
+    }))
+}
+
+/// Execute a registered tool.
+///
+/// ! A destructive tool requires `confirm: true`. Dry-run is the default
+/// because the caller most likely to run one blind is an agent that has lost
+/// its context and is re-reading the registry.
+async fn devtool_run(args: &Value) -> ToolResponse {
+    let Some(name) = args.get("name").and_then(Value::as_str) else {
+        return err("missing 'name'".into());
+    };
+    let Ok(cwd) = std::env::current_dir() else {
+        return err("cwd unavailable".into());
+    };
+    let tools = load_devtools(&cwd);
+    let Some(tool) = tools.iter().find(|t| t.name == name) else {
+        let known: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        return err(format!(
+            "no tool '{name}' · registered: {}",
+            if known.is_empty() {
+                "none".to_owned()
+            } else {
+                known.join(" · ")
+            }
+        ));
+    };
+
+    let confirmed = args
+        .get("confirm")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if tool.destructive && !confirmed {
+        return ToolResponse::ok(json!({
+            "name": name,
+            "entry": tool.entry,
+            "dry_run": true,
+            "reason": "tool is declared destructive · pass confirm:true to execute",
+        }));
+    }
+
+    let extra = args.get("args").and_then(Value::as_str).unwrap_or("");
+    let command = if extra.is_empty() {
+        tool.entry.clone()
+    } else {
+        format!("{} {extra}", tool.entry)
+    };
+    let out = tokio::process::Command::new("sh")
+        .args(["-c", &command])
+        .current_dir(&cwd)
+        .output()
+        .await;
+    let Ok(out) = out else {
+        return err(format!("spawn '{command}' failed"));
+    };
+    ToolResponse {
+        // ! `ok` is whether the tool RAN · its exit code is the tool's verdict.
+        ok: true,
+        data: json!({
+            "name": name,
+            "command": command,
+            "dry_run": false,
+            "exit_code": out.status.code(),
+            "stdout": String::from_utf8_lossy(&out.stdout),
+            "stderr": String::from_utf8_lossy(&out.stderr),
+        }),
+        next_suggested: vec![],
+        memory_refs: vec![],
+        error: None,
     }
 }

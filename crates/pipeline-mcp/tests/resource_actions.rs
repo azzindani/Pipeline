@@ -50,6 +50,8 @@ async fn the_resource_actions_are_reachable_and_honest() {
     resource_measurement_records_real_numbers_and_compares_them().await;
     throttling_refuses_rather_than_mislabelling_an_unconstrained_run().await;
     maturity_is_derived_from_run_history().await;
+    devtools_are_hosted_and_destructive_ones_dry_run().await;
+    mode_set_records_the_project_mode().await;
 }
 
 /// Resource measurement, driven the way an agent would.
@@ -206,4 +208,133 @@ async fn maturity_is_derived_from_run_history() {
         present.is_empty(),
         "a failing run produced positive evidence: {present:?}"
     );
+}
+
+/// Project tools · hosted, ✗ generated.
+async fn devtools_are_hosted_and_destructive_ones_dry_run() {
+    let _dir = enter_project();
+    let state = Arc::new(ServerState::new());
+
+    let empty = call(&state, "pipeline_project", "devtool_list", json!({})).await;
+    assert_eq!(empty["count"].as_u64(), Some(0));
+
+    // ! `destructive` is required. Omitting it must fail rather than default —
+    // a tool that rewrites source and never said so is the one case where a
+    // wrong default does damage.
+    let undeclared = call_tool(
+        "pipeline_project",
+        ToolRequest {
+            action: "devtool_add".to_owned(),
+            args: json!({"name": "fmt", "entry": "echo formatted"}),
+        },
+        state.clone(),
+    )
+    .await;
+    assert!(!undeclared.ok, "destructive must be required");
+
+    call(
+        &state,
+        "pipeline_project",
+        "devtool_add",
+        json!({"name": "safe", "entry": "echo ran", "destructive": false}),
+    )
+    .await;
+    call(
+        &state,
+        "pipeline_project",
+        "devtool_add",
+        json!({"name": "rewrite", "entry": "echo rewrote", "destructive": true}),
+    )
+    .await;
+
+    let listed = call(&state, "pipeline_project", "devtool_list", json!({})).await;
+    assert_eq!(listed["count"].as_u64(), Some(2));
+
+    // Safe tool runs.
+    let ran = call(
+        &state,
+        "pipeline_project",
+        "devtool_run",
+        json!({"name": "safe"}),
+    )
+    .await;
+    assert_eq!(ran["dry_run"].as_bool(), Some(false));
+    assert_eq!(ran["exit_code"].as_i64(), Some(0));
+    assert!(ran["stdout"].as_str().is_some_and(|o| o.contains("ran")));
+
+    // Destructive tool dry-runs unless confirmed.
+    let dry = call(
+        &state,
+        "pipeline_project",
+        "devtool_run",
+        json!({"name": "rewrite"}),
+    )
+    .await;
+    assert_eq!(
+        dry["dry_run"].as_bool(),
+        Some(true),
+        "a destructive tool executed without confirmation: {dry}"
+    );
+
+    let confirmed = call(
+        &state,
+        "pipeline_project",
+        "devtool_run",
+        json!({"name": "rewrite", "confirm": true}),
+    )
+    .await;
+    assert_eq!(confirmed["dry_run"].as_bool(), Some(false));
+
+    // An unknown tool names what is registered rather than failing bare.
+    let missing = call_tool(
+        "pipeline_project",
+        ToolRequest {
+            action: "devtool_run".to_owned(),
+            args: json!({"name": "nope"}),
+        },
+        state,
+    )
+    .await;
+    let why = missing.error.unwrap_or_default();
+    assert!(why.contains("safe"), "error must list known tools: {why}");
+}
+
+/// Mode decides which gates apply.
+async fn mode_set_records_the_project_mode() {
+    let _dir = enter_project();
+    let state = Arc::new(ServerState::new());
+
+    let built = call(
+        &state,
+        "pipeline_plan",
+        "mode_set",
+        json!({"mode": "build"}),
+    )
+    .await;
+    assert_eq!(built["mode"].as_str(), Some("build"));
+
+    let maintained = call(
+        &state,
+        "pipeline_plan",
+        "mode_set",
+        json!({"mode": "maintain"}),
+    )
+    .await;
+    assert_eq!(maintained["previous"].as_str(), Some("build"));
+    assert_eq!(
+        maintained["gates"]["motion_compare"].as_str(),
+        Some("required"),
+        "maintain mode must require motion comparison: {maintained}"
+    );
+
+    let bogus = call_tool(
+        "pipeline_plan",
+        ToolRequest {
+            action: "mode_set".to_owned(),
+            args: json!({"mode": "vibes"}),
+        },
+        state,
+    )
+    .await;
+    assert!(!bogus.ok, "an unknown mode must be refused");
 }
