@@ -2089,6 +2089,15 @@ static REGISTRY: [ToolDescriptor; 19] = [
                 ]),
             ),
             ActionSpec::real(
+                "review_brief",
+                "Assemble review material · diff · size against code_review §2 · human-only paths. Material for a review, ✗ a review.",
+                Of(&[opt(
+                    "base",
+                    Str,
+                    "ref to diff against · default origin/main",
+                )]),
+            ),
+            ActionSpec::real(
                 "health",
                 "Project health in one call · last run, its AGE, consecutive failures, uncommitted files. Reports concerns, ✗ a quality verdict.",
                 NoArgs,
@@ -2292,9 +2301,9 @@ mod tests {
         }
         assert_eq!(
             (real, scaffold, planned),
-            (166, 20, 7),
+            (167, 20, 7),
             "fidelity split moved · update the fidelity doc too"
         );
-        assert_eq!(real + scaffold + planned, 193, "action count drift");
+        assert_eq!(real + scaffold + planned, 194, "action count drift");
     }
 }

@@ -18,6 +18,7 @@ pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
         "self_check" => self_check().await,
         "health" => health(state.clone()).await,
         "audit" => audit(state.clone()).await,
+        "review_brief" => review_brief(&req.args),
         "explain" => explain(&req.args),
         "config_get" => config_get(&req.args).await,
         "config_set" => config_set(&req.args).await,
@@ -617,6 +618,155 @@ fn stage_evidence_gaps(runs: &[pipeline_memory::RunRecord]) -> Vec<Value> {
         out.push(json!({ "area": "evidence", "severity": severity, "detail": detail }));
     }
     out
+}
+
+/// Assemble the material a reviewer needs · ✗ perform the review.
+///
+/// ! `code_review/STANDARDS.md` §12 is explicit: AI findings are suggestions,
+/// ✗ verdicts, and AI cannot approve. So this gathers — diff, size against the
+/// §2 thresholds, sensitive paths — and returns it for the reviewer to judge.
+/// A tool that returned findings here would be the thing §12 forbids, wearing a
+/// tool's authority.
+///
+/// ! Sensitive paths are flagged for HUMAN-ONLY review (§12), ✗ merely noted.
+/// Auth, crypto and financial logic is where an AI reviewer misses subtle flaws
+/// most expensively.
+fn review_brief(args: &Value) -> ToolResponse {
+    // code_review §2 · owner of PR size across the repo.
+    const LINES_TARGET: usize = 400;
+    const LINES_LIMIT: usize = 800;
+    const FILES_TARGET: usize = 10;
+    const FILES_LIMIT: usize = 20;
+
+    let base = args
+        .get("base")
+        .and_then(Value::as_str)
+        .unwrap_or("origin/main");
+
+    let Some(stat) = git_lines(&["diff", "--numstat", &format!("{base}...HEAD")]) else {
+        return err(format!(
+            "cannot diff against '{base}' · not a git repository, | the ref does not exist"
+        ));
+    };
+
+    let mut files: Vec<Value> = Vec::new();
+    let mut total_lines = 0usize;
+    // Generated and lock files are excluded from the size judgement by §2, and
+    // listed separately so their absence from the count is visible rather than
+    // silent.
+    let mut excluded: Vec<String> = Vec::new();
+    for line in &stat {
+        let cols: Vec<&str> = line.split('\t').collect();
+        let [added, removed, path] = cols[..] else {
+            continue;
+        };
+        let changed = added.parse::<usize>().unwrap_or(0) + removed.parse::<usize>().unwrap_or(0);
+        if is_size_exempt(path) {
+            excluded.push(path.to_owned());
+            continue;
+        }
+        total_lines += changed;
+        files.push(json!({ "path": path, "added": added, "removed": removed }));
+    }
+
+    let sensitive: Vec<&str> = files
+        .iter()
+        .filter_map(|f| f["path"].as_str())
+        .filter(|p| is_sensitive(p))
+        .collect();
+
+    let mut size_notes: Vec<String> = Vec::new();
+    if total_lines > LINES_LIMIT {
+        size_notes.push(format!(
+            "{total_lines} lines changed · over the {LINES_LIMIT} hard limit · split before review"
+        ));
+    } else if total_lines > LINES_TARGET {
+        size_notes.push(format!(
+            "{total_lines} lines changed · over the {LINES_TARGET} target · review will be slower and worse"
+        ));
+    }
+    if files.len() > FILES_LIMIT {
+        size_notes.push(format!(
+            "{} files · over the {FILES_LIMIT} hard limit",
+            files.len()
+        ));
+    } else if files.len() > FILES_TARGET {
+        size_notes.push(format!(
+            "{} files · over the {FILES_TARGET} target",
+            files.len()
+        ));
+    }
+
+    let commits = git_lines(&["rev-list", "--count", &format!("{base}..HEAD")])
+        .and_then(|l| l.first().and_then(|n| n.parse::<usize>().ok()));
+    if commits.is_some_and(|c| c > 10) {
+        size_notes.push(format!(
+            "{} commits · over the 10 limit · each commit should be one logical unit",
+            commits.unwrap_or_default()
+        ));
+    }
+
+    ToolResponse {
+        ok: true,
+        data: json!({
+            "base": base,
+            "files": files,
+            "files_changed": files.len(),
+            "lines_changed": total_lines,
+            "commits": commits,
+            "size_exempt": excluded,
+            "size_notes": size_notes,
+            // ! Named, ✗ reviewed. §12 puts these outside an AI reviewer's remit.
+            "human_only_paths": sensitive,
+            "checklist": "pipeline_standards.checklist · 15 rows mapped to their owning standard",
+            "note": "material for a review, ✗ a review · findings are the reviewer's to make (code_review §12)",
+        }),
+        next_suggested: vec!["pipeline_standards.checklist".into()],
+        memory_refs: vec![],
+        error: None,
+    }
+}
+
+/// Paths excluded from the size judgement by `code_review` §2.
+fn is_size_exempt(path: &str) -> bool {
+    const LOCKS: [&str; 6] = [
+        "Cargo.lock",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "poetry.lock",
+        "uv.lock",
+    ];
+    LOCKS.iter().any(|l| path.ends_with(l))
+        || path.contains("/generated/")
+        || path.contains("/migrations/")
+        || std::path::Path::new(path)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("snap"))
+}
+
+/// Code where `code_review` §12 requires a human reviewer.
+///
+/// ! Deliberately broad. A false positive costs one human read; a false
+/// negative sends auth or crypto through AI-only review, which is the outcome
+/// §12 exists to prevent.
+fn is_sensitive(path: &str) -> bool {
+    const MARKERS: [&str; 12] = [
+        "auth",
+        "oauth",
+        "token",
+        "secret",
+        "crypt",
+        "password",
+        "session",
+        "permission",
+        "payment",
+        "billing",
+        "invoice",
+        "ledger",
+    ];
+    let lower = path.to_lowercase();
+    MARKERS.iter().any(|m| lower.contains(m))
 }
 
 /// Run a git command, returning its stdout lines · `None` outside a repo.

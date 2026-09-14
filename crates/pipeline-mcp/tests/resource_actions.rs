@@ -54,6 +54,7 @@ async fn the_resource_actions_are_reachable_and_honest() {
     mode_set_records_the_project_mode().await;
     tasks_are_tracked_with_a_verifiable_done_condition().await;
     health_and_audit_report_gaps_without_grading().await;
+    review_brief_gathers_material_and_defers_the_judgement().await;
 }
 
 /// Resource measurement, driven the way an agent would.
@@ -463,5 +464,60 @@ async fn health_and_audit_report_gaps_without_grading() {
             .as_str()
             .is_some_and(|n| n.contains("✗ a quality verdict")),
         "audit must not present itself as a verdict: {audit}"
+    );
+}
+
+/// Review brief gathers · ✗ reviews.
+async fn review_brief_gathers_material_and_defers_the_judgement() {
+    // ! Builds its own two-commit repo rather than diffing the host checkout:
+    // the earlier helpers leave the process in a temp directory, and a test that
+    // depended on the surrounding repository would pass or fail by accident.
+    let dir = enter_project();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .expect("git");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "t@example.test"]);
+    git(&["config", "user.name", "test"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "base"]);
+    std::fs::write(dir.path().join("src_auth.rs"), "// token handling\n").expect("write");
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "add auth"]);
+
+    let state = Arc::new(ServerState::new());
+    let resp = call_tool(
+        "pipeline_meta",
+        ToolRequest {
+            action: "review_brief".to_owned(),
+            args: json!({"base": "HEAD~1"}),
+        },
+        state,
+    )
+    .await;
+
+    assert!(resp.ok, "review_brief failed: {:?}", resp.error);
+    let d = resp.data;
+
+    // ! The load-bearing assertion. code_review §12 forbids an AI reviewer
+    // returning verdicts, so this must never carry findings — only material.
+    assert!(
+        d.get("findings").is_none(),
+        "review_brief returned findings · §12 makes those the reviewer's: {d}"
+    );
+    assert!(
+        d["note"].as_str().is_some_and(|n| n.contains("✗ a review")),
+        "the brief must say what it is not: {d}"
+    );
+    assert!(d["files_changed"].is_number());
+    assert!(d["lines_changed"].is_number());
+    let human_only = d["human_only_paths"].as_array().expect("array");
+    assert!(
+        human_only.iter().any(|p| p.as_str() == Some("src_auth.rs")),
+        "a path naming auth must be flagged human-only (§12): {d}"
     );
 }
