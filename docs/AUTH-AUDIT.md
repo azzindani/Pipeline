@@ -24,6 +24,7 @@ load-bearing.
 | 2 | Refresh-token reuse is rejected but the chain is not revoked | Medium · **fixed** |
 | 3 | No redaction rule at the logging boundary — relies on call sites | Low · open |
 | 4 | PKCE `code_challenge_method` fell back to `plain` | High · **fixed** |
+| 5 | Authorization-code reuse refused but issued tokens not revoked | Medium · **fixed** |
 
 ---
 
@@ -126,7 +127,26 @@ every other method takes the refusal path.
 
 ---
 
-## 7. Not findings
+## 7. Finding 5 — code reuse refused, not revoked · Medium · fixed
+
+Found against ASVS V10, and it is the half-implementation
+[OAUTH.md §4](https://github.com/azzindani/Standards/blob/main/security/OAUTH.md#4-authorization-code)
+names as the most common one.
+
+The code was deleted on first read, so a second redemption failed — but whatever
+the first redemption minted stayed alive. When the attacker redeems first, those
+are precisely the grants to kill: refusing the replay alone leaves them holding
+a working session and hands the legitimate user an error message.
+
+**Fixed.** A redeemed code records the chain it produced; replaying it revokes
+that chain and logs `event = authorization_code_reuse`. Reuses the lineage
+machinery added for refresh tokens, which is why it was cheap. Two tests: a
+replay kills what the code minted, and an unknown code refuses without
+collateral damage.
+
+---
+
+## 8. Not findings
 
 | Observation | Why it is fine |
 |---|---|
@@ -138,9 +158,10 @@ every other method takes the refusal path.
 
 ---
 
-## 8. Order
+## 9. Order
 
 1. ~~Finding 1~~ — done.
 2. ~~Finding 2~~ — done.
 3. ~~Finding 4~~ — done · found only against the primary text.
-4. Finding 3 — open · hardening against a leak that has not happened.
+4. ~~Finding 5~~ — done.
+5. Finding 3 — open · hardening against a leak that has not happened.
