@@ -1,4 +1,6 @@
 //! `pipeline` binary · single entry point for CLI · MCP server · dev daemon.
+//!
+//! kind: composite
 
 use clap::{Parser, Subcommand};
 use pipeline_core::{StageProfile, StageStatus};

@@ -1,5 +1,7 @@
 //! Pipeline memory · `SQLite`-backed structured + KV store.
 //!
+//! kind: component
+//!
 //! Schema in `schema.sql` · CLAUDE.md §"Memory architecture" describes the
 //! three logical layers (structured · semantic · working). Day-2 ships the
 //! structured layer end-to-end; semantic (sqlite-vec) lands in MVP.
