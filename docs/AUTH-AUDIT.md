@@ -18,9 +18,9 @@ load-bearing.
 
 | # | Finding | Severity |
 |---|---|---|
-| 1 | Access-token TTL is 24 h against a ≤ 15 min ceiling for user-facing tokens | High |
-| 2 | Refresh-token reuse is rejected but the chain is not revoked | Medium |
-| 3 | No redaction rule at the logging boundary — relies on call sites | Low |
+| 1 | Access-token TTL is 24 h against a ≤ 15 min ceiling for user-facing tokens | High · **fixed** |
+| 2 | Refresh-token reuse is rejected but the chain is not revoked | Medium · **fixed** |
+| 3 | No redaction rule at the logging boundary — relies on call sites | Low · open |
 
 ---
 
@@ -61,9 +61,8 @@ stretched on top of a fix that had already landed.
 Consequence: a leaked access token is valid for a day, and revoking the refresh
 chain does nothing about it. The revocation story degrades to "wait".
 
-Fix: reduce to ≤ 15 min and let the rotating refresh grant do its job. The
-client already supports `refresh_token`; `expires_in` is published, so a
-conforming client refreshes on schedule. Persistence stays.
+**Fixed.** `ACCESS_TOKEN_TTL_MS` is now 15 min. The rotating refresh grant covers
+the gap, `expires_in` is published, and persistence stays.
 
 ---
 
@@ -78,9 +77,15 @@ Today a thief who replays a spent token gets `invalid_grant` — and the legitim
 holder, whose token was rotated out from under them, gets the same. Neither the
 operator nor the user learns that a replay happened.
 
-Fix: record a chain id across rotations; on presentation of a spent token,
-invalidate every live grant in that chain and log a distinct security event. The
-`invalid_grant` response to the caller stays generic, per §3.
+**Fixed.** Grants carry a chain id; rotation inherits it, fresh authorization
+starts a new one. A replayed spent token revokes every live grant in that
+lineage and logs `event = refresh_token_reuse`. The caller still gets a generic
+`invalid_grant`, per §3. The spent ledger is bounded (4096) — an unbounded one
+is the memory-exhaustion shape the DCR cap already guards against.
+
+Three tests: a replay kills the rotated-to access token, rotation stays in one
+lineage while fresh authorization starts its own, and revoking one chain leaves
+another principal's alive.
 
 ---
 
@@ -111,6 +116,6 @@ leaking one requires deliberately unwrapping it.
 
 ## 7. Order
 
-1. Finding 1 — one constant, immediate risk reduction.
-2. Finding 2 — chain tracking, the real security gap.
-3. Finding 3 — hardening against a leak that has not happened.
+1. ~~Finding 1~~ — done.
+2. ~~Finding 2~~ — done.
+3. Finding 3 — open · hardening against a leak that has not happened.

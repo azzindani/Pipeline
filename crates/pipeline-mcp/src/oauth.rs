@@ -16,9 +16,10 @@
 //!
 //! Why the grants have the lifetimes they do:
 //! - **auth code · 10 min, one-shot** — deleted on first read, pass or fail.
-//! - **access token · 24 h, persisted** — in-memory-only meant every container
-//!   bounce forced claude.ai to re-authorize from scratch. Folio hit this; we
-//!   inherit the fix rather than the bug.
+//! - **access token · 15 min, persisted** — persistence is what fixed the
+//!   container-bounce re-authorization (Folio hit it; we inherit the fix, ✗ the
+//!   bug). The lifetime is short because a leaked token must expire before it is
+//!   useful · the refresh grant below covers the gap.
 //! - **refresh token · 30 d, rotating** — without a refresh grant the client
 //!   must re-run the full authorize flow every 24 h ("asks auth every time").
 //!   Single-use: the presented one is invalidated as the new pair is minted.
@@ -42,9 +43,19 @@ use crate::auth::constant_time_eq;
 use crate::http_transport::AppState;
 
 const AUTH_CODE_TTL_MS: i64 = 10 * 60 * 1000;
-const ACCESS_TOKEN_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+/// ! 15 min, ✗ 24 h. `security/TOKENS.md` caps a user-facing access token at
+/// 15 minutes precisely so a leaked one expires before it is useful — at 24 h,
+/// revoking the refresh chain did nothing for a day and revocation degraded to
+/// "wait". The container-bounce problem that motivated the long TTL was already
+/// solved by persisting grants; the TTL was stretched on top of a landed fix.
+/// `expires_in` is published and the refresh grant rotates, so a conforming
+/// client refreshes on schedule rather than re-authorizing.
+const ACCESS_TOKEN_TTL_MS: i64 = 15 * 60 * 1000;
 const REFRESH_TOKEN_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const CLIENT_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// Ceiling on the spent-refresh ledger · an unbounded one is the same
+/// memory-exhaustion shape the DCR client cap already guards against.
+const SPENT_REFRESH_CAP: usize = 4096;
 const CLIENT_MAX: usize = 256;
 
 /// Pre-auth bodies are tiny (login form · code exchange · DCR JSON). Cap them
@@ -71,6 +82,16 @@ fn sha256_b64url(input: &str) -> String {
 struct Grant {
     principal: String,
     expires_at: i64,
+    /// Identifies the rotation lineage this grant belongs to · every pair minted
+    /// from a refresh inherits its predecessor's chain.
+    ///
+    /// ! This is what makes reuse actionable. Without it, replaying a spent
+    /// refresh token is merely rejected — the thief and the legitimate holder
+    /// get the same `invalid_grant`, and nobody learns a replay happened.
+    /// `Option` for backward compatibility: grants persisted before chains
+    /// existed deserialize with `None` and are treated as their own chain.
+    #[serde(default)]
+    chain: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +117,10 @@ pub struct OAuth {
     codes: Mutex<HashMap<String, AuthCode>>,
     access: Mutex<HashMap<String, Grant>>,
     refresh: Mutex<HashMap<String, Grant>>,
+    /// Consumed refresh token → its chain. Memory-only and bounded: this exists
+    /// to recognise a replay, ✗ to be durable. Losing it on restart costs one
+    /// missed detection, ✗ correctness.
+    spent_refresh: Mutex<HashMap<String, String>>,
     clients: Mutex<HashMap<String, Client>>,
     /// Seeded from env · never evicted by the DCR reaper.
     static_client_id: String,
@@ -128,6 +153,7 @@ impl OAuth {
             codes: Mutex::new(HashMap::new()),
             access: Mutex::new(load_store(&state_dir.join("access-tokens.json"))),
             refresh: Mutex::new(load_store(&state_dir.join("refresh-tokens.json"))),
+            spent_refresh: Mutex::new(HashMap::new()),
             clients: Mutex::new(clients),
             state_dir,
             static_client_id,
@@ -201,11 +227,60 @@ impl OAuth {
         }
     }
 
+    /// Kill every live grant in a rotation lineage · returns how many died.
+    ///
+    /// ! Called when a spent refresh token is replayed. The standard treats
+    /// reuse as theft, ✗ as a mistake: the thief and the legitimate holder both
+    /// lose access, and the user re-authorizes. That is the intended outcome —
+    /// the alternative leaves a thief holding a working chain.
+    fn revoke_chain(&self, chain: &str) -> usize {
+        let mut killed = 0;
+        if let Ok(mut m) = self.access.lock() {
+            let before = m.len();
+            m.retain(|_, g| g.chain.as_deref() != Some(chain));
+            killed += before - m.len();
+            persist(&self.access_file(), &m);
+        }
+        if let Ok(mut m) = self.refresh.lock() {
+            let before = m.len();
+            m.retain(|_, g| g.chain.as_deref() != Some(chain));
+            killed += before - m.len();
+            persist(&self.refresh_file(), &m);
+        }
+        killed
+    }
+
+    /// Chain a spent refresh token belonged to, if it is still known.
+    fn chain_of_spent(&self, token: &str) -> Option<String> {
+        self.spent_refresh
+            .lock()
+            .ok()
+            .and_then(|m| m.get(token).cloned())
+    }
+
+    /// Remember that a refresh token was consumed, so a later replay is
+    /// recognisable as reuse rather than as an unknown token.
+    fn mark_spent(&self, token: &str, chain: Option<String>) {
+        let Some(chain) = chain else { return };
+        if let Ok(mut m) = self.spent_refresh.lock() {
+            // Bounded · a spent ledger that grows without limit is the same
+            // memory-exhaustion shape the DCR client cap already guards against.
+            if m.len() >= SPENT_REFRESH_CAP {
+                m.clear();
+            }
+            m.insert(token.to_owned(), chain);
+        }
+    }
+
     /// Mint an access + refresh pair and persist both.
-    fn issue_pair(&self, principal: &str, scope: &str) -> Value {
+    ///
+    /// `chain` carries the rotation lineage · `None` starts a new one, which is
+    /// correct for a fresh authorization and wrong for a refresh.
+    fn issue_pair(&self, principal: &str, scope: &str, chain: Option<String>) -> Value {
         let now = now_ms();
         let access_token = random_token();
         let refresh_token = random_token();
+        let chain = chain.unwrap_or_else(random_token);
 
         if let Ok(mut m) = self.access.lock() {
             m.insert(
@@ -213,6 +288,7 @@ impl OAuth {
                 Grant {
                     principal: principal.to_owned(),
                     expires_at: now + ACCESS_TOKEN_TTL_MS,
+                    chain: Some(chain.clone()),
                 },
             );
             persist(&self.access_file(), &m);
@@ -223,6 +299,7 @@ impl OAuth {
                 Grant {
                     principal: principal.to_owned(),
                     expires_at: now + REFRESH_TOKEN_TTL_MS,
+                    chain: Some(chain.clone()),
                 },
             );
             persist(&self.refresh_file(), &m);
@@ -565,14 +642,30 @@ pub async fn token(State(st): State<AppState>, Form(f): Form<HashMap<String, Str
             })
         });
         let Some(rec) = rec.filter(|r| r.expires_at > now_ms()) else {
+            // ! Reuse of a token we know was already spent is theft, ✗ a
+            // mistake: the legitimate holder rotated it away, so whoever is
+            // presenting it now got it some other way. Kill the whole lineage.
+            // Both parties lose access and the user re-authorizes — the
+            // alternative leaves a thief holding a working chain.
+            if let Some(chain) = st.oauth.chain_of_spent(presented) {
+                let killed = st.oauth.revoke_chain(&chain);
+                tracing::warn!(
+                    event = "refresh_token_reuse",
+                    grants_revoked = killed,
+                    "spent refresh token replayed · revoked the chain"
+                );
+            }
+            // ! Response stays generic · TOKENS.md §3. The log says what
+            // happened; the caller learns only that the grant is invalid.
             return oauth_err(
                 StatusCode::BAD_REQUEST,
                 "invalid_grant",
                 "Refresh token is missing, expired, or already used.",
             );
         };
+        st.oauth.mark_spent(presented, rec.chain.clone());
         let scope = f.get("scope").map_or("mcp", String::as_str);
-        return Json(st.oauth.issue_pair(&rec.principal, scope)).into_response();
+        return Json(st.oauth.issue_pair(&rec.principal, scope, rec.chain)).into_response();
     }
 
     if grant != "authorization_code" {
@@ -647,7 +740,8 @@ pub async fn token(State(st): State<AppState>, Form(f): Form<HashMap<String, Str
     }
 
     let scope = record.scope.as_deref().unwrap_or("mcp");
-    Json(st.oauth.issue_pair(&record.principal, scope)).into_response()
+    // Fresh authorization starts a new lineage.
+    Json(st.oauth.issue_pair(&record.principal, scope, None)).into_response()
 }
 
 #[cfg(test)]
@@ -717,9 +811,105 @@ mod tests {
     }
 
     #[test]
+    fn replaying_a_spent_refresh_token_kills_the_whole_chain() {
+        // ! Reuse is theft, ✗ a mistake. The legitimate holder rotated this
+        // token away, so whoever presents it now obtained it some other way —
+        // and leaving the rest of the lineage alive leaves the thief working
+        // credentials.
+        let o = oauth();
+        let first = o.issue_pair("alice", "mcp", None);
+        let spent = first["refresh_token"].as_str().unwrap().to_owned();
+
+        let chain = o
+            .refresh
+            .lock()
+            .unwrap()
+            .get(&spent)
+            .and_then(|g| g.chain.clone())
+            .expect("a fresh pair carries a chain");
+
+        // Normal rotation · the spent token is consumed and remembered.
+        o.refresh.lock().unwrap().remove(&spent);
+        o.mark_spent(&spent, Some(chain.clone()));
+        let second = o.issue_pair("alice", "mcp", Some(chain.clone()));
+        let live_access = second["access_token"].as_str().unwrap().to_owned();
+        assert_eq!(o.resolve(&live_access).as_deref(), Some("alice"));
+
+        // Replay → the chain dies, including the rotated-to access token.
+        assert_eq!(o.chain_of_spent(&spent).as_deref(), Some(chain.as_str()));
+        let killed = o.revoke_chain(&chain);
+        assert!(killed > 0, "revocation removed nothing");
+        assert_eq!(
+            o.resolve(&live_access),
+            None,
+            "the rotated-to access token survived a reuse revocation"
+        );
+    }
+
+    #[test]
+    fn rotation_carries_the_chain_and_fresh_authorization_starts_one() {
+        let o = oauth();
+        let a = o.issue_pair("alice", "mcp", None);
+        let a_chain = o
+            .refresh
+            .lock()
+            .unwrap()
+            .get(a["refresh_token"].as_str().unwrap())
+            .and_then(|g| g.chain.clone())
+            .expect("chain");
+
+        let rotated = o.issue_pair("alice", "mcp", Some(a_chain.clone()));
+        let rotated_chain = o
+            .refresh
+            .lock()
+            .unwrap()
+            .get(rotated["refresh_token"].as_str().unwrap())
+            .and_then(|g| g.chain.clone())
+            .expect("chain");
+        assert_eq!(rotated_chain, a_chain, "rotation must stay in one lineage");
+
+        let fresh = o.issue_pair("alice", "mcp", None);
+        let fresh_chain = o
+            .refresh
+            .lock()
+            .unwrap()
+            .get(fresh["refresh_token"].as_str().unwrap())
+            .and_then(|g| g.chain.clone())
+            .expect("chain");
+        assert_ne!(
+            fresh_chain, a_chain,
+            "a fresh authorization must start its own lineage · otherwise one \
+             reuse revokes unrelated sessions"
+        );
+    }
+
+    #[test]
+    fn revoking_one_chain_leaves_another_alive() {
+        let o = oauth();
+        let mine = o.issue_pair("alice", "mcp", None);
+        let theirs = o.issue_pair("bob", "mcp", None);
+        let their_access = theirs["access_token"].as_str().unwrap().to_owned();
+
+        let my_chain = o
+            .refresh
+            .lock()
+            .unwrap()
+            .get(mine["refresh_token"].as_str().unwrap())
+            .and_then(|g| g.chain.clone())
+            .expect("chain");
+
+        o.revoke_chain(&my_chain);
+        assert_eq!(
+            o.resolve(&their_access).as_deref(),
+            Some("bob"),
+            "revoking one lineage must not touch another"
+        );
+    }
+
+    #[test]
     fn access_tokens_resolve_to_their_principal_then_expire() {
         let o = oauth();
-        let pair = o.issue_pair("alice", "mcp");
+        let pair = o.issue_pair("alice", "mcp", None);
         let tok = pair["access_token"].as_str().unwrap().to_owned();
         assert_eq!(o.resolve(&tok).as_deref(), Some("alice"));
         assert_eq!(o.resolve("not-a-token"), None);
@@ -739,7 +929,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pipeline-oauth-rt-{}", uuid::Uuid::new_v4()));
         let tok = {
             let o = OAuth::new(dir.clone());
-            let pair = o.issue_pair("ci", "mcp");
+            let pair = o.issue_pair("ci", "mcp", None);
             pair["access_token"].as_str().unwrap().to_owned()
         };
         let reborn = OAuth::new(dir);
@@ -755,7 +945,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pipeline-oauth-exp-{}", uuid::Uuid::new_v4()));
         let tok = {
             let o = OAuth::new(dir.clone());
-            let pair = o.issue_pair("ci", "mcp");
+            let pair = o.issue_pair("ci", "mcp", None);
             let t = pair["access_token"].as_str().unwrap().to_owned();
             if let Ok(mut m) = o.access.lock() {
                 if let Some(g) = m.get_mut(&t) {
