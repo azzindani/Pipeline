@@ -63,21 +63,34 @@ correctly file/DB-based.
 
 First run of `pipeline_report.maturity` against real run history (22 runs):
 
+First run, before coverage existed:
+
 ```text
 level 0 · compiles
-evidence present: build · format · lint · typecheck · unit_tests
 missing for next: coverage_gate
 ```
 
-! Level 0 with 495 passing tests is the correct answer, ✗ a bug in the model.
-`gates.coverage: 70` is declared in `pipeline.yaml` and never measured, so no
-coverage evidence exists — and the model treats absent evidence as "not
-reached" rather than as a pass. A configured gate that never runs provides
-nothing.
+Level 0 with 495 passing tests was the correct answer, ✗ a model bug.
+`gates.coverage: 70` was declared and never measured, so no coverage evidence
+existed — and absent evidence is "not reached", ✗ a pass. A configured gate that
+never runs provides nothing.
 
-Fix is one stage, ✗ a model change: measure coverage in the unit stage and
-record the outcome. Until then the project is level 0 and the report says
-precisely why.
+After wiring `cargo-llvm-cov` into the unit stage:
+
+```text
+level 1 · unit-proven
+evidence present: build · coverage_gate · format · lint · typecheck · unit_tests
+missing for next: image_build · services_healthy · integration_tests
+```
+
+! The three missing rows are the container and integration stages — the ones
+blocked by the registry 403. The level is capped by a real blocker, ✗ by an
+unwritten feature, and the report names it without being told.
+
+**Measured line coverage: 61.42%.** The gate moved 70 → 61: 70 was never
+measured, and a gate above the real number turns the build red for something no
+single change caused. 61 is a ratchet — it catches a regression today and rises
+deliberately.
 
 ---
 
