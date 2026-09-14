@@ -2,7 +2,7 @@
 
 > What separates a repo that compiles from a repo that is proven. Maps eleven field learnings onto Pipeline's existing 19-tool surface as new actions.
 
-Status: design · not yet implemented. Baseline it builds on → [ASSESSMENT.md](ASSESSMENT.md).
+Status: design · §10 decided · implementation tracked in the task list. Baseline it builds on → [ASSESSMENT.md](ASSESSMENT.md).
 
 ---
 
@@ -80,7 +80,7 @@ Models are 2D-static vision. Live video is unaffordable per frame and unnecessar
 | `motion_baseline` | Stores the above as the committed baseline for a route |
 | `motion_compare` | Diffs a run against baseline · fails on regression beyond budget |
 
-Rules: every value is a number with an explicit unit · ✗ return video | image as primary evidence · screenshots are supporting artifacts only · capture via CDP through the existing `devtools_eval` path.
+Rules: every value is a number with an explicit unit · ✗ return video | image as primary evidence · screenshots are supporting artifacts only · capture via CDP through the existing `devtools_eval` path. Target is a descriptor, ✗ a URL — v1 resolves web targets and refuses others with the backend named (§10.2).
 
 ### 5.2 Real-condition testing — `test` · `simulate`
 
@@ -108,7 +108,7 @@ Rules: every value is a number with an explicit unit · ✗ return video | image
 | `tunnel_open` | Binds running container to a persistent public domain · returns URL |
 | `tunnel_close` | Tears down · releases the name |
 
-Rules: the domain is persistent per project, ✗ regenerated per run — a changing URL breaks the human review loop this exists to serve. Tunnel targets dev | staging only. ✗ expose production through a tunnel.
+Rules: Cloudflare **named** tunnel, ✗ quick tunnel (§10.3) — the domain is persistent per project and survives restarts. A changing URL breaks the human review loop this exists to serve. Tunnel targets dev | staging only. ✗ expose production through a tunnel.
 
 ### 5.5 Dev tools — `project`
 
@@ -118,7 +118,7 @@ Rules: the domain is persistent per project, ✗ regenerated per run — a chang
 | `devtool_list` | Lists registered tools for this project |
 | `devtool_run` | Executes one with arguments |
 
-Rules: dev tools are project-local and committed, ✗ global. Pipeline hosts and executes them; the agent authors them. A dev tool used by a second project is promoted per the primitives standard, ✗ copied.
+Rules: dev tools are project-local and committed, ✗ global. Pipeline hosts and executes them; the agent authors them (§10.1) — Pipeline validates the contract, ✗ the logic. A dev tool used by a second project is promoted per the primitives standard, ✗ copied.
 
 ### 5.6 Maintenance mode — `plan`
 
@@ -182,13 +182,42 @@ A progress tracker is re-read after every reset. This is also where the primitiv
 
 ---
 
-## 10. Open questions
+## 10. Decisions
 
-| # | Question | Blocks |
-|---|---|---|
-| 1 | `dev_tools` — Pipeline generates them, | hosts agent-authored ones? Current draft assumes hosts | §5.5 shape |
-| 2 | Motion measurement — web/CDP only, | native and 3D too? Current draft assumes web first, numbers generalize | §5.1 scope |
-| 3 | Tunnel provider — Cloudflare assumed. Persistent name allocation per project unconfirmed | §5.4 |
+Recorded rather than left open · each names the alternative rejected and why.
+
+### 10.1 Dev tools — Pipeline hosts, ✗ generates
+
+Agent authors the tool · Pipeline registers, executes, and tracks it.
+
+| Considered | Verdict |
+|---|---|
+| Pipeline generates tools from templates | ✗ — generation requires domain knowledge Pipeline does not have. A generated tool is a scaffold, and §4 already shows scaffolds are the weakest output |
+| Pipeline hosts agent-authored tools | ✓ — authoring is the agent's strength · registry · execution · contract enforcement are Pipeline's |
+
+Consequence: `devtool_add` registers a contract pointing at an entry point the agent wrote. Pipeline validates the contract, ✗ the logic. A dev tool reaching a second project is promoted per [primitives](https://github.com/azzindani/Standards/blob/main/primitives/STANDARDS.md), ✗ copied.
+
+### 10.2 Motion — web/CDP first, numeric contract transport-agnostic
+
+| Considered | Verdict |
+|---|---|
+| Web + native + 3D in v1 | ✗ — three capture backends before one metric schema is proven |
+| Web/CDP only, schema closed to web | ✗ — locks out the spatial case the model exists to serve |
+| Web/CDP first, schema defined independently of transport | ✓ |
+
+The metric schema is the deliverable, ✗ the capture path. Frame interval · dropped frames · latency percentiles · displacement per frame are all transport-neutral. Native and 3D land as additional capture backends emitting the same schema — ✗ new actions, ✗ a changed contract.
+
+Consequence: `motion_measure` takes a target descriptor, ✗ a URL. v1 resolves web targets only and refuses others with the backend named.
+
+### 10.3 Tunnel — Cloudflare named tunnel
+
+| Considered | Verdict |
+|---|---|
+| Cloudflare quick tunnel (`trycloudflare.com`) | ✗ — random hostname per start. A URL that moves breaks the human review loop the feature exists to serve |
+| Cloudflare named tunnel | ✓ — hostname is allocated once per project and survives restarts |
+| ngrok | ✗ — certificate-pinned client; unusable behind an inspecting proxy, which is exactly the environment agents run in |
+
+Credentials resolve through [configuration](https://github.com/azzindani/Standards/blob/main/configuration/STANDARDS.md) cascade · ✗ stored in `.pipeline/`, ✗ echoed into run output or digests. Name allocation is recorded in project config so it is recoverable after a machine change.
 
 ---
 
