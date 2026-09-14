@@ -469,7 +469,7 @@ fn pipeline_yaml(name: &str, stack: &str, template: &str) -> String {
     };
     let standards = standards_block(stack, template);
     format!(
-        "project: {name}\nversion: 0.0.1\n\nstack:\n  runtime: {stack}\n{services}\nstages:\n  fast:\n    - static\n    - unit\n  full:\n    - static\n    - unit\n    - container\n    - integration\n  preflight:\n    - static\n    - unit\n    - container\n    - integration\n    - security\n\ngates:\n  coverage: 70\n  image_size_mb: 200\n  critical_vulns: 0\n\n{standards}"
+        "project: {name}\nversion: 0.0.1\n\nstack:\n  runtime: {stack}\n{services}\nstages:\n  fast:\n    - static\n    - unit\n  full:\n    - static\n    - unit\n    - container\n    - integration\n  preflight:\n    - static\n    - unit\n    - container\n    - integration\n    - security\n\ngates:\n  # ! Coverage is deliberately UNSET · a gate nobody measured protects nothing,\n  # and a guessed threshold either passes everything or reddens the build for a\n  # condition no change caused. Run `pipeline run fast` once, read the measured\n  # number, then set a floor just under it and ratchet up.\n  # coverage: <measured>\n  image_size_mb: 200\n  critical_vulns: 0\n\n{standards}"
     )
 }
 
