@@ -452,6 +452,8 @@ async fn stage(args: Value, state: Arc<ServerState>) -> ToolResponse {
     let summary = Runner::run_profile(profile, &ctx).await;
 
     let mut run_ids: Vec<String> = Vec::new();
+    // ! One read for the whole summary · every stage in a run shares a commit.
+    let head = pipeline_memory::head_commit();
     for r in &summary.results {
         let failure_json = r
             .failure
@@ -466,7 +468,7 @@ async fn stage(args: Value, state: Arc<ServerState>) -> ToolResponse {
                 status: status_label(r.status),
                 duration_ms: r.duration.as_millis(),
                 triggered_by: Some("mcp"),
-                commit_sha: None,
+                commit_sha: head.as_deref(),
                 stdout: Some(&r.stdout),
                 stderr: Some(&r.stderr),
                 failure_json: failure_json.as_deref(),

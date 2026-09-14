@@ -176,6 +176,8 @@ async fn run_profile(profile_arg: &str) -> anyhow::Result<()> {
             .failure
             .as_ref()
             .and_then(|f| serde_json::to_string(f).ok());
+        // ! Recorded per run so `last_good_commit` has something to vouch for.
+        let head = pipeline_memory::head_commit();
         mem.log_run(&NewRun {
             project_id: &project_id,
             session_id: session_ref,
@@ -184,7 +186,7 @@ async fn run_profile(profile_arg: &str) -> anyhow::Result<()> {
             status: status_label(r.status),
             duration_ms: r.duration.as_millis(),
             triggered_by: Some("pipeline-cli"),
-            commit_sha: None,
+            commit_sha: head.as_deref(),
             stdout: Some(&r.stdout),
             stderr: Some(&r.stderr),
             failure_json: failure_json.as_deref(),

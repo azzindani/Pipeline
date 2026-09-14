@@ -76,6 +76,10 @@ async fn a_new_process_reconstructs_the_whole_packet_from_disk() {
     let packet = cold.handover("proj").await.expect("handover");
 
     assert_eq!(packet.project.id, "proj");
+    assert_eq!(
+        packet.project.last_good_commit, None,
+        "no run passed, so no commit may be vouched for"
+    );
 
     let last = packet
         .last_run
@@ -134,5 +138,51 @@ async fn a_bare_project_still_answers() {
     assert!(
         packet.progress.remaining.is_empty(),
         "an empty tracker must be empty, ✗ absent — absent is indistinguishable from unset"
+    );
+}
+
+#[tokio::test]
+async fn only_a_passing_run_vouches_for_a_commit() {
+    // ! A failing run records a commit too. Crediting it would point a cold
+    // agent at a commit that does not build — the opposite of the field's job.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mem = Memory::open(&dir.path().join("memory.db"))
+        .await
+        .expect("open");
+    mem.upsert_project("proj", "proj", "rust")
+        .await
+        .expect("project");
+
+    let log = |status: &'static str, sha: &'static str| {
+        let mem = mem.clone();
+        async move {
+            mem.log_run(&NewRun {
+                project_id: "proj",
+                session_id: None,
+                profile: "fast",
+                stage: "unit",
+                status,
+                duration_ms: 1,
+                triggered_by: None,
+                commit_sha: Some(sha),
+                stdout: None,
+                stderr: None,
+                failure_json: None,
+            })
+            .await
+            .expect("run");
+        }
+    };
+
+    log("pass", "good1").await;
+    log("fail", "bad1").await;
+
+    assert_eq!(
+        mem.last_good_commit("proj")
+            .await
+            .expect("query")
+            .as_deref(),
+        Some("good1"),
+        "the later FAILING run must not become the last good commit"
     );
 }
