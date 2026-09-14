@@ -32,6 +32,8 @@ pub enum MemoryError {
     SessionNotFound(String),
     #[error("project not found: {0}")]
     ProjectNotFound(String),
+    #[error("serialize progress: {0}")]
+    Serialize(#[from] serde_json::Error),
 }
 
 /// Owned handle to the project's SQLite memory store.
@@ -262,7 +264,27 @@ impl Memory {
             last_run,
             recent_failures,
             active_work: self.active_work(project_id).await?,
+            progress: self.progress(project_id).await?,
         })
+    }
+
+    /// Read the progress tracker · absent → default, ✗ error.
+    pub async fn progress(&self, project_id: &str) -> Result<Progress, MemoryError> {
+        let raw = self.recall(project_id, "progress", "tracker").await?;
+        Ok(raw
+            .and_then(|r| serde_json::from_str(&r).ok())
+            .unwrap_or_default())
+    }
+
+    /// Write the progress tracker whole.
+    pub async fn set_progress(
+        &self,
+        project_id: &str,
+        progress: &Progress,
+    ) -> Result<(), MemoryError> {
+        let blob = serde_json::to_string(progress).map_err(MemoryError::Serialize)?;
+        self.remember(project_id, "progress", "tracker", &blob)
+            .await
     }
 
     /// Rebuild the planning context from what `pipeline_plan.*` stored.
@@ -845,6 +867,28 @@ pub struct MilestoneBrief {
     pub exit_criteria: Vec<String>,
 }
 
+/// Where a long-running effort actually stands.
+///
+/// ! Distinct from [`ActiveWork`], which is the *plan* — what the project
+/// intends to build. This is the *thread*: what the current effort has already
+/// done and what it was about to do. An agent that loses its context keeps the
+/// plan (it is stored) but loses the thread, and then redoes finished work or
+/// resumes at the wrong step. Re-read this after every context reset.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Progress {
+    /// One sentence · what this effort is for. ✗ the project's goal, this
+    /// effort's goal.
+    pub goal: Option<String>,
+    /// Append-only. Steps finished, oldest first.
+    pub completed: Vec<String>,
+    /// Ordered. Next step is index 0.
+    pub remaining: Vec<String>,
+    /// What is preventing the next step · `None` when unblocked.
+    pub blocker: Option<String>,
+    /// ISO timestamp of the last update · staleness is a signal.
+    pub updated_at: Option<String>,
+}
+
 /// Canonical handover packet · CLAUDE.md §"Handover protocol".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandoverPacket {
@@ -853,6 +897,9 @@ pub struct HandoverPacket {
     pub last_run: Option<RunRecord>,
     pub recent_failures: Vec<FailureRecord>,
     pub active_work: ActiveWork,
+    /// Empty rather than absent on a project that never recorded progress —
+    /// an absent field would be indistinguishable from "no progress made".
+    pub progress: Progress,
 }
 
 /// Re-sort scope rows oldest-first on the payload's own `created_at`.

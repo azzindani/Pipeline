@@ -43,6 +43,53 @@ async fn call(state: &Arc<ServerState>, tool: &str, action: &str, args: Value) -
     resp.data
 }
 
+/// Advance the tracker · the thread a context reset loses.
+async fn advance_the_progress_tracker(state: &Arc<ServerState>) {
+    // The progress tracker is the thread a reset loses. Advance it, then prove
+    // a fresh connection resumes at the right step rather than the first one.
+    call(
+        state,
+        "pipeline_session",
+        "progress",
+        json!({"goal": "prove the tracker survives a reset",
+                "remaining": ["step one", "step two", "step three"]}),
+    )
+    .await;
+    let advanced = call(
+        state,
+        "pipeline_session",
+        "progress",
+        json!({"completed": "step one", "blocker": "waiting on registry access"}),
+    )
+    .await;
+    assert_eq!(
+        advanced.get("next_step").and_then(Value::as_str),
+        Some("step two"),
+        "completing a step must advance next_step: {advanced}"
+    );
+}
+
+/// A reconnecting agent must resume mid-thread, ✗ at the first step.
+async fn assert_resumes_mid_thread(state: &Arc<ServerState>) {
+    let resumed = call(state, "pipeline_session", "progress", json!({})).await;
+    assert_eq!(
+        resumed.get("next_step").and_then(Value::as_str),
+        Some("step two"),
+        "a reconnecting agent resumed at the wrong step: {resumed}"
+    );
+    assert_eq!(
+        resumed.get("blocker").and_then(Value::as_str),
+        Some("waiting on registry access"),
+        "the blocker did not survive the reconnect: {resumed}"
+    );
+    assert!(
+        serde_json::to_string(&resumed)
+            .expect("serialize")
+            .contains("step one"),
+        "completed work was lost — the agent will redo it: {resumed}"
+    );
+}
+
 #[tokio::test]
 async fn an_agent_session_survives_its_own_round_trip() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -108,6 +155,8 @@ async fn an_agent_session_survives_its_own_round_trip() {
         "memory.recall did not return what memory.remember stored: {recalled}"
     );
 
+    advance_the_progress_tracker(&state).await;
+
     // Handover is what a cold agent reads first. It must reflect this session.
     let handover = call(&state, "pipeline_session", "handover", json!({})).await;
     let rendered = serde_json::to_string(&handover).expect("serialize");
@@ -134,6 +183,8 @@ async fn an_agent_session_survives_its_own_round_trip() {
     // Persistence is the point: a fresh state handle reads the same database,
     // the way a reconnecting agent would.
     let fresh = Arc::new(ServerState::new());
+    assert_resumes_mid_thread(&fresh).await;
+
     let reread = call(
         &fresh,
         "pipeline_memory",

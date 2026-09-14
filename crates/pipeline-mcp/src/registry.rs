@@ -306,6 +306,28 @@ static REGISTRY: [ToolDescriptor; 19] = [
                 ]),
             ),
             ActionSpec::real(
+                "progress",
+                "Read | advance the long-run progress tracker · no args → read · any arg → apply then return new state.",
+                Of(&[
+                    opt("goal", Str, "one sentence · what this effort is for"),
+                    opt(
+                        "completed",
+                        Str,
+                        "step just finished · appended, ✗ replaces",
+                    ),
+                    opt(
+                        "remaining",
+                        List,
+                        "ordered remaining steps · index 0 is next",
+                    ),
+                    opt(
+                        "blocker",
+                        Str,
+                        "what blocks the next step · explicit null clears",
+                    ),
+                ]),
+            ),
+            ActionSpec::real(
                 "checkpoint",
                 "Persist a free-form progress note to memory under scope 'checkpoint'.",
                 Of(&[opt("note", Str, "note body · empty when omitted")]),
@@ -2076,9 +2098,9 @@ mod tests {
         }
         assert_eq!(
             (real, scaffold, planned),
-            (148, 20, 7),
+            (149, 20, 7),
             "fidelity split moved · update the fidelity doc too"
         );
-        assert_eq!(real + scaffold + planned, 175, "action count drift");
+        assert_eq!(real + scaffold + planned, 176, "action count drift");
     }
 }
