@@ -87,6 +87,7 @@ Every standard in the catalog applies to Pipeline's own codebase. Priority order
 | 13 | Directory | `directory/STANDARDS.md` | Project layout |
 | 14 | Dependencies | `dependencies/STANDARDS.md` | Cargo.toml management |
 | 15 | Performance | `performance/STANDARDS.md` | Stage runner performance |
+| 16 | Primitives | `primitives/STANDARDS.md` | Unit taxonomy · reuse · duplication control |
 
 ### Standards for projects Pipeline manages
 
@@ -657,9 +658,23 @@ pipeline repo port     # translate external repo to target language
 
 ---
 
+## Primitive-based development
+
+All code follows the primitive model: **primitive → part → component → composite**, dependency
+direction downward only. Kind is determined by qualification rows, ✗ author preference. A unit
+earns reuse on the third call site across two components, ✗ on speculation.
+
+Authoritative rules → `primitives/STANDARDS.md` in the Standards repo (Foundation tier, always
+loaded). Pipeline enforces it; ✗ restate it here.
+
+---
+
 ## Build order
 
 Phase ladder · per-milestone tool delivery · velocity targets · risk register live in **`PLAN.md`**. Update there, not here.
+
+Capability expansion (test breadth · metrics · motion measurement · tunnels · dev tools ·
+environments) lives in **`docs/MATURITY.md`**. Baseline audit in **`docs/ASSESSMENT.md`**.
 
 CLAUDE.md owns timeless project context (architecture · concepts · MCP surface concept · standards reference). PLAN.md owns execution.
 
