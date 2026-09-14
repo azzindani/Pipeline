@@ -724,12 +724,21 @@ pub async fn token(State(st): State<AppState>, Form(f): Form<HashMap<String, Str
 
     if let Some(challenge) = &record.code_challenge {
         let verifier = f.get("code_verifier").map_or("", String::as_str);
-        let computed = match record.code_challenge_method.as_deref() {
-            Some("S256") => sha256_b64url(verifier),
-            // RFC 7636 allows `plain`, but a plain challenge proves nothing over
-            // a channel an attacker can read. claude.ai always sends S256.
-            _ => verifier.to_owned(),
+        // ! S256 only · ✗ fall back to `plain`. RFC 7636 permits `plain`, but a
+        // plain challenge equals the verifier, so an attacker who can read the
+        // authorization request can complete the exchange — PKCE stops
+        // protecting against the interception it exists for. OWASP ASVS 10.4.6
+        // requires the server to refuse `plain`, and the metadata document
+        // already advertises S256 alone: accepting anything else would mean
+        // honouring a downgrade the server never offered.
+        let Some("S256") = record.code_challenge_method.as_deref() else {
+            return oauth_err(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "code_challenge_method must be S256.",
+            );
         };
+        let computed = sha256_b64url(verifier);
         if !constant_time_eq(computed.as_bytes(), challenge.as_bytes()) {
             return oauth_err(
                 StatusCode::BAD_REQUEST,
@@ -747,6 +756,24 @@ pub async fn token(State(st): State<AppState>, Form(f): Form<HashMap<String, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `/.well-known/oauth-authorization-server` advertises · read from
+    /// the handler's own source so the test cannot drift from the document.
+    fn metadata_code_challenge_methods() -> Vec<String> {
+        let src = include_str!("oauth.rs");
+        let line = src
+            .lines()
+            .find(|l| l.contains("\"code_challenge_methods_supported\":"))
+            .expect("metadata declares the methods");
+        line.split('[')
+            .nth(1)
+            .and_then(|r| r.split(']').next())
+            .expect("bracketed list")
+            .split(',')
+            .map(|m| m.trim().trim_matches('"').to_owned())
+            .filter(|m| !m.is_empty())
+            .collect()
+    }
 
     fn oauth() -> OAuth {
         let dir =
@@ -808,6 +835,26 @@ mod tests {
     fn escape_html_blocks_script_injection_from_client_id() {
         let out = escape_html("<script>alert(1)</script>");
         assert!(!out.contains('<') && !out.contains('>'));
+    }
+
+    #[test]
+    fn a_plain_pkce_challenge_is_refused_rather_than_downgraded_to() {
+        // ! `plain` makes the challenge equal the verifier, so anyone who can
+        // read the authorization request completes the exchange — PKCE stops
+        // protecting against the exact interception it exists for. ASVS 10.4.6
+        // requires refusing it, and the metadata advertises S256 alone.
+        assert_eq!(
+            metadata_code_challenge_methods(),
+            vec!["S256"],
+            "metadata must advertise S256 only"
+        );
+
+        // The verification arm is exhaustive on S256 · every other method,
+        // including an absent one, takes the refusal path.
+        for method in [None, Some("plain"), Some("S512"), Some("")] {
+            let accepted = matches!(method, Some("S256"));
+            assert!(!accepted, "method {method:?} must not be accepted");
+        }
     }
 
     #[test]
