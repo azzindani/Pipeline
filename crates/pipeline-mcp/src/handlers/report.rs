@@ -30,8 +30,6 @@ pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
 /// written by real captures. Absent evidence stays `Absent`, which the level
 /// model treats as "not reached" rather than as a pass.
 async fn maturity(state: Arc<ServerState>) -> ToolResponse {
-    use pipeline_core::maturity::{Evidence, level};
-
     let cfg = match load_config_in_cwd() {
         Ok(c) => c,
         Err(e) => return err(e),
@@ -40,12 +38,36 @@ async fn maturity(state: Arc<ServerState>) -> ToolResponse {
         Ok(m) => m,
         Err(e) => return err(e),
     };
-    // 200 runs is deep enough that a stage exercised at any point in recent
-    // history counts, ✗ so deep that a year-old green pass props up a level.
-    let runs = match mem.run_history(&cfg.project, 200).await {
-        Ok(r) => r,
+    let root = match std::env::current_dir() {
+        Ok(d) => d,
         Err(e) => return err(e.to_string()),
     };
+    match maturity_of(&mem, &cfg.project, &root).await {
+        Ok(v) => ToolResponse::ok(v),
+        Err(e) => err(e),
+    }
+}
+
+/// Compute one project's maturity payload from its own memory and tree.
+///
+/// ! `root` is a parameter, ✗ read from the process cwd, because
+/// `pipeline_repo.fleet_health` computes this for repos the server is not
+/// sitting inside. Level-5 evidence lives in `<root>/.pipeline/motion`, so a
+/// cwd-relative lookup would have reported every fleet member as missing a
+/// motion baseline while the baseline sat in the repo it belongs to.
+pub(crate) async fn maturity_of(
+    mem: &pipeline_memory::Memory,
+    project: &str,
+    root: &std::path::Path,
+) -> Result<Value, String> {
+    use pipeline_core::maturity::{Evidence, level};
+
+    // 200 runs is deep enough that a stage exercised at any point in recent
+    // history counts, ✗ so deep that a year-old green pass props up a level.
+    let runs = mem
+        .run_history(project, 200)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let mut evidence: BTreeMap<String, Evidence> = BTreeMap::new();
     // ! Latest outcome per stage wins · runs arrive newest-first, so only the
@@ -82,11 +104,11 @@ async fn maturity(state: Arc<ServerState>) -> ToolResponse {
     }
 
     // Level 5 evidence comes from captures, ✗ from stage outcomes.
-    if motion_baseline_exists() {
+    if motion_baseline_exists(root) {
         evidence.insert("motion_baseline".to_owned(), Evidence::Present);
     }
     if mem
-        .list_scope(&cfg.project, "resource")
+        .list_scope(project, "resource")
         .await
         .is_ok_and(|r| !r.is_empty())
     {
@@ -100,7 +122,7 @@ async fn maturity(state: Arc<ServerState>) -> ToolResponse {
         .map(|(k, _)| k)
         .collect();
 
-    ToolResponse::ok(json!({
+    Ok(json!({
         "level": report.level,
         "level_name": report.level_name,
         "missing_for_next": report.missing_for_next,
@@ -131,8 +153,8 @@ fn stage_evidence_keys(stage: &str) -> Vec<String> {
 }
 
 /// A committed motion baseline · written by `e2e.motion_baseline`.
-fn motion_baseline_exists() -> bool {
-    std::env::current_dir().is_ok_and(|cwd| cwd.join(".pipeline").join("motion").is_dir())
+fn motion_baseline_exists(root: &std::path::Path) -> bool {
+    root.join(".pipeline").join("motion").is_dir()
 }
 
 async fn velocity_metrics(state: Arc<ServerState>) -> ToolResponse {
