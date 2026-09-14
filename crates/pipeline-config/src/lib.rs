@@ -1,5 +1,7 @@
 //! `pipeline.yaml` schema · serde-driven · validated on load.
 //!
+//! kind: part
+//!
 //! See `CLAUDE.md` §"pipeline.yaml schema" for the canonical shape.
 
 use serde::{Deserialize, Serialize};

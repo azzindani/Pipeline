@@ -49,6 +49,8 @@ sha2 = "0.10"
 base64 = "0.22"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "tower-log", "form", "query"] }
 tower-http = { version = "0.6", default-features = false, features = ["trace", "cors"] }
+syn = { version = "2", features = ["full", "parsing"] }
+walkdir = "2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

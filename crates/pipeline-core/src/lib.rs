@@ -1,5 +1,7 @@
 //! Pipeline stage runner · result types · context.
 //!
+//! kind: component
+//!
 //! Defines the `Stage` trait every executor implements (static · unit · container ·
 //! integration · security) and the result envelope every super tool returns.
 //! Implementations land in `pipeline-stages`.

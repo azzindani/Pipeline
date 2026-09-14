@@ -1,4 +1,6 @@
 //! Standards integration — Pipeline's binding to an external, separately-versioned
+//!
+//! kind: component
 //! standards corpus (`github.com/azzindani/Standards`).
 //!
 //! Standards is NOT vendored and NOT a monorepo path. It is a **dependency**:
