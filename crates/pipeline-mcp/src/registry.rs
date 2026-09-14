@@ -1822,6 +1822,23 @@ static REGISTRY: [ToolDescriptor; 19] = [
                 "Count recorded failures grouped by stage · a read error is an error, ✗ zero.",
                 NoArgs,
             ),
+            ActionSpec::real(
+                "record_fix",
+                "Record what was tried against a failure and whether it worked · the write half suggest_fix reads.",
+                Of(&[
+                    req(
+                        "failure_id",
+                        Str,
+                        "id from known_issues | suggest_fix candidates",
+                    ),
+                    req("fix", Str, "what was applied"),
+                    req(
+                        "worked",
+                        Bool,
+                        "did it resolve the failure · record false too",
+                    ),
+                ]),
+            ),
             ActionSpec::scaffold(
                 "suggest_fix",
                 "Keyword LIKE search over past failure messages · ! ✗ vector search · ranking is not meaningful.",
@@ -2098,9 +2115,9 @@ mod tests {
         }
         assert_eq!(
             (real, scaffold, planned),
-            (149, 20, 7),
+            (150, 20, 7),
             "fidelity split moved · update the fidelity doc too"
         );
-        assert_eq!(real + scaffold + planned, 176, "action count drift");
+        assert_eq!(real + scaffold + planned, 177, "action count drift");
     }
 }

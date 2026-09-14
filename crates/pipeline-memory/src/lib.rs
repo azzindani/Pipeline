@@ -389,6 +389,33 @@ impl Memory {
         Ok(id)
     }
 
+    /// Close the learning loop · record what was tried against a failure and
+    /// whether it worked.
+    ///
+    /// ! Without this the loop CLAUDE.md describes cannot close. `fix_applied`
+    /// and `fix_worked` were read in three places and written in none, so
+    /// `suggest_fix`'s filter on `fix_worked == Some(1)` could never match and
+    /// every lookup returned zero prior fixes — silently, because zero matches
+    /// is also what a genuinely new error looks like.
+    ///
+    /// A failed fix is recorded too. Knowing what did NOT work is the half that
+    /// stops an agent retrying it on the next occurrence.
+    pub async fn record_fix(
+        &self,
+        failure_id: &str,
+        fix: &str,
+        worked: bool,
+    ) -> Result<bool, MemoryError> {
+        let result =
+            sqlx::query("UPDATE failures SET fix_applied = ?, fix_worked = ? WHERE id = ?")
+                .bind(fix)
+                .bind(i64::from(worked))
+                .bind(failure_id)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn log_failure(&self, failure: &NewFailure<'_>) -> Result<String, MemoryError> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
