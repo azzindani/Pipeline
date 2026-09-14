@@ -87,6 +87,45 @@ jobs:
           # DL3008 (pin apt versions) is noise for a base image rebuilt often.
           ignore: DL3008
 
+  # ── Dogfood · Pipeline runs Pipeline ───────────────────────────────────────
+  # CLAUDE.md: "If Pipeline cannot CI/CD itself, it is not ready." This job is
+  # that proof — `pipeline run confirm` executes the same stage 0 + 1 the jobs
+  # above run as raw cargo.
+  #
+  # ! Deliberately IN ADDITION to those jobs, ✗ instead of them. Two reasons:
+  #   1. A bug in the stage runner that made everything pass would be invisible
+  #      if the raw steps were gone. The raw lane is the control that catches a
+  #      stage runner lying about its own repo.
+  #   2. static and unit run in parallel on purpose (a fmt nit must not hide a
+  #      failing test). One sequential profile run cannot preserve that.
+  # Divergence between this job and the two above is the signal: the stage
+  # runner and the raw commands disagree about the same tree.
+  dogfood:
+    name: stage 0+1 · via pipeline itself
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pipeline
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: build the binary that will run the pipeline
+        run: cargo build -p pipeline-cli --locked
+
+      # Resolves the Standards repo through the cascade · ✗ a path that exists
+      # only on one machine. Offline-safe: absent cache → clone from origin.
+      - name: pipeline run confirm
+        run: ./target/debug/pipeline run confirm
+
+      - name: report is machine-readable
+        run: ./target/debug/pipeline report | python3 -c "import json,sys; json.load(sys.stdin)"
+
   # ── Stage 1 · unit ─────────────────────────────────────────────────────────
   # Fast, no containers. Runs in PARALLEL with static — a fmt nit should not
   # hide a failing test.
