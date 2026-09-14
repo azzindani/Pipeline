@@ -1205,6 +1205,61 @@ static REGISTRY: [ToolDescriptor; 19] = [
                     ),
                 ]),
             ),
+            ActionSpec::real(
+                "motion_measure",
+                "Capture motion as scalars for one route · frame interval percentiles · paint · layout shift. ✗ video, ✗ pixels.",
+                Of(&[
+                    opt("url", Str, "origin to open · required for the web backend"),
+                    opt(
+                        "backend",
+                        Str,
+                        "web · others refused by name until implemented",
+                    ),
+                    opt(
+                        "route",
+                        Str,
+                        "route label for the baseline · defaults to url",
+                    ),
+                    opt(
+                        "environment",
+                        Str,
+                        "dev | staging | production · defaults to dev",
+                    ),
+                    opt(
+                        "hardware_class",
+                        Str,
+                        "machine class · cross-class comparison is refused",
+                    ),
+                    opt(
+                        "target_frame_interval_ms",
+                        Num,
+                        "declared target · 60fps → 16.7",
+                    ),
+                ]),
+            ),
+            ActionSpec::real(
+                "motion_baseline",
+                "Commit a capture as the baseline for an environment + route · explicit, ✗ automatic on first run.",
+                Of(&[
+                    req("record", Obj, "the object motion_measure returned"),
+                    opt("environment", Str, "overrides the record's environment"),
+                    opt("route", Str, "overrides the record's route"),
+                ]),
+            ),
+            ActionSpec::real(
+                "motion_compare",
+                "Compare a capture against the committed baseline · missing baseline | vanished metric → refused, ✗ passed.",
+                Of(&[
+                    req("record", Obj, "the object motion_measure returned"),
+                    opt("environment", Str, "overrides the record's environment"),
+                    opt("route", Str, "overrides the record's route"),
+                    opt(
+                        "budgets",
+                        Obj,
+                        "metric → {absolute, percent} · wider bound wins",
+                    ),
+                ]),
+            ),
         ],
     },
     ToolDescriptor {
@@ -2115,9 +2170,9 @@ mod tests {
         }
         assert_eq!(
             (real, scaffold, planned),
-            (150, 20, 7),
+            (153, 20, 7),
             "fidelity split moved · update the fidelity doc too"
         );
-        assert_eq!(real + scaffold + planned, 177, "action count drift");
+        assert_eq!(real + scaffold + planned, 180, "action count drift");
     }
 }

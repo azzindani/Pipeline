@@ -31,7 +31,7 @@ this" must never collapse into "I determined it is fine."
 | **Scaffold** | Writes a template, skeleton, or fixture · ✗ reads · ✗ analyzes your project | Useful as a starting point, worthless as a finding. Badged `[scaffold]` in `tools/list` |
 | **Planned** | Not implemented | Refused in `dispatch` **before the handler runs**. Badged `[planned]`, and the summary states what is missing |
 
-Current split: **150 Real · 20 Scaffold · 7 Planned** across 177 actions. The counts are pinned by
+Current split: **153 Real · 20 Scaffold · 7 Planned** across 180 actions. The counts are pinned by
 `registry::tests::the_fidelity_split_is_recorded` — a tripwire, not a target. If
 it moves, this table needs the same edit.
 
