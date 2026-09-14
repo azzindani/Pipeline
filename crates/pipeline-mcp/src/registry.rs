@@ -1976,6 +1976,11 @@ static REGISTRY: [ToolDescriptor; 19] = [
                 NoArgs,
             ),
             ActionSpec::real(
+                "maturity",
+                "Project maturity level 0-5, computed from evidence present in run history + captures · ✗ declared.",
+                NoArgs,
+            ),
+            ActionSpec::real(
                 "velocity_metrics",
                 "Pass rate · median inner-loop ms · failures by stage, computed from recorded runs.",
                 NoArgs,
@@ -2209,9 +2214,9 @@ mod tests {
         }
         assert_eq!(
             (real, scaffold, planned),
-            (156, 20, 7),
+            (157, 20, 7),
             "fidelity split moved · update the fidelity doc too"
         );
-        assert_eq!(real + scaffold + planned, 183, "action count drift");
+        assert_eq!(real + scaffold + planned, 184, "action count drift");
     }
 }

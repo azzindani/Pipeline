@@ -4,12 +4,14 @@ use crate::handlers::{ensure_memory, load_config_in_cwd};
 use crate::server::ServerState;
 use crate::tools::{ToolRequest, ToolResponse};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
     match req.action.as_str() {
         "dashboard" | "last" | "summary" => dashboard(state).await,
         "velocity_metrics" => velocity_metrics(state).await,
+        "maturity" => maturity(state).await,
         "burndown" => burndown(&req.args, state).await,
         other => ToolResponse {
             ok: false,
@@ -19,6 +21,97 @@ pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
             error: Some(format!("unknown action 'pipeline_report.{other}'")),
         },
     }
+}
+
+/// Compute the project's maturity level from evidence actually present.
+///
+/// ! Evidence is DERIVED, ✗ declared. A project cannot assert a level here —
+/// the only inputs are stage outcomes recorded by real runs and artifacts
+/// written by real captures. Absent evidence stays `Absent`, which the level
+/// model treats as "not reached" rather than as a pass.
+async fn maturity(state: Arc<ServerState>) -> ToolResponse {
+    use pipeline_core::maturity::{Evidence, level};
+
+    let cfg = match load_config_in_cwd() {
+        Ok(c) => c,
+        Err(e) => return err(e),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(e),
+    };
+    // 200 runs is deep enough that a stage exercised at any point in recent
+    // history counts, ✗ so deep that a year-old green pass props up a level.
+    let runs = match mem.run_history(&cfg.project, 200).await {
+        Ok(r) => r,
+        Err(e) => return err(e.to_string()),
+    };
+
+    let mut evidence: BTreeMap<String, Evidence> = BTreeMap::new();
+    // ! Latest outcome per stage wins · runs arrive newest-first, so only the
+    // first sighting of a stage is recorded. A stage that passed yesterday and
+    // failed today is Failed, ✗ Present.
+    for run in &runs {
+        for key in stage_evidence_keys(&run.stage) {
+            evidence.entry(key).or_insert(match run.status.as_str() {
+                "pass" => Evidence::Present,
+                _ => Evidence::Failed,
+            });
+        }
+    }
+
+    // Level 5 evidence comes from captures, ✗ from stage outcomes.
+    if motion_baseline_exists() {
+        evidence.insert("motion_baseline".to_owned(), Evidence::Present);
+    }
+    if mem
+        .list_scope(&cfg.project, "resource")
+        .await
+        .is_ok_and(|r| !r.is_empty())
+    {
+        evidence.insert("resource_metrics".to_owned(), Evidence::Present);
+    }
+
+    let report = level(&evidence);
+    let present: Vec<&String> = evidence
+        .iter()
+        .filter(|(_, e)| **e == Evidence::Present)
+        .map(|(k, _)| k)
+        .collect();
+
+    ToolResponse::ok(json!({
+        "level": report.level,
+        "level_name": report.level_name,
+        "missing_for_next": report.missing_for_next,
+        "regressions": report.regressions,
+        "evidence_present": present,
+        "runs_examined": runs.len(),
+    }))
+}
+
+/// Which level requirements a stage outcome is evidence for.
+///
+/// ! One stage can satisfy several requirements — the static stage runs lint,
+/// format and type checks as one unit, so its outcome is evidence for all
+/// three. ✗ invent a finer signal than the runner actually produces.
+fn stage_evidence_keys(stage: &str) -> Vec<String> {
+    let keys: &[&str] = match stage {
+        "static" => &["build", "lint", "format", "typecheck"],
+        "unit" => &["unit_tests"],
+        "container" => &["image_build"],
+        "integration" => &["services_healthy", "integration_tests"],
+        // ! `security` and anything unrecognised map to nothing on purpose. The
+        // level model's security evidence is a level-4/5 concern fed by
+        // captures, ✗ by a stage pass — inventing a mapping here would let a
+        // green security stage stand in for chaos and load evidence.
+        _ => &[],
+    };
+    keys.iter().map(|k| (*k).to_owned()).collect()
+}
+
+/// A committed motion baseline · written by `e2e.motion_baseline`.
+fn motion_baseline_exists() -> bool {
+    std::env::current_dir().is_ok_and(|cwd| cwd.join(".pipeline").join("motion").is_dir())
 }
 
 async fn velocity_metrics(state: Arc<ServerState>) -> ToolResponse {

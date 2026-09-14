@@ -2,7 +2,7 @@
 
 > Live backlog for Pipeline + Standards. Session task state is ephemeral and invisible outside the terminal UI — this file is the durable copy.
 
-Updated: 2026-09-14 · 19 done · 10 open · 2 removed by request.
+Updated: 2026-09-14 · 20 done · 9 open · 2 removed by request.
 
 Blocked items name their blocker. ✗ mark a task done while its verification is blocked — record the partial and say what is missing.
 
@@ -31,7 +31,6 @@ Blocked items name their blocker. ✗ mark a task done while its verification is
 
 | # | Task | Shipped | Missing |
 |---|---|---|---|
-| 23 | Maturity level as an enforceable gate | `pipeline-core/src/maturity.rs` · 8 tests · levels 0–5 computed from evidence | Nothing derives the evidence map from real run data · stage 4 does not call it · no report surface |
 | 21 | Apply primitives to Pipeline's own code | Kinds declared on all 16 crate roots · direction check passes | 44 submodules undeclared · `repo.rs` 2,360 LOC · `data.rs` 1,903 · `plan.rs` 1,624 · `e2e.rs` 1,541 unsplit. Needs the registry's call-site + duplicate detection first |
 | 33 | Auth audit findings | Findings 1, 2, 4, 5 fixed | Finding 3 — redacting wrapper type for token values, so omission is the default rather than a per-call-site habit |
 
@@ -41,6 +40,7 @@ Blocked items name their blocker. ✗ mark a task done while its verification is
 
 | # | Task | Notes |
 |---|---|---|
+| 36 | Measure coverage in the unit stage | Pipeline is maturity level 0 because `gates.coverage: 70` is declared and never measured. One stage change unlocks level 1 |
 | 1 | Promote the 7 `Planned` actions | Feasible here: `e2e.record` (needs a timeout — it spawns an interactive tool and blocks forever), `simulate.journey_simulate`, analysis half of `repo.re_reconstruct`. Blocked by #29: `env.devcontainer_open` · `deploy.canary` · `blue_green`. Own project: `repo.port` |
 | 8 | `test.fixture_create` · `eval_run` · `endpoint_probe` · `docker_verify` · `e2e.video_capture` · `simulate.stress` | `docker_verify` blocked by #29 · rest are not |
 | 9 | `project.devtool_*` · `plan.mode_set` | Decided: Pipeline **hosts** agent-authored tools, ✗ generates → `docs/MATURITY.md` §10.1 · conventions → `primitives/STANDARDS.md` §11 |
@@ -90,6 +90,7 @@ Pipeline 432 → 491 tests · fmt + clippy clean · `pipeline run confirm` green
 | 24 | Learning loop closed — `fix_applied` was read in three places and written in none |
 | 25 | Handover verified across a real process boundary |
 | 6 | `observe.resource_measure` · `throttle_test` · `efficiency_report` — wired, driven end to end |
+| 23 | Maturity level computed from real run history — `report.maturity` |
 | 30 | `security/TOKENS.md` |
 | 31 | Auth audit — 5 findings, 4 fixed |
 | 35 | `security/OAUTH.md` — and it caught finding 5 in Pipeline the same day |

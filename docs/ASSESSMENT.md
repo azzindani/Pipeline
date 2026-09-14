@@ -59,6 +59,28 @@ correctly file/DB-based.
    single-crate design. Current state is worst of both.
 4. Tests last. More unit tests on unproven code cements assumptions.
 
+## Maturity level — computed, ✗ asserted
+
+First run of `pipeline_report.maturity` against real run history (22 runs):
+
+```text
+level 0 · compiles
+evidence present: build · format · lint · typecheck · unit_tests
+missing for next: coverage_gate
+```
+
+! Level 0 with 495 passing tests is the correct answer, ✗ a bug in the model.
+`gates.coverage: 70` is declared in `pipeline.yaml` and never measured, so no
+coverage evidence exists — and the model treats absent evidence as "not
+reached" rather than as a pass. A configured gate that never runs provides
+nothing.
+
+Fix is one stage, ✗ a model change: measure coverage in the unit stage and
+record the outcome. Until then the project is level 0 and the report says
+precisely why.
+
+---
+
 ## Repo state
 
 Both repos: `main` only · no other remote branches · no open PRs · working trees clean.
