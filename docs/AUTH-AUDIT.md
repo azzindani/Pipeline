@@ -22,7 +22,7 @@ load-bearing.
 |---|---|---|
 | 1 | Access-token TTL is 24 h against a ≤ 15 min ceiling for user-facing tokens | High · **fixed** |
 | 2 | Refresh-token reuse is rejected but the chain is not revoked | Medium · **fixed** |
-| 3 | No redaction rule at the logging boundary — relies on call sites | Low · open |
+| 3 | No redaction rule at the logging boundary — relies on call sites | Low · **fixed** |
 | 4 | PKCE `code_challenge_method` fell back to `plain` | High · **fixed** |
 | 5 | Authorization-code reuse refused but issued tokens not revoked | Medium · **fixed** |
 
@@ -100,9 +100,15 @@ to omit them at each call site. Pipeline logs principals rather than token
 values, which is correct today, but nothing structurally prevents a future
 `tracing` call from formatting a header or a grant record.
 
-Fix: a redacting wrapper type for token values whose `Debug`/`Display` print a
-placeholder, used everywhere a token is held. Then omission is the default and
-leaking one requires deliberately unwrapping it.
+**Fixed.** `Secret` wraps every token value in the registry. `Debug`, `Display`
+and `Serialize` all print `<redacted>` — serialisation included, because
+redaction that survives `{:?}` and dies at `to_string()` is not redaction.
+
+Comparison goes through `Secret::matches`, constant-time, so the commonest
+reason a secret escapes its wrapper (unwrap in order to compare) has no reason
+to happen. There is deliberately **no** `expose()` accessor: one was written and
+removed when clippy showed it had no caller, and `primitives/STANDARDS.md`
+forbids merging a unit with zero call sites.
 
 ---
 
@@ -164,4 +170,4 @@ collateral damage.
 2. ~~Finding 2~~ — done.
 3. ~~Finding 4~~ — done · found only against the primary text.
 4. ~~Finding 5~~ — done.
-5. Finding 3 — open · hardening against a leak that has not happened.
+5. ~~Finding 3~~ — done. All five closed.
