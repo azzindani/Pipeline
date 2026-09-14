@@ -6,6 +6,7 @@ pub mod docker;
 pub mod docs;
 pub mod e2e;
 pub mod env;
+pub mod fleet;
 pub mod memory;
 pub mod meta;
 pub mod observe;

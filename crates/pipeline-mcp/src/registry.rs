@@ -1565,6 +1565,11 @@ static REGISTRY: [ToolDescriptor; 19] = [
                 NoArgs,
             ),
             ActionSpec::real(
+                "fleet_health",
+                "One pass over every registered repo · per repo: managed or not, branch, uncommitted count, last run + age, consecutive failures, maturity level, high audit findings, blocked tasks · loudest first · gathers, ✗ grades.",
+                NoArgs,
+            ),
+            ActionSpec::real(
                 "re_analyze",
                 "Scan a codebase synchronously · module boundaries · entry points · test layout · deps from real manifests · binary | service | infra types refused by name.",
                 Of(&[
@@ -2301,9 +2306,9 @@ mod tests {
         }
         assert_eq!(
             (real, scaffold, planned),
-            (167, 20, 7),
+            (168, 20, 7),
             "fidelity split moved · update the fidelity doc too"
         );
-        assert_eq!(real + scaffold + planned, 194, "action count drift");
+        assert_eq!(real + scaffold + planned, 195, "action count drift");
     }
 }

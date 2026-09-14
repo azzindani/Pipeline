@@ -55,6 +55,7 @@ async fn the_resource_actions_are_reachable_and_honest() {
     tasks_are_tracked_with_a_verifiable_done_condition().await;
     health_and_audit_report_gaps_without_grading().await;
     review_brief_gathers_material_and_defers_the_judgement().await;
+    fleet_health_reports_every_registered_repo_from_one_call().await;
 }
 
 /// Resource measurement, driven the way an agent would.
@@ -520,4 +521,143 @@ async fn review_brief_gathers_material_and_defers_the_judgement() {
         human_only.iter().any(|p| p.as_str() == Some("src_auth.rs")),
         "a path naming auth must be flagged human-only (§12): {d}"
     );
+}
+
+/// Fleet health across registered repos · the maintenance view.
+///
+/// ! The gap this closes: every other health action reads the process working
+/// directory, so maintaining N existing repos meant N chdirs. This asserts one
+/// call reports all of them — including the two states an adopted repo starts
+/// in, unmanaged and never-cloned, which are the ones a fleet view exists to
+/// surface.
+async fn fleet_health_reports_every_registered_repo_from_one_call() {
+    let (_keep, data) = fleet_fixture().await;
+
+    assert_eq!(
+        data["total"], 3,
+        "every registered repo is reported: {data}"
+    );
+    assert_eq!(data["unmanaged"], 1, "the repo without a config: {data}");
+    assert_eq!(data["missing"], 1, "the repo with no tree on disk: {data}");
+
+    let rows = data["repos"].as_array().expect("repos array");
+    let row = |alias: &str| -> &Value {
+        rows.iter()
+            .find(|r| r["alias"] == alias)
+            .unwrap_or_else(|| panic!("no row for '{alias}' in {data}"))
+    };
+
+    // ! A repo registered but never cloned reports exists:false, ✗ an empty
+    // healthy row. Absent is reported as absent.
+    let missing = row("never-cloned");
+    assert_eq!(missing["state"], "missing", "{missing}");
+    assert!(
+        missing["attention"]
+            .as_array()
+            .expect("attention")
+            .iter()
+            .any(|a| a.as_str().is_some_and(|s| s.contains("never cloned"))),
+        "the missing tree is named: {missing}"
+    );
+
+    let un = row("unmanaged");
+    assert_eq!(un["state"], "unmanaged", "{un}");
+    assert!(
+        un["attention"]
+            .as_array()
+            .expect("attention")
+            .iter()
+            .any(|a| a.as_str().is_some_and(|s| s.contains("adopt=true"))),
+        "the action that fixes it is named: {un}"
+    );
+
+    let m = row("managed");
+    assert_eq!(m["state"], "managed", "{m}");
+    assert_eq!(
+        m["project"], "resource-test",
+        "read from its own config: {m}"
+    );
+    // Nothing has ever run there, so the run and maturity views are honest
+    // about it rather than reporting a level nobody earned.
+    assert!(m["last_run"].is_null(), "no run recorded: {m}");
+    assert_eq!(m["maturity"]["level"], 0, "below every level: {m}");
+    assert_eq!(m["tasks"]["blocked"], 1, "blocked task counted: {m}");
+    assert!(
+        m["findings"]["high"].as_u64().expect("high count") > 0,
+        "the audit rules ran against this repo: {m}"
+    );
+
+    // Loudest first · the caller reads the list in order and does not sort.
+    let counts: Vec<usize> = rows
+        .iter()
+        .map(|r| r["attention"].as_array().map_or(0, Vec::len))
+        .collect();
+    assert!(
+        counts.windows(2).all(|w| w[0] >= w[1]),
+        "attention descending, got {counts:?}"
+    );
+    assert_eq!(
+        data["needs_attention"], 3,
+        "each of the three has something to say: {data}"
+    );
+}
+
+/// Three registered repos in the three states an adopted fleet contains ·
+/// returns the tempdirs (kept alive by the caller) and the fleet payload.
+async fn fleet_fixture() -> (Vec<tempfile::TempDir>, Value) {
+    // A managed repo with real recorded state.
+    let managed = tempfile::tempdir().expect("tempdir");
+    std::fs::write(managed.path().join("pipeline.yaml"), PROJECT_YAML).expect("write config");
+    std::env::set_current_dir(managed.path()).expect("chdir managed");
+    {
+        let state = Arc::new(ServerState::new());
+        let added = call(
+            &state,
+            "pipeline_plan",
+            "task_add",
+            json!({
+                "title": "upgrade the toolchain",
+                "acceptance": "cargo build passes on the new pin",
+            }),
+        )
+        .await;
+        let id = added["task"]["id"].as_str().expect("task id").to_owned();
+        call(
+            &state,
+            "pipeline_plan",
+            "task_update",
+            json!({
+                "id": id,
+                "status": "blocked",
+                "blocker": "waiting on the upstream release",
+            }),
+        )
+        .await;
+    }
+
+    // A repo Pipeline has never been told about beyond its path.
+    let unmanaged = tempfile::tempdir().expect("tempdir");
+    std::fs::write(unmanaged.path().join("README.md"), "hello").expect("write readme");
+
+    // The hub the fleet is read from · deliberately NOT one of the repos.
+    let hub = tempfile::tempdir().expect("tempdir");
+    let registry = json!({"repos": [
+        {"alias": "managed", "url": managed.path().to_string_lossy(),
+         "kind": "local", "added_at": "2026-01-01T00:00:00Z", "cloned": true},
+        {"alias": "unmanaged", "url": unmanaged.path().to_string_lossy(),
+         "kind": "local", "added_at": "2026-01-01T00:00:00Z", "cloned": true},
+        {"alias": "never-cloned", "url": "https://github.com/example/never-cloned",
+         "kind": "git", "added_at": "2026-01-01T00:00:00Z", "cloned": false},
+    ]});
+    std::fs::create_dir_all(hub.path().join(".pipeline/repos")).expect("mkdir registry");
+    std::fs::write(
+        hub.path().join(".pipeline/repos/registry.json"),
+        serde_json::to_string_pretty(&registry).expect("serialize"),
+    )
+    .expect("write registry");
+    std::env::set_current_dir(hub.path()).expect("chdir hub");
+
+    let state = Arc::new(ServerState::new());
+    let data = call(&state, "pipeline_repo", "fleet_health", json!({})).await;
+    (vec![managed, unmanaged, hub], data)
 }

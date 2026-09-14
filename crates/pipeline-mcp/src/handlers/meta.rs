@@ -492,6 +492,29 @@ async fn audit(state: Arc<ServerState>) -> ToolResponse {
         Err(e) => return err(format!("memory: {e}")),
     };
 
+    let findings = audit_findings(&cfg, &mem).await;
+    let high = findings.iter().filter(|f| f["severity"] == "high").count();
+    ToolResponse::ok(json!({
+        "project": cfg.project,
+        "findings": findings,
+        "high": high,
+        "total": findings.len(),
+        // ! Reported, ✗ judged. Whether these gaps are acceptable is the
+        // caller's call — Pipeline names them.
+        "note": "gaps found, ✗ a quality verdict · severity ranks attention, not acceptability",
+    }))
+}
+
+/// One project's audit findings, severity-sorted.
+///
+/// ! Split out so `pipeline_repo.fleet_health` audits every registered repo
+/// through THIS function rather than its own copy of the rules. A second
+/// implementation drifts, and a fleet view that grades a tree differently from
+/// `pipeline_meta.audit` on the same tree is worse than no fleet view.
+pub(crate) async fn audit_findings(
+    cfg: &pipeline_config::PipelineConfig,
+    mem: &pipeline_memory::Memory,
+) -> Vec<Value> {
     let mut findings: Vec<Value> = Vec::new();
     let mut note = |area: &str, severity: &str, detail: String| {
         findings.push(json!({ "area": area, "severity": severity, "detail": detail }));
@@ -577,16 +600,7 @@ async fn audit(state: Arc<ServerState>) -> ToolResponse {
         _ => 2,
     });
 
-    let high = findings.iter().filter(|f| f["severity"] == "high").count();
-    ToolResponse::ok(json!({
-        "project": cfg.project,
-        "findings": findings,
-        "high": high,
-        "total": findings.len(),
-        // ! Reported, ✗ judged. Whether these gaps are acceptable is the
-        // caller's call — Pipeline names them.
-        "note": "gaps found, ✗ a quality verdict · severity ranks attention, not acceptability",
-    }))
+    findings
 }
 
 /// Stage evidence gaps · a stage that never ran and one that ran red are both

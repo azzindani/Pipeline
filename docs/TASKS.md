@@ -12,7 +12,7 @@ Blocked items name their blocker. ✗ mark a task done while its verification is
 
 | # | Task | Detail |
 |---|---|---|
-| 28 | Land both branches on `main` | Pipeline `claude/relaxed-noether-j1l68e` is 26 commits ahead, Standards 6. Both green. ✗ merged: this session's instructions forbid pushing to a branch other than the designated one without explicit permission, and both `CLAUDE.md` files forbid opening a PR unasked. Say merge | PR |
+| 28 | Land both branches on `main` | Pipeline `claude/relaxed-noether-j1l68e` is ~37 commits ahead, Standards ~11. Both green. ✗ merged: this session's instructions forbid pushing to a branch other than the designated one without explicit permission, and both `CLAUDE.md` files forbid opening a PR unasked. Say merge | PR |
 
 ---
 
@@ -66,7 +66,7 @@ Blocked items name their blocker. ✗ mark a task done while its verification is
 
 ## 7. Done this session
 
-Pipeline 432 → 491 tests · fmt + clippy clean · `pipeline run confirm` green. Standards 43 → 46 · `validate.py` 0 errors.
+Pipeline 432 → 505 tests · fmt + clippy clean · `pipeline run fast` green. Standards 43 → 51 · `validate.py` 0 errors. Surface 195 actions / 19 tools, under the 200 ceiling.
 
 | # | Task |
 |---|---|
@@ -95,3 +95,6 @@ Pipeline 432 → 491 tests · fmt + clippy clean · `pipeline run confirm` green
 | 31 | Auth audit — 5 findings, 4 fixed |
 | 35 | `security/OAUTH.md` — and it caught finding 5 in Pipeline the same day |
 | 34a | Standards review: security tier · `devops/CONTAINERS.md` (runtime hardening) · `web/SECURITY.md` (SRI · Trusted Types · COOP/CORP) |
+| 37 | `design/` producer–consumer completeness — an orphan read is a defect, ✗ an unfinished feature. Scanner run over the workspace: 221 public fields, 0 orphans |
+| 38 | `llm/` standard — `STANDARDS.md` (prompt artifacts · model pinning + migration · output contracts · degradation ladder · token cost) · `EVALUATION.md` (eval sets · graders · gates · adversarial cases) · `SAFETY.md` (injection · tool authorization · agent autonomy · prompt privacy) |
+| 39 | `repo.fleet_health` — every registered repo in one call: state · branch · uncommitted · last run + age · maturity · high findings · blocked tasks, loudest first. Audit and maturity run through the SAME functions the single-project actions use |
