@@ -35,7 +35,9 @@ gates:
 # `project_type` · `surfaces` are keys into that repo's ROUTER.md §5 · §6 tables —
 # Pipeline selects routes, it does not define them.
 standards:
-  source: /root/Standards
+  # ✗ absolute path — portable to no machine but the one that wrote it. Unset →
+  # cascade: PIPELINE_STANDARDS_DIR → shared cache → clone from the repo above.
+  # Point `source` at a local checkout only in a throwaway override.
   project_type: MCP server
   languages: [rust]        # settles ROUTER's MCP-server language choice (python | typescript | rust)
   surfaces:
@@ -43,5 +45,18 @@ standards:
     - Deployed service
     - Public package
   pin: 0828bd8de09977166cb30172d26fdcb1113bd0fa
+
+# Promotion ladder. Omitting this block yields exactly these three with these
+# gates — the defaults live in pipeline-config, ✗ in this file. Declared here so
+# Pipeline's own ladder is visible to anyone reading the repo.
+environments:
+  - name: dev
+    requires: [static, unit]
+  - name: staging
+    requires: [static, unit, container, integration]
+    tunnel: true
+  - name: production
+    requires: [preflight, security]
+    approval: true
 
 # deploy + maintenance wire in at v1 · see PLAN.md
