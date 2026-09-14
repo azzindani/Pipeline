@@ -34,7 +34,9 @@ pub struct TokenRegistry {
     pub mode: AuthMode,
     /// principal → token value. Small (< 256) — linear scan is fine and lets us
     /// compare every entry in constant time.
-    tokens: BTreeMap<String, String>,
+    /// principal → token. [`Secret`] so a stray `{:?}` on the registry prints
+    /// placeholders rather than every live bearer.
+    tokens: BTreeMap<String, Secret>,
 }
 
 impl TokenRegistry {
@@ -46,8 +48,11 @@ impl TokenRegistry {
                 .map_err(|e| format!("PIPELINE_TOKENS_FILE {path}: {e}"))?;
             let parsed: BTreeMap<String, String> = serde_json::from_str(&raw)
                 .map_err(|e| format!("PIPELINE_TOKENS_FILE {path} is not a JSON object: {e}"))?;
-            let tokens: BTreeMap<String, String> =
-                parsed.into_iter().filter(|(_, v)| !v.is_empty()).collect();
+            let tokens: BTreeMap<String, Secret> = parsed
+                .into_iter()
+                .filter(|(_, v)| !v.is_empty())
+                .map(|(k, v)| (k, Secret::new(v)))
+                .collect();
             if tokens.is_empty() {
                 return Err(format!("PIPELINE_TOKENS_FILE {path} has no usable entries"));
             }
@@ -58,7 +63,10 @@ impl TokenRegistry {
         }
 
         if let Some(inline) = non_empty("PIPELINE_TOKENS") {
-            let tokens = parse_inline(&inline);
+            let tokens: BTreeMap<String, Secret> = parse_inline(&inline)
+                .into_iter()
+                .map(|(k, v)| (k, Secret::new(v)))
+                .collect();
             if tokens.is_empty() {
                 return Err(
                     "PIPELINE_TOKENS set but produced no usable entries · expected \
@@ -75,7 +83,7 @@ impl TokenRegistry {
         if let Some(single) = non_empty("PIPELINE_TOKEN") {
             return Ok(Self {
                 mode: AuthMode::Single,
-                tokens: BTreeMap::from([("default".to_owned(), single)]),
+                tokens: BTreeMap::from([("default".to_owned(), Secret::new(single))]),
             });
         }
 
@@ -93,7 +101,7 @@ impl TokenRegistry {
     pub fn lookup(&self, presented: &str) -> Option<&str> {
         let mut found: Option<&str> = None;
         for (name, value) in &self.tokens {
-            if constant_time_eq(presented.as_bytes(), value.as_bytes()) {
+            if value.matches(presented) {
                 found = Some(name.as_str());
             }
         }
@@ -126,7 +134,7 @@ impl TokenRegistry {
             },
             tokens: pairs
                 .iter()
-                .map(|(n, v)| ((*n).to_owned(), (*v).to_owned()))
+                .map(|(n, v)| ((*n).to_owned(), Secret::new(*v)))
                 .collect(),
         }
     }
@@ -218,10 +226,86 @@ mod tests {
     }
 
     #[test]
+    fn a_secret_redacts_itself_in_every_format() {
+        let s = Secret::new("sk-real-token-value");
+        assert_eq!(format!("{s:?}"), "Secret(<redacted>)");
+        assert_eq!(format!("{s}"), "<redacted>");
+        assert_eq!(
+            serde_json::to_string(&s).expect("serialize"),
+            "\"<redacted>\"",
+            "serialisation must redact too · redaction that dies at to_string is not redaction"
+        );
+        assert!(
+            !format!("{s:?}{s}").contains("sk-real"),
+            "the real value reached a formatted string"
+        );
+    }
+
+    #[test]
+    fn a_secret_compares_without_being_exposed() {
+        let s = Secret::new("sk-abc");
+        assert!(s.matches("sk-abc"));
+        assert!(!s.matches("sk-abd"));
+    }
+
+    #[test]
     fn constant_time_eq_behaves_like_eq() {
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(constant_time_eq(b"", b""));
+    }
+}
+
+/// A secret that will not print itself.
+///
+/// ! `security/TOKENS.md` §7 requires redaction at the logging boundary, ✗ by
+/// remembering to omit a value at each call site. Pipeline logs principals
+/// rather than token values today, which is correct and unenforced: nothing
+/// stops the next `tracing` call formatting a header or a grant record.
+///
+/// Wrapping makes omission the default: `{:?}`, `{}` and `serialize` all print a
+/// placeholder, and the only way to act on the value is [`Secret::matches`].
+///
+/// ! No `expose()` accessor. One was written and removed — nothing needed it,
+/// and `primitives/STANDARDS.md` forbids merging a unit with zero call sites.
+/// Add it when a real call site appears, ✗ in anticipation of one.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Constant-time comparison against a presented value.
+    ///
+    /// ! Provided so callers compare through the wrapper rather than exposing
+    /// to compare — the commonest reason a secret escapes its wrapper.
+    pub fn matches(&self, presented: &str) -> bool {
+        constant_time_eq(self.0.as_bytes(), presented.as_bytes())
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(<redacted>)")
+    }
+}
+
+impl std::fmt::Display for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// ! Serialising a secret writes it wherever the output goes — a persisted
+/// grant file, a JSON response, a log line. Redaction that survives `{:?}` and
+/// dies at `to_string()` is not redaction, so this is deliberate and
+/// deliberately inconvenient: persist `expose()` explicitly, at a site review
+/// can see.
+impl serde::Serialize for Secret {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str("<redacted>")
     }
 }
