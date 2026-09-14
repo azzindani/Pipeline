@@ -1738,6 +1738,45 @@ static REGISTRY: [ToolDescriptor; 19] = [
                 Of(&[req("rule", Str, "PromQL expression")]),
             ),
             ActionSpec::real(
+                "resource_measure",
+                "Run a command and record CPU · wall · peak memory · efficiency ratios. Unmeasurable fields are reported, ✗ zeroed.",
+                Of(&[
+                    req("command", Str, "shell command to measure"),
+                    opt("label", Str, "history key · defaults to the command"),
+                    opt(
+                        "constraint",
+                        Str,
+                        "constraint profile in force · omit → unconstrained",
+                    ),
+                    opt(
+                        "work_units",
+                        Num,
+                        "units of work completed · required for efficiency ratios",
+                    ),
+                ]),
+            ),
+            ActionSpec::real(
+                "throttle_test",
+                "Measure under a declared constraint · refuses when no constraint mechanism exists rather than mislabelling an unconstrained run.",
+                Of(&[
+                    req("command", Str, "shell command to measure"),
+                    req("profile", Str, "constraint profile name"),
+                    opt("work_units", Num, "units of work completed"),
+                ]),
+            ),
+            ActionSpec::real(
+                "efficiency_report",
+                "Compare a label's latest resource record against its predecessor · efficiency as a ratio, ✗ raw speed.",
+                Of(&[
+                    req("label", Str, "history key used by resource_measure"),
+                    opt(
+                        "tolerance_percent",
+                        Num,
+                        "movement treated as unchanged · default 5",
+                    ),
+                ]),
+            ),
+            ActionSpec::real(
                 "perf_baseline",
                 "Measure a baseline from recorded passing stage durations · refuses on short history and says how many more runs are needed.",
                 Of(&[
@@ -2170,9 +2209,9 @@ mod tests {
         }
         assert_eq!(
             (real, scaffold, planned),
-            (153, 20, 7),
+            (156, 20, 7),
             "fidelity split moved · update the fidelity doc too"
         );
-        assert_eq!(real + scaffold + planned, 180, "action count drift");
+        assert_eq!(real + scaffold + planned, 183, "action count drift");
     }
 }
