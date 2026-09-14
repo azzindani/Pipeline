@@ -49,6 +49,7 @@ fn enter_project() -> tempfile::TempDir {
 async fn the_resource_actions_are_reachable_and_honest() {
     resource_measurement_records_real_numbers_and_compares_them().await;
     throttling_refuses_rather_than_mislabelling_an_unconstrained_run().await;
+    maturity_is_derived_from_run_history().await;
 }
 
 /// Resource measurement, driven the way an agent would.
@@ -147,4 +148,62 @@ async fn throttling_refuses_rather_than_mislabelling_an_unconstrained_run() {
             "refusal must name the missing mechanism: {why}"
         );
     }
+}
+
+/// Maturity computed from real runs, ✗ asserted.
+///
+/// ! Folded into this binary rather than a third one: it chdirs like the rest,
+/// and a separate binary would only add another process doing the same thing.
+async fn maturity_is_derived_from_run_history() {
+    let _dir = enter_project();
+    let state = Arc::new(ServerState::new());
+
+    // A bare project has no evidence and must sit below level 0 — ✗ default to
+    // a level because nothing has failed yet.
+    let bare = call(&state, "pipeline_report", "maturity", json!({})).await;
+    assert_eq!(bare["level"].as_u64(), Some(0));
+    assert_eq!(bare["level_name"].as_str(), Some("below level 0"));
+    assert!(
+        bare["missing_for_next"]
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "a bare project must name what is missing: {bare}"
+    );
+
+    // Run the fast profile for real · static + unit now carry outcomes.
+    // The temp project has no Cargo.toml, so the rust stages fail — which is the
+    // case worth asserting: a recorded FAILURE must not become evidence.
+    // `call` is bypassed because a failing run is a legitimate outcome here,
+    // ✗ a broken call.
+    let run = call_tool(
+        "pipeline_run",
+        ToolRequest {
+            action: "stage".to_owned(),
+            args: json!({"profile": "fast"}),
+        },
+        state.clone(),
+    )
+    .await;
+    assert_eq!(
+        run.data["overall"].as_str(),
+        Some("fail"),
+        "expected the stages to fail in a project with no manifest: {}",
+        run.data
+    );
+
+    let after = call(&state, "pipeline_report", "maturity", json!({})).await;
+    assert!(
+        after["runs_examined"].as_u64().is_some_and(|n| n > 0),
+        "no runs reached the evidence map: {after}"
+    );
+    assert_eq!(
+        after["level"].as_u64(),
+        Some(0),
+        "failed stages must not raise the level: {after}"
+    );
+    let present = after["evidence_present"].as_array().expect("array");
+    assert!(
+        present.is_empty(),
+        "a failing run produced positive evidence: {present:?}"
+    );
 }
