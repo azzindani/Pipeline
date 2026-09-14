@@ -387,6 +387,11 @@ static REGISTRY: [ToolDescriptor; 19] = [
         summary: "Idea intake · feasibility · PRD · features · milestones · ADRs · risks.",
         actions: &[
             ActionSpec::real(
+                "mode_set",
+                "Declare build | maintain · decides which gates apply.",
+                Of(&[req("mode", Str, "build | maintain")]),
+            ),
+            ActionSpec::real(
                 "idea_capture",
                 "Persist an idea · ! single fixed key: a second capture overwrites the first.",
                 Of(&[req("text", Str, "idea body")]),
@@ -674,6 +679,34 @@ static REGISTRY: [ToolDescriptor; 19] = [
                         "stack",
                         Str,
                         "override pipeline.yaml · rust | python-uv | bun | node | go",
+                    ),
+                ]),
+            ),
+            ActionSpec::real(
+                "devtool_add",
+                "Register a project-local tool the agent wrote · Pipeline validates the contract, ✗ the logic.",
+                Of(&[
+                    req("name", Str, "tool name · unique per project"),
+                    req("entry", Str, "command that runs it, from the project root"),
+                    req(
+                        "destructive",
+                        Bool,
+                        "does it mutate source | state · required, ✗ defaulted",
+                    ),
+                    opt("description", Str, "what it does"),
+                ]),
+            ),
+            ActionSpec::real("devtool_list", "List registered project tools.", NoArgs),
+            ActionSpec::real(
+                "devtool_run",
+                "Run a registered tool · destructive tools dry-run unless confirmed.",
+                Of(&[
+                    req("name", Str, "registered tool name"),
+                    opt("args", Str, "extra arguments appended to the entry command"),
+                    opt(
+                        "confirm",
+                        Bool,
+                        "execute a destructive tool · default false → dry run",
                     ),
                 ]),
             ),
@@ -2214,9 +2247,9 @@ mod tests {
         }
         assert_eq!(
             (real, scaffold, planned),
-            (157, 20, 7),
+            (161, 20, 7),
             "fidelity split moved · update the fidelity doc too"
         );
-        assert_eq!(real + scaffold + planned, 184, "action count drift");
+        assert_eq!(real + scaffold + planned, 188, "action count drift");
     }
 }

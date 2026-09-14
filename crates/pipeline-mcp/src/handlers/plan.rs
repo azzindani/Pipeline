@@ -37,6 +37,7 @@ pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
         "milestone_create" => milestone_create(req.args, state).await,
         "milestone_progress" => milestone_progress(req.args, state).await,
         "progress" => progress(state).await,
+        "mode_set" => mode_set(&req.args, state).await,
         "decision_log" => decision_log(req.args, state).await,
         "risk_add" => risk_add(req.args, state).await,
         "risk_list" => risk_list(state).await,
@@ -1406,6 +1407,58 @@ fn err(msg: String) -> ToolResponse {
         memory_refs: vec![],
         error: Some(msg),
     }
+}
+
+/// Declare whether this project is being built or maintained.
+///
+/// ! The two modes optimise for opposite things — build mode for scaffold speed
+/// and shape correctness, maintain mode for regression safety — so which gates
+/// apply depends on it. Storing the mode is what lets a gate ask, rather than
+/// every gate guessing from the commit rate.
+async fn mode_set(args: &Value, state: Arc<ServerState>) -> ToolResponse {
+    const MODES: [&str; 2] = ["build", "maintain"];
+
+    let Some(mode) = args.get("mode").and_then(Value::as_str) else {
+        return err(format!("missing 'mode' · one of: {}", MODES.join(" | ")));
+    };
+    if !MODES.contains(&mode) {
+        return err(format!(
+            "unknown mode '{mode}' · one of: {}",
+            MODES.join(" | ")
+        ));
+    }
+    let cfg = match load_config_in_cwd() {
+        Ok(c) => c,
+        Err(e) => return err(e),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(e),
+    };
+    let previous = mem
+        .recall(&cfg.project, "plan", "mode")
+        .await
+        .ok()
+        .flatten();
+    if let Err(e) = mem.remember(&cfg.project, "plan", "mode", mode).await {
+        return err(e.to_string());
+    }
+    ToolResponse::ok(json!({
+        "mode": mode,
+        "previous": previous,
+        "gates": match mode {
+            "maintain" => json!({
+                "motion_compare": "required",
+                "baselines": "frozen · move deliberately",
+                "coverage": "may not fall",
+            }),
+            _ => json!({
+                "motion_compare": "optional until a baseline exists",
+                "baselines": "recorded as the shape settles",
+                "coverage": "ratchets upward",
+            }),
+        },
+    }))
 }
 
 #[cfg(test)]
