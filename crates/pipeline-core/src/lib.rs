@@ -6,6 +6,7 @@
 //! integration · security) and the result envelope every super tool returns.
 //! Implementations land in `pipeline-stages`.
 
+pub mod maturity;
 pub mod motion;
 pub mod resource;
 
