@@ -49,6 +49,10 @@ standards:
   surfaces:
     - Command line
     - Deployed service
+    # .pipeline/memory.db is durable state beyond files → the persistent-store
+    # surface applies, and with it database/ENGINES.md. SQLite here is the
+    # embedded case that standard permits, ✗ an exemption → docs/adr/0001.
+    - Persistent store
     - Public package
   pin: 0828bd8de09977166cb30172d26fdcb1113bd0fa
 
