@@ -517,6 +517,12 @@ The faster this loop · the faster the agent learns what works. Memory makes the
 
 ---
 
+## 11b. Open backlog
+
+Live task list → **`docs/TASKS.md`**. Session task state is ephemeral and invisible outside the terminal UI; that file is the durable copy. Update it when a task moves.
+
+---
+
 ## 12. Risk register
 
 | Risk | Likelihood | Impact | Mitigation |
