@@ -38,6 +38,9 @@ pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
         "milestone_progress" => milestone_progress(req.args, state).await,
         "progress" => progress(state).await,
         "mode_set" => mode_set(&req.args, state).await,
+        "task_add" => task_add(&req.args, state).await,
+        "task_list" => task_list(&req.args, state).await,
+        "task_update" => task_update(&req.args, state).await,
         "decision_log" => decision_log(req.args, state).await,
         "risk_add" => risk_add(req.args, state).await,
         "risk_list" => risk_list(state).await,
@@ -1459,6 +1462,245 @@ async fn mode_set(args: &Value, state: Arc<ServerState>) -> ToolResponse {
             }),
         },
     }))
+}
+
+// ── task tracking ───────────────────────────────────────────────────────────
+//
+// ! Durable and queryable, ✗ a session list. `workflow/STANDARDS.md` §8: every
+// non-trivial task is tracked, and working on untracked tasks creates invisible
+// debt. A task list that lives in an agent's session dies with it — which is
+// exactly the invisible work that rule forbids.
+//
+// Priority vocabulary is fixed to P0–P4 from that standard, ✗ free text: a
+// priority nobody can compare is a label.
+
+const PRIORITIES: [&str; 5] = ["P0", "P1", "P2", "P3", "P4"];
+const STATUSES: [&str; 4] = ["open", "in_progress", "blocked", "done"];
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct Task {
+    id: String,
+    title: String,
+    #[serde(default)]
+    detail: String,
+    priority: String,
+    status: String,
+    /// What makes this verifiably finished · `workflow` §8 requires a testable
+    /// done condition, so a task without one is incomplete at creation.
+    acceptance: String,
+    /// Parent goal | feature | bug this serves · traceability.
+    #[serde(default)]
+    parent: Option<String>,
+    /// Why it is blocked · only meaningful with `status: blocked`.
+    #[serde(default)]
+    blocker: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+async fn load_tasks(
+    cfg: &pipeline_config::PipelineConfig,
+    mem: &pipeline_memory::Memory,
+) -> Vec<Task> {
+    mem.recall(&cfg.project, "task", "list")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+async fn save_tasks(
+    cfg: &pipeline_config::PipelineConfig,
+    mem: &pipeline_memory::Memory,
+    tasks: &[Task],
+) -> Result<(), String> {
+    let blob = serde_json::to_string(tasks).map_err(|e| e.to_string())?;
+    mem.remember(&cfg.project, "task", "list", &blob)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Days since an RFC3339 timestamp · `None` when unparseable.
+fn days_since(ts: &str) -> Option<i64> {
+    let then = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
+    Some((chrono::Utc::now() - then.with_timezone(&chrono::Utc)).num_days())
+}
+
+async fn task_add(args: &Value, state: Arc<ServerState>) -> ToolResponse {
+    let Some(title) = args.get("title").and_then(Value::as_str) else {
+        return err("missing 'title'".into());
+    };
+    // ! Required. workflow §8 makes a testable done condition part of a task,
+    // ✗ an optional extra — a task nobody can verify finished is never finished.
+    let Some(acceptance) = args.get("acceptance").and_then(Value::as_str) else {
+        return err(
+            "missing 'acceptance' · a task needs a testable done condition, else \
+             nothing can say it is finished"
+                .into(),
+        );
+    };
+    let priority = args.get("priority").and_then(Value::as_str).unwrap_or("P2");
+    if !PRIORITIES.contains(&priority) {
+        return err(format!(
+            "unknown priority '{priority}' · one of: {}",
+            PRIORITIES.join(" · ")
+        ));
+    }
+    let cfg = match load_config_in_cwd() {
+        Ok(c) => c,
+        Err(e) => return err(e),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(e),
+    };
+    let now = pipeline_memory::now_rfc3339();
+    let task = Task {
+        id: uuid::Uuid::new_v4().to_string()[..8].to_owned(),
+        title: title.to_owned(),
+        detail: args
+            .get("detail")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        priority: priority.to_owned(),
+        status: "open".to_owned(),
+        acceptance: acceptance.to_owned(),
+        parent: args
+            .get("parent")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        blocker: None,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    let mut tasks = load_tasks(&cfg, &mem).await;
+    tasks.push(task.clone());
+    if let Err(e) = save_tasks(&cfg, &mem, &tasks).await {
+        return err(e);
+    }
+    ToolResponse {
+        ok: true,
+        data: json!({ "task": task, "total": tasks.len() }),
+        next_suggested: vec!["pipeline_plan.task_list".into()],
+        memory_refs: vec![format!("task:{}", task.id)],
+        error: None,
+    }
+}
+
+/// List tasks · newest-blocking-first, with staleness surfaced.
+async fn task_list(args: &Value, state: Arc<ServerState>) -> ToolResponse {
+    let cfg = match load_config_in_cwd() {
+        Ok(c) => c,
+        Err(e) => return err(e),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(e),
+    };
+    let tasks = load_tasks(&cfg, &mem).await;
+    let filter = args.get("status").and_then(Value::as_str);
+    let mut shown: Vec<&Task> = tasks
+        .iter()
+        .filter(|t| filter.is_none_or(|f| t.status == f))
+        .collect();
+    // Priority order, then oldest first · P0 above P4, and within a priority the
+    // task that has waited longest comes first.
+    shown.sort_by(|a, b| {
+        a.priority
+            .cmp(&b.priority)
+            .then(a.created_at.cmp(&b.created_at))
+    });
+
+    // ! Staleness is reported, ✗ enforced. workflow §8: no activity 30+ days →
+    // re-evaluate · blocked 7+ days → escalate. Pipeline surfaces both; the
+    // decision stays with whoever owns the work.
+    let untouched_30d: Vec<&str> = tasks
+        .iter()
+        .filter(|t| t.status != "done" && days_since(&t.updated_at).is_some_and(|d| d >= 30))
+        .map(|t| t.id.as_str())
+        .collect();
+    let blocked_7d: Vec<&str> = tasks
+        .iter()
+        .filter(|t| t.status == "blocked" && days_since(&t.updated_at).is_some_and(|d| d >= 7))
+        .map(|t| t.id.as_str())
+        .collect();
+
+    let mut by_status: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for t in &tasks {
+        *by_status.entry(t.status.as_str()).or_default() += 1;
+    }
+
+    ToolResponse::ok(json!({
+        "tasks": shown,
+        "total": tasks.len(),
+        "by_status": by_status,
+        "stale_30d": untouched_30d,
+        "blocked_7d": blocked_7d,
+        "next": shown.iter().find(|t| t.status == "open").map(|t| &t.id),
+    }))
+}
+
+async fn task_update(args: &Value, state: Arc<ServerState>) -> ToolResponse {
+    let Some(id) = args.get("id").and_then(Value::as_str) else {
+        return err("missing 'id'".into());
+    };
+    let cfg = match load_config_in_cwd() {
+        Ok(c) => c,
+        Err(e) => return err(e),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(e),
+    };
+    let mut tasks = load_tasks(&cfg, &mem).await;
+    let Some(task) = tasks.iter_mut().find(|t| t.id == id) else {
+        return err(format!("no task '{id}'"));
+    };
+
+    if let Some(status) = args.get("status").and_then(Value::as_str) {
+        if !STATUSES.contains(&status) {
+            return err(format!(
+                "unknown status '{status}' · one of: {}",
+                STATUSES.join(" · ")
+            ));
+        }
+        // ! Blocked requires a reason. "blocked" with no cause is untrackable —
+        // nobody can unblock what nobody named.
+        if status == "blocked"
+            && args.get("blocker").and_then(Value::as_str).is_none()
+            && task.blocker.is_none()
+        {
+            return err("status 'blocked' requires 'blocker' · name what is blocking it".into());
+        }
+        if status != "blocked" {
+            task.blocker = None;
+        }
+        task.status = status.to_owned();
+    }
+    if let Some(blocker) = args.get("blocker").and_then(Value::as_str) {
+        task.blocker = Some(blocker.to_owned());
+    }
+    if let Some(priority) = args.get("priority").and_then(Value::as_str) {
+        if !PRIORITIES.contains(&priority) {
+            return err(format!(
+                "unknown priority '{priority}' · one of: {}",
+                PRIORITIES.join(" · ")
+            ));
+        }
+        task.priority = priority.to_owned();
+    }
+    if let Some(detail) = args.get("detail").and_then(Value::as_str) {
+        task.detail = detail.to_owned();
+    }
+    task.updated_at = pipeline_memory::now_rfc3339();
+    let updated = task.clone();
+
+    if let Err(e) = save_tasks(&cfg, &mem, &tasks).await {
+        return err(e);
+    }
+    ToolResponse::ok(json!({ "task": updated }))
 }
 
 #[cfg(test)]

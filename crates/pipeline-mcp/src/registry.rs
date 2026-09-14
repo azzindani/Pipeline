@@ -387,6 +387,41 @@ static REGISTRY: [ToolDescriptor; 19] = [
         summary: "Idea intake · feasibility · PRD · features · milestones · ADRs · risks.",
         actions: &[
             ActionSpec::real(
+                "task_add",
+                "Track a task · durable in project memory, ✗ a session list. Acceptance is required — a task nobody can verify finished never is.",
+                Of(&[
+                    req("title", Str, "one-line outcome"),
+                    req("acceptance", Str, "testable done condition"),
+                    opt("priority", Str, "P0 | P1 | P2 | P3 | P4 · default P2"),
+                    opt("detail", Str, "context"),
+                    opt("parent", Str, "goal | feature | bug this serves"),
+                ]),
+            ),
+            ActionSpec::real(
+                "task_list",
+                "List tasks by priority then age · surfaces 30-day stale and 7-day blocked, ✗ enforces them.",
+                Of(&[opt(
+                    "status",
+                    Str,
+                    "open | in_progress | blocked | done · omit → all",
+                )]),
+            ),
+            ActionSpec::real(
+                "task_update",
+                "Move a task · 'blocked' requires naming the blocker.",
+                Of(&[
+                    req("id", Str, "task id from task_list"),
+                    opt("status", Str, "open | in_progress | blocked | done"),
+                    opt(
+                        "blocker",
+                        Str,
+                        "what blocks it · required when status is blocked",
+                    ),
+                    opt("priority", Str, "P0 | P1 | P2 | P3 | P4"),
+                    opt("detail", Str, "updated context"),
+                ]),
+            ),
+            ActionSpec::real(
                 "mode_set",
                 "Declare build | maintain · decides which gates apply.",
                 Of(&[req("mode", Str, "build | maintain")]),
@@ -2054,6 +2089,16 @@ static REGISTRY: [ToolDescriptor; 19] = [
                 ]),
             ),
             ActionSpec::real(
+                "health",
+                "Project health in one call · last run, its AGE, consecutive failures, uncommitted files. Reports concerns, ✗ a quality verdict.",
+                NoArgs,
+            ),
+            ActionSpec::real(
+                "audit",
+                "Wider pass · gaps against declared gates, standards binding, stage evidence, tracked work. Names gaps, ✗ judges acceptability.",
+                NoArgs,
+            ),
+            ActionSpec::real(
                 "self_check",
                 "Probe cargo · rustc · docker · git via --version · takes no arguments.",
                 NoArgs,
@@ -2247,9 +2292,9 @@ mod tests {
         }
         assert_eq!(
             (real, scaffold, planned),
-            (161, 20, 7),
+            (166, 20, 7),
             "fidelity split moved · update the fidelity doc too"
         );
-        assert_eq!(real + scaffold + planned, 188, "action count drift");
+        assert_eq!(real + scaffold + planned, 193, "action count drift");
     }
 }
