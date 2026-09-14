@@ -6,6 +6,8 @@
 //! integration · security) and the result envelope every super tool returns.
 //! Implementations land in `pipeline-stages`.
 
+pub mod motion;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

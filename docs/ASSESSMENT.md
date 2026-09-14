@@ -16,7 +16,7 @@ Baseline audit of Pipeline + Standards. State at Pipeline `c28f063` · Standards
 
 ## MCP surface
 
-19 tools · 177 actions — 150 real · 20 scaffold · 7 planned.
+19 tools · 180 actions — 153 real · 20 scaffold · 7 planned.
 (175/148 at the time of the audit · `session.progress` added since.)
 `tools/list` payload = 82,636 B ≈ 23–25k tokens (descriptions 20,325 B · inputSchema 62,311 B).
 
