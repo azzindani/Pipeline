@@ -2,7 +2,7 @@
 
 > Live backlog for Pipeline + Standards. Session task state is ephemeral and invisible outside the terminal UI — this file is the durable copy.
 
-Updated: 2026-09-14 · 20 done · 9 open · 2 removed by request.
+Updated: 2026-09-14 · 2 removed by request.
 
 Blocked items name their blocker. ✗ mark a task done while its verification is blocked — record the partial and say what is missing.
 
@@ -32,7 +32,6 @@ Blocked items name their blocker. ✗ mark a task done while its verification is
 | # | Task | Shipped | Missing |
 |---|---|---|---|
 | 21 | Apply primitives to Pipeline's own code | Kinds declared on all 16 crate roots · direction check passes | 44 submodules undeclared · `repo.rs` 2,360 LOC · `data.rs` 1,903 · `plan.rs` 1,624 · `e2e.rs` 1,541 unsplit. Needs the registry's call-site + duplicate detection first |
-| 33 | Auth audit findings | Findings 1, 2, 4, 5 fixed | Finding 3 — redacting wrapper type for token values, so omission is the default rather than a per-call-site habit |
 
 ---
 
@@ -40,11 +39,8 @@ Blocked items name their blocker. ✗ mark a task done while its verification is
 
 | # | Task | Notes |
 |---|---|---|
-| 36 | Measure coverage in the unit stage | Pipeline is maturity level 0 because `gates.coverage: 70` is declared and never measured. One stage change unlocks level 1 |
 | 1 | Promote the 7 `Planned` actions | Feasible here: `e2e.record` (needs a timeout — it spawns an interactive tool and blocks forever), `simulate.journey_simulate`, analysis half of `repo.re_reconstruct`. Blocked by #29: `env.devcontainer_open` · `deploy.canary` · `blue_green`. Own project: `repo.port` |
 | 8 | `test.fixture_create` · `eval_run` · `endpoint_probe` · `docker_verify` · `e2e.video_capture` · `simulate.stress` | `docker_verify` blocked by #29 · rest are not |
-| 9 | `project.devtool_*` · `plan.mode_set` | Decided: Pipeline **hosts** agent-authored tools, ✗ generates → `docs/MATURITY.md` §10.1 · conventions → `primitives/STANDARDS.md` §11 |
-| 32 | Reconcile documented vs implemented handover packet | `CLAUDE.md` shows `current_branch` · `last_good_commit` · `consecutive_failures` · `files_in_progress` · `last_action` · `blockers` · `relevant_memory` · `suggested_next`. None exist on `HandoverPacket`. Per field: implement | delete from the doc |
 | 3 | Fix what the full-stage run revealed | Original findings were environmental. The real defects found this session were fixed under their own tasks. Revisit after #29 |
 
 ---
@@ -53,7 +49,7 @@ Blocked items name their blocker. ✗ mark a task done while its verification is
 
 | # | Task | Progress |
 |---|---|---|
-| 34 | Review every standard against current external best practice | Security tier done · findings in `Standards/tools/review/FINDINGS-core.md`. Remaining: `devops/` (NIST SP 800-190 · CIS) · `api/` (OpenAPI 3.1) · `web/` (OWASP Top 10) · `database/` + `sql/` · `python/` `go/` `typescript/` `shell/` · `testing/` `ml/` `data_pipeline/` |
+| 34 | Review every standard against current external best practice | Done: security · `devops/` · `api/` · `web/`. Verified-current and no-change results are recorded too, so the unexamined set is visible. **Remaining: `database/` + `sql/` · `python/` `go/` `typescript/` `shell/` · `testing/` `ml/` `data_pipeline/`** · findings in `Standards/tools/review/FINDINGS-core.md` |
 
 **Method that works:** IETF and OWASP web mirrors are blocked by the proxy; `github.com` is not, and the sources live there. `git clone --depth 1 github.com/OWASP/ASVS` → read requirement text → cite by id. Same for `OWASP/CheatSheetSeries` · `open-telemetry/semantic-conventions` · `usnistgov/800-63-4`. RFC text remains unreachable — search summaries only.
 
@@ -91,6 +87,11 @@ Pipeline 432 → 491 tests · fmt + clippy clean · `pipeline run confirm` green
 | 25 | Handover verified across a real process boundary |
 | 6 | `observe.resource_measure` · `throttle_test` · `efficiency_report` — wired, driven end to end |
 | 23 | Maturity level computed from real run history — `report.maturity` |
+| 9 | `project.devtool_*` · `plan.mode_set` — Pipeline hosts agent-authored tools |
+| 32 | Handover packet reconciled · `current_branch` + `last_good_commit` implemented, six doc-only fields deleted |
+| 33 | All five auth findings fixed — TTL · refresh reuse · PKCE plain · code reuse · redaction |
+| 36 | Coverage measured · gate ratcheted 70 → 61 against a real 61.42% · **Pipeline is maturity level 1** |
 | 30 | `security/TOKENS.md` |
 | 31 | Auth audit — 5 findings, 4 fixed |
 | 35 | `security/OAUTH.md` — and it caught finding 5 in Pipeline the same day |
+| 34a | Standards review: security tier · `devops/CONTAINERS.md` (runtime hardening) · `web/SECURITY.md` (SRI · Trusted Types · COOP/CORP) |
