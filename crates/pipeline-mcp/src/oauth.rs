@@ -121,6 +121,14 @@ pub struct OAuth {
     /// to recognise a replay, ✗ to be durable. Losing it on restart costs one
     /// missed detection, ✗ correctness.
     spent_refresh: Mutex<HashMap<String, String>>,
+    /// Redeemed authorization code → the chain it minted. Same purpose, earlier
+    /// in the flow.
+    ///
+    /// ! Deleting a code on first read stops a second redemption but leaves
+    /// whatever the first redemption minted alive — and when the attacker
+    /// redeemed first, that is precisely the grant to kill. Refusing without
+    /// revoking hands the attacker a working session and the user an error.
+    spent_codes: Mutex<HashMap<String, String>>,
     clients: Mutex<HashMap<String, Client>>,
     /// Seeded from env · never evicted by the DCR reaper.
     static_client_id: String,
@@ -154,6 +162,7 @@ impl OAuth {
             access: Mutex::new(load_store(&state_dir.join("access-tokens.json"))),
             refresh: Mutex::new(load_store(&state_dir.join("refresh-tokens.json"))),
             spent_refresh: Mutex::new(HashMap::new()),
+            spent_codes: Mutex::new(HashMap::new()),
             clients: Mutex::new(clients),
             state_dir,
             static_client_id,
@@ -248,6 +257,24 @@ impl OAuth {
             persist(&self.refresh_file(), &m);
         }
         killed
+    }
+
+    /// Chain a redeemed authorization code minted, if still known.
+    fn chain_of_spent_code(&self, code: &str) -> Option<String> {
+        self.spent_codes
+            .lock()
+            .ok()
+            .and_then(|m| m.get(code).cloned())
+    }
+
+    /// Remember which chain a code produced, so a replay is recognisable.
+    fn mark_code_spent(&self, code: &str, chain: &str) {
+        if let Ok(mut m) = self.spent_codes.lock() {
+            if m.len() >= SPENT_REFRESH_CAP {
+                m.clear();
+            }
+            m.insert(code.to_owned(), chain.to_owned());
+        }
     }
 
     /// Chain a spent refresh token belonged to, if it is still known.
@@ -628,44 +655,53 @@ fn urlencode(s: &str) -> String {
 }
 
 /// Exchange an auth code (or a refresh token) for a fresh access + refresh pair.
+/// Rotate a refresh grant · reuse of a spent token revokes the lineage.
+///
+/// ! Split out of `token` to keep that function readable, ✗ because the logic
+/// is separable: the reuse branch and the rotation branch must stay adjacent,
+/// since the whole point is that one is the other's failure mode.
+fn refresh_grant(st: &AppState, f: &HashMap<String, String>) -> Response {
+    // ── refresh grant: rotate, so a 24h lapse never forces a re-authorize ──
+    let presented = f.get("refresh_token").map_or("", String::as_str);
+    let rec = st.oauth.refresh.lock().ok().and_then(|mut m| {
+        // Single-use: remove on read whether or not it turns out valid.
+        m.remove(presented).inspect(|_| {
+            persist(&st.oauth.refresh_file(), &m);
+        })
+    });
+    let Some(rec) = rec.filter(|r| r.expires_at > now_ms()) else {
+        // ! Reuse of a token we know was already spent is theft, ✗ a
+        // mistake: the legitimate holder rotated it away, so whoever is
+        // presenting it now got it some other way. Kill the whole lineage.
+        // Both parties lose access and the user re-authorizes — the
+        // alternative leaves a thief holding a working chain.
+        if let Some(chain) = st.oauth.chain_of_spent(presented) {
+            let killed = st.oauth.revoke_chain(&chain);
+            tracing::warn!(
+                event = "refresh_token_reuse",
+                grants_revoked = killed,
+                "spent refresh token replayed · revoked the chain"
+            );
+        }
+        // ! Response stays generic · TOKENS.md §3. The log says what
+        // happened; the caller learns only that the grant is invalid.
+        return oauth_err(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "Refresh token is missing, expired, or already used.",
+        );
+    };
+    st.oauth.mark_spent(presented, rec.chain.clone());
+    let scope = f.get("scope").map_or("mcp", String::as_str);
+    Json(st.oauth.issue_pair(&rec.principal, scope, rec.chain)).into_response()
+}
+
 pub async fn token(State(st): State<AppState>, Form(f): Form<HashMap<String, String>>) -> Response {
     st.oauth.reap();
     let grant = f.get("grant_type").map_or("", String::as_str);
 
-    // ── refresh grant: rotate, so a 24h lapse never forces a re-authorize ──
     if grant == "refresh_token" {
-        let presented = f.get("refresh_token").map_or("", String::as_str);
-        let rec = st.oauth.refresh.lock().ok().and_then(|mut m| {
-            // Single-use: remove on read whether or not it turns out valid.
-            m.remove(presented).inspect(|_| {
-                persist(&st.oauth.refresh_file(), &m);
-            })
-        });
-        let Some(rec) = rec.filter(|r| r.expires_at > now_ms()) else {
-            // ! Reuse of a token we know was already spent is theft, ✗ a
-            // mistake: the legitimate holder rotated it away, so whoever is
-            // presenting it now got it some other way. Kill the whole lineage.
-            // Both parties lose access and the user re-authorizes — the
-            // alternative leaves a thief holding a working chain.
-            if let Some(chain) = st.oauth.chain_of_spent(presented) {
-                let killed = st.oauth.revoke_chain(&chain);
-                tracing::warn!(
-                    event = "refresh_token_reuse",
-                    grants_revoked = killed,
-                    "spent refresh token replayed · revoked the chain"
-                );
-            }
-            // ! Response stays generic · TOKENS.md §3. The log says what
-            // happened; the caller learns only that the grant is invalid.
-            return oauth_err(
-                StatusCode::BAD_REQUEST,
-                "invalid_grant",
-                "Refresh token is missing, expired, or already used.",
-            );
-        };
-        st.oauth.mark_spent(presented, rec.chain.clone());
-        let scope = f.get("scope").map_or("mcp", String::as_str);
-        return Json(st.oauth.issue_pair(&rec.principal, scope, rec.chain)).into_response();
+        return refresh_grant(&st, &f);
     }
 
     if grant != "authorization_code" {
@@ -689,6 +725,18 @@ pub async fn token(State(st): State<AppState>, Form(f): Form<HashMap<String, Str
         .filter(|r| r.expires_at > now_ms());
 
     let Some(record) = record else {
+        // ! A code we know was already redeemed is a replay, ✗ a typo. Revoke
+        // what that redemption minted: if the attacker redeemed first, refusing
+        // this request alone leaves them holding the session and hands the
+        // legitimate user the error. ASVS 10.4.2.
+        if let Some(chain) = st.oauth.chain_of_spent_code(code) {
+            let killed = st.oauth.revoke_chain(&chain);
+            tracing::warn!(
+                event = "authorization_code_reuse",
+                grants_revoked = killed,
+                "redeemed authorization code replayed · revoked the chain"
+            );
+        }
         return oauth_err(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
@@ -749,8 +797,11 @@ pub async fn token(State(st): State<AppState>, Form(f): Form<HashMap<String, Str
     }
 
     let scope = record.scope.as_deref().unwrap_or("mcp");
-    // Fresh authorization starts a new lineage.
-    Json(st.oauth.issue_pair(&record.principal, scope, None)).into_response()
+    // Fresh authorization starts a new lineage · recorded against the code so a
+    // later replay of that code can revoke exactly what it produced.
+    let chain = random_token();
+    st.oauth.mark_code_spent(code, &chain);
+    Json(st.oauth.issue_pair(&record.principal, scope, Some(chain))).into_response()
 }
 
 #[cfg(test)]
@@ -855,6 +906,45 @@ mod tests {
             let accepted = matches!(method, Some("S256"));
             assert!(!accepted, "method {method:?} must not be accepted");
         }
+    }
+
+    #[test]
+    fn replaying_a_redeemed_authorization_code_kills_what_it_minted() {
+        // ! The half-implementation this guards against: delete the code on
+        // first read, refuse the second redemption, and leave the first
+        // redemption's tokens alive. When the attacker redeemed first, those
+        // are exactly the grants to kill — refusing alone gives them a working
+        // session and the user an error message. ASVS 10.4.2.
+        let o = oauth();
+        let code = "the-code";
+        let chain = random_token();
+        o.mark_code_spent(code, &chain);
+        let issued = o.issue_pair("alice", "mcp", Some(chain.clone()));
+        let access = issued["access_token"].as_str().unwrap().to_owned();
+        assert_eq!(o.resolve(&access).as_deref(), Some("alice"));
+
+        // Replay of that code → everything it produced dies.
+        assert_eq!(o.chain_of_spent_code(code).as_deref(), Some(chain.as_str()));
+        assert!(o.revoke_chain(&chain) > 0, "revocation removed nothing");
+        assert_eq!(
+            o.resolve(&access),
+            None,
+            "tokens minted by the replayed code survived"
+        );
+    }
+
+    #[test]
+    fn an_unknown_code_leaves_other_sessions_alone() {
+        // A typo'd | expired code must refuse without collateral damage.
+        let o = oauth();
+        let other = o.issue_pair("bob", "mcp", None);
+        let bobs = other["access_token"].as_str().unwrap().to_owned();
+        assert!(o.chain_of_spent_code("never-issued").is_none());
+        assert_eq!(
+            o.resolve(&bobs).as_deref(),
+            Some("bob"),
+            "an unknown code must not touch another session"
+        );
     }
 
     #[test]
