@@ -142,6 +142,8 @@ Three, fixed: `dev` → `staging` → `production`.
 
 Environment is first-class in `pipeline.yaml`, ✗ a deploy argument. `e2e.against_env` and `deploy.target` resolve against it.
 
+Implemented in `pipeline-config` as `Environments` · `Environment { name · requires · tunnel · approval }`. Omitting the block yields exactly these three rungs with these gates — defaults live in code, ✗ in every project's YAML. An absent block is never an empty ladder: that would read as "no gates" and let anything promote straight to production.
+
 ---
 
 ## 7. Surface rule
