@@ -154,6 +154,10 @@ Rationale is measured, ✗ aesthetic: `tools/list` cost is driven by per-action 
 
 Ceiling: 19 tools · ≤ 200 actions. Crossing 200 → drop Scaffold and Planned actions first (27 available), ✗ add a tool.
 
+! At **194** the ceiling is close. The next batch of actions requires resolving
+the 27 Scaffold and Planned actions first — that is the rule, ✗ a suggestion,
+and raising the ceiling to avoid it would make the budget decorative.
+
 ---
 
 ## 8. Split across repos
