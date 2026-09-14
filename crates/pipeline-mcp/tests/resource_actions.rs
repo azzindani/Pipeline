@@ -52,6 +52,8 @@ async fn the_resource_actions_are_reachable_and_honest() {
     maturity_is_derived_from_run_history().await;
     devtools_are_hosted_and_destructive_ones_dry_run().await;
     mode_set_records_the_project_mode().await;
+    tasks_are_tracked_with_a_verifiable_done_condition().await;
+    health_and_audit_report_gaps_without_grading().await;
 }
 
 /// Resource measurement, driven the way an agent would.
@@ -337,4 +339,129 @@ async fn mode_set_records_the_project_mode() {
     )
     .await;
     assert!(!bogus.ok, "an unknown mode must be refused");
+}
+
+/// Task tracking · durable, ✗ a session list.
+async fn tasks_are_tracked_with_a_verifiable_done_condition() {
+    let _dir = enter_project();
+    let state = Arc::new(ServerState::new());
+
+    // ! Acceptance is required. A task nobody can verify finished never is, so
+    // omitting it must fail rather than default to empty.
+    let no_acceptance = call_tool(
+        "pipeline_plan",
+        ToolRequest {
+            action: "task_add".to_owned(),
+            args: json!({"title": "do a thing"}),
+        },
+        state.clone(),
+    )
+    .await;
+    assert!(!no_acceptance.ok, "acceptance must be required");
+
+    let added = call(
+        &state,
+        "pipeline_plan",
+        "task_add",
+        json!({
+            "title": "wire the coverage gate",
+            "acceptance": "pipeline run fast reports a coverage line",
+            "priority": "P1"
+        }),
+    )
+    .await;
+    let id = added["task"]["id"].as_str().expect("id").to_owned();
+    assert_eq!(added["task"]["status"].as_str(), Some("open"));
+
+    // Priority order: P0 sorts above P2.
+    call(
+        &state,
+        "pipeline_plan",
+        "task_add",
+        json!({"title": "urgent", "acceptance": "it stops failing", "priority": "P0"}),
+    )
+    .await;
+    let listed = call(&state, "pipeline_plan", "task_list", json!({})).await;
+    assert_eq!(listed["total"].as_u64(), Some(2));
+    assert_eq!(
+        listed["tasks"][0]["priority"].as_str(),
+        Some("P0"),
+        "P0 must sort first: {listed}"
+    );
+
+    // ! Blocked without a reason is untrackable — nobody can unblock what
+    // nobody named.
+    let nameless = call_tool(
+        "pipeline_plan",
+        ToolRequest {
+            action: "task_update".to_owned(),
+            args: json!({"id": id, "status": "blocked"}),
+        },
+        state.clone(),
+    )
+    .await;
+    assert!(!nameless.ok, "blocked must require a blocker");
+
+    let blocked = call(
+        &state,
+        "pipeline_plan",
+        "task_update",
+        json!({"id": id, "status": "blocked", "blocker": "registry 403"}),
+    )
+    .await;
+    assert_eq!(blocked["task"]["blocker"].as_str(), Some("registry 403"));
+
+    // Leaving blocked clears the blocker · a stale reason reads as a live one.
+    let unblocked = call(
+        &state,
+        "pipeline_plan",
+        "task_update",
+        json!({"id": id, "status": "in_progress"}),
+    )
+    .await;
+    assert!(
+        unblocked["task"]["blocker"].is_null(),
+        "moving off blocked must clear the blocker: {unblocked}"
+    );
+
+    // Survives a reconnect · the whole point of durable tracking.
+    let fresh = Arc::new(ServerState::new());
+    let reread = call(&fresh, "pipeline_plan", "task_list", json!({})).await;
+    assert_eq!(
+        reread["total"].as_u64(),
+        Some(2),
+        "tasks did not survive: {reread}"
+    );
+}
+
+/// Health and audit gather, ✗ judge.
+async fn health_and_audit_report_gaps_without_grading() {
+    let _dir = enter_project();
+    let state = Arc::new(ServerState::new());
+
+    let health = call(&state, "pipeline_meta", "health", json!({})).await;
+    assert_eq!(health["project"].as_str(), Some("resource-test"));
+    // A project with no runs must say so rather than report healthy silence.
+    assert!(
+        health["concerns"].as_array().is_some_and(|c| c
+            .iter()
+            .any(|x| x.as_str().is_some_and(|s| s.contains("no run")))),
+        "a project with no runs must name that: {health}"
+    );
+
+    let audit = call(&state, "pipeline_meta", "audit", json!({})).await;
+    let findings = audit["findings"].as_array().expect("findings");
+    assert!(!findings.is_empty(), "a bare project has gaps: {audit}");
+    // ! Every finding carries a severity so attention can be ranked — but the
+    // response says plainly that severity ranks attention, ✗ acceptability.
+    assert!(
+        findings.iter().all(|f| f["severity"].is_string()),
+        "every finding needs a severity: {findings:?}"
+    );
+    assert!(
+        audit["note"]
+            .as_str()
+            .is_some_and(|n| n.contains("✗ a quality verdict")),
+        "audit must not present itself as a verdict: {audit}"
+    );
 }
