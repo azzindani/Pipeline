@@ -18,6 +18,9 @@ pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
     match req.action.as_str() {
         "metrics_setup" => metrics_setup(&req.args).await,
         "perf_baseline" => perf_baseline(&req.args, state).await,
+        "resource_measure" => resource_measure(&req.args, state).await,
+        "throttle_test" => throttle_test(&req.args, state).await,
+        "efficiency_report" => efficiency_report(&req.args, state).await,
         "perf_compare" => perf_compare(&req.args, state).await,
         "logs_aggregate" => logs_aggregate(&req.args).await,
         "traces_setup" => traces_setup(&req.args).await,
@@ -77,6 +80,183 @@ struct StageStat {
 /// `{}` — so every regression gate built on it was inert, and a baseline of
 /// nothing compared equal to everything. The numbers now come from
 /// `run_history`, the same genuinely measured data `optimize_suggest` reads.
+/// Run a command and record what it consumed.
+async fn resource_measure(args: &Value, state: Arc<ServerState>) -> ToolResponse {
+    let Some(command) = args.get("command").and_then(Value::as_str) else {
+        return err("missing 'command'".into());
+    };
+    let label = args
+        .get("label")
+        .and_then(Value::as_str)
+        .unwrap_or(command)
+        .to_owned();
+    let constraint = args
+        .get("constraint")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let work_units = args.get("work_units").and_then(Value::as_f64);
+
+    let m = match pipeline_core::resource::measure(
+        &label,
+        "sh",
+        &["-c".to_owned(), command.to_owned()],
+        constraint,
+        work_units,
+    ) {
+        Ok(m) => m,
+        Err(e) => return err(format!("spawn '{command}': {e}")),
+    };
+
+    let stored = store_resource_record(&m.record, &state).await;
+    let eff = m.record.efficiency();
+    ToolResponse {
+        // ! `ok` reports whether the MEASUREMENT succeeded, ✗ whether the
+        // command did. A failing command under measurement is a result worth
+        // keeping — exit_code carries that.
+        ok: true,
+        data: json!({
+            "record": m.record,
+            "efficiency": eff,
+            "exit_code": m.exit_code,
+            "unmeasured": m.unmeasured,
+            "stored": stored,
+            "stdout_tail": tail(&m.stdout),
+            "stderr_tail": tail(&m.stderr),
+        }),
+        next_suggested: vec!["pipeline_observe.efficiency_report".into()],
+        memory_refs: vec![format!("resource:{label}")],
+        error: None,
+    }
+}
+
+/// Run the same command under a declared constraint.
+///
+/// ! Refuses when no constraint mechanism is available rather than running
+/// unconstrained and labelling the result as throttled — a mislabelled baseline
+/// is worse than a missing one, because every later comparison inherits it.
+async fn throttle_test(args: &Value, state: Arc<ServerState>) -> ToolResponse {
+    let Some(command) = args.get("command").and_then(Value::as_str) else {
+        return err("missing 'command'".into());
+    };
+    let Some(profile) = args.get("profile").and_then(Value::as_str) else {
+        return err("missing 'profile' · the constraint this run is taken under".into());
+    };
+    if !cgroups_available() {
+        return err(format!(
+            "cannot apply constraint '{profile}' · no cgroup v2 controller at              /sys/fs/cgroup · running unconstrained and labelling it '{profile}' would              poison every comparison against it"
+        ));
+    }
+    let mut throttled = args.clone();
+    if let Some(o) = throttled.as_object_mut() {
+        o.insert("constraint".into(), Value::String(profile.to_owned()));
+        o.insert(
+            "label".into(),
+            Value::String(format!("{command} [{profile}]")),
+        );
+    }
+    resource_measure(&throttled, state).await
+}
+
+/// Compare a labelled record against its stored predecessor.
+async fn efficiency_report(args: &Value, state: Arc<ServerState>) -> ToolResponse {
+    let Some(label) = args.get("label").and_then(Value::as_str) else {
+        return err("missing 'label'".into());
+    };
+    let cfg = match load_config_in_cwd() {
+        Ok(c) => c,
+        Err(e) => return err(e),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(e),
+    };
+    let raw = match mem.recall(&cfg.project, "resource", label).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return err(format!(
+                "no resource record for '{label}' · run observe.resource_measure first"
+            ));
+        }
+        Err(e) => return err(e.to_string()),
+    };
+    let history: Vec<pipeline_core::resource::ResourceRecord> =
+        serde_json::from_str(&raw).unwrap_or_default();
+    let Some(current) = history.last() else {
+        return err(format!("record for '{label}' is empty"));
+    };
+    let Some(baseline) = history.len().checked_sub(2).and_then(|i| history.get(i)) else {
+        // ! One sample is not a comparison. Reporting "unchanged" here would
+        // claim a verdict the data cannot support.
+        return ToolResponse::ok(json!({
+            "label": label,
+            "samples": history.len(),
+            "current": current,
+            "efficiency": current.efficiency(),
+            "verdict": "insufficient-history",
+        }));
+    };
+    let tolerance = args
+        .get("tolerance_percent")
+        .and_then(Value::as_f64)
+        .unwrap_or(5.0);
+    let verdict = pipeline_core::resource::compare_efficiency(baseline, current, tolerance);
+    ToolResponse::ok(json!({
+        "label": label,
+        "samples": history.len(),
+        "baseline": baseline,
+        "current": current,
+        "efficiency": current.efficiency(),
+        "verdict": verdict,
+    }))
+}
+
+/// cgroup v2 presence · the only constraint mechanism available without Docker.
+fn cgroups_available() -> bool {
+    std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists()
+}
+
+/// Append to the label's history · returns whether it persisted.
+async fn store_resource_record(
+    record: &pipeline_core::resource::ResourceRecord,
+    state: &Arc<ServerState>,
+) -> bool {
+    let Ok(cfg) = load_config_in_cwd() else {
+        return false;
+    };
+    let Ok(mem) = ensure_memory(state).await else {
+        return false;
+    };
+    let mut history: Vec<pipeline_core::resource::ResourceRecord> = mem
+        .recall(&cfg.project, "resource", &record.label)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| serde_json::from_str(&r).ok())
+        .unwrap_or_default();
+    history.push(record.clone());
+    // Bounded · a history that grows without limit turns every read into a
+    // larger one. The last 50 samples answer every question this feeds.
+    if history.len() > 50 {
+        let excess = history.len() - 50;
+        history.drain(..excess);
+    }
+    let Ok(blob) = serde_json::to_string(&history) else {
+        return false;
+    };
+    mem.remember(&cfg.project, "resource", &record.label, &blob)
+        .await
+        .is_ok()
+}
+
+/// Last 2 KiB · enough to diagnose, ✗ enough to flood a context window.
+fn tail(s: &str) -> String {
+    const LIMIT: usize = 2048;
+    if s.len() <= LIMIT {
+        return s.to_owned();
+    }
+    s[s.len() - LIMIT..].to_owned()
+}
+
 async fn perf_baseline(args: &Value, state: Arc<ServerState>) -> ToolResponse {
     let suite = args
         .get("suite")

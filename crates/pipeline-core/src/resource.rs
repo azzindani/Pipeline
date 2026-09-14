@@ -123,6 +123,54 @@ mod tests {
     }
 
     #[test]
+    fn measuring_a_real_command_yields_real_numbers() {
+        let m = measure(
+            "sleep",
+            "sh",
+            &["-c".to_owned(), "sleep 0.2".to_owned()],
+            None,
+            None,
+        )
+        .expect("spawn");
+        assert_eq!(m.exit_code, Some(0));
+        assert!(
+            m.record.wall_time_ms >= 180,
+            "wall time {} ms is below the 200 ms the command slept",
+            m.record.wall_time_ms
+        );
+    }
+
+    #[test]
+    fn a_failing_command_is_measured_rather_than_erroring() {
+        // ! A non-zero exit is a result, ✗ a measurement failure. Returning Err
+        // here would lose the resource numbers for exactly the runs worth
+        // investigating.
+        let m = measure(
+            "fail",
+            "sh",
+            &["-c".to_owned(), "exit 3".to_owned()],
+            None,
+            None,
+        )
+        .expect("spawn");
+        assert_eq!(m.exit_code, Some(3));
+    }
+
+    #[test]
+    fn stdout_is_captured_for_the_caller_to_parse_work_units_from() {
+        let m = measure(
+            "echo",
+            "sh",
+            &["-c".to_owned(), "echo 42".to_owned()],
+            None,
+            Some(42.0),
+        )
+        .expect("spawn");
+        assert_eq!(m.stdout.trim(), "42");
+        assert_eq!(m.record.work_units, Some(42.0));
+    }
+
+    #[test]
     fn efficiency_is_work_over_resource() {
         let e = record(2.0, 1000, Some(100.0)).efficiency();
         assert_eq!(e.work_per_cpu_second, Some(50.0));
@@ -201,4 +249,128 @@ mod tests {
             EfficiencyVerdict::Improved
         );
     }
+}
+
+// ── capture ─────────────────────────────────────────────────────────────────
+
+/// Cumulative CPU seconds this process's *reaped children* have consumed.
+///
+/// ! `cutime` + `cstime` from `/proc/self/stat`, fields 16 and 17 after `comm`.
+/// Only reaped children count, so a delta taken around a `wait` is that child's
+/// CPU time — and only if no other child is reaped concurrently, which is why
+/// [`measure`] takes `&mut` access to the notion of "one measurement at a time".
+///
+/// Linux only. Elsewhere → `None`, and the record reports CPU as unmeasured
+/// rather than as zero: a zero would read as "measured, and free".
+fn children_cpu_seconds() -> Option<f64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // `comm` is parenthesised and may contain spaces — split after the last ')'.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // After comm, field 1 is state · cutime is the 13th, cstime the 14th.
+    let child_user: f64 = fields.get(12)?.parse().ok()?;
+    let child_system: f64 = fields.get(13)?.parse().ok()?;
+    Some((child_user + child_system) / clock_ticks_per_second())
+}
+
+/// `sysconf(_SC_CLK_TCK)` · 100 on every mainstream Linux. Read from the
+/// environment where a caller needs to override it, ✗ hardcoded silently.
+fn clock_ticks_per_second() -> f64 {
+    std::env::var("PIPELINE_CLK_TCK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100.0)
+}
+
+/// Peak resident memory of a running pid, in MB · `VmHWM` from `/proc/<pid>/status`.
+fn peak_memory_mb(pid: u32) -> Option<f64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
+    let kb: f64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb / 1024.0)
+}
+
+/// What a capture could not measure · reported, ✗ silently zeroed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Unmeasured {
+    CpuSeconds,
+    MemoryPeak,
+}
+
+/// One measured command.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Measurement {
+    pub record: ResourceRecord,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    /// Fields the platform would not yield. Non-empty → the record's
+    /// corresponding numbers are placeholders, ✗ measurements.
+    pub unmeasured: Vec<Unmeasured>,
+}
+
+/// Run a command and measure what it consumed.
+///
+/// ! Peak memory is sampled while the child runs, so a command that exits
+/// faster than the first sample reports no peak. That is recorded in
+/// `unmeasured`, ✗ reported as 0 MB — the difference matters when the number
+/// feeds a budget.
+pub fn measure(
+    label: &str,
+    program: &str,
+    args: &[String],
+    constraint: Option<String>,
+    work_units: Option<f64>,
+) -> std::io::Result<Measurement> {
+    use std::process::{Command, Stdio};
+
+    let cpu_before = children_cpu_seconds();
+    let started = std::time::Instant::now();
+
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let pid = child.id();
+    let mut peak_mb: Option<f64> = None;
+    // Sample until the child is gone. Cheap: a read of one small procfs file.
+    while child.try_wait()?.is_none() {
+        if let Some(mb) = peak_memory_mb(pid) {
+            peak_mb = Some(peak_mb.map_or(mb, |p: f64| p.max(mb)));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let out = child.wait_with_output()?;
+    let wall_time_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let cpu_after = children_cpu_seconds();
+
+    let mut unmeasured = Vec::new();
+    let cpu_seconds = if let (Some(before), Some(after)) = (cpu_before, cpu_after) {
+        (after - before).max(0.0)
+    } else {
+        unmeasured.push(Unmeasured::CpuSeconds);
+        0.0
+    };
+    let memory_peak_mb = peak_mb.unwrap_or_else(|| {
+        unmeasured.push(Unmeasured::MemoryPeak);
+        0.0
+    });
+
+    Ok(Measurement {
+        record: ResourceRecord {
+            label: label.to_owned(),
+            wall_time_ms,
+            cpu_seconds,
+            memory_peak_mb,
+            constraint,
+            work_units,
+        },
+        exit_code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        unmeasured,
+    })
 }
