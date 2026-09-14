@@ -60,6 +60,27 @@ async fn maturity(state: Arc<ServerState>) -> ToolResponse {
         }
     }
 
+    // ! `coverage_gate` needs its own derivation, ✗ the unit stage's outcome.
+    // The stage passes when the tool is absent — measuring nothing is not
+    // failing — so treating a green unit run as coverage evidence would let a
+    // machine without cargo-llvm-cov claim level 1.
+    if let Some(unit) = runs.iter().find(|r| r.stage == "unit") {
+        let measured = unit
+            .stdout
+            .as_deref()
+            .is_some_and(|o| o.contains("line coverage"));
+        if measured {
+            evidence.insert(
+                "coverage_gate".to_owned(),
+                if unit.status == "pass" {
+                    Evidence::Present
+                } else {
+                    Evidence::Failed
+                },
+            );
+        }
+    }
+
     // Level 5 evidence comes from captures, ✗ from stage outcomes.
     if motion_baseline_exists() {
         evidence.insert("motion_baseline".to_owned(), Evidence::Present);
