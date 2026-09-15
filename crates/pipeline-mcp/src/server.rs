@@ -122,17 +122,11 @@ async fn handle_tool_call(params: Value, state: Arc<ServerState>) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
-    let arguments = params.get("arguments").cloned().unwrap_or_default();
-    let req = ToolRequest {
-        action: arguments
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned(),
-        args: arguments.get("args").cloned().unwrap_or(Value::Null),
+    let arguments = params.get("arguments").unwrap_or(&Value::Null);
+    let resp = match ToolRequest::from_arguments(&name, arguments) {
+        Ok(req) => dispatch::call_tool(&name, req, state).await,
+        Err(e) => crate::tools::ToolResponse::refused(e),
     };
-
-    let resp = dispatch::call_tool(&name, req, state).await;
     let is_error = !resp.ok;
     let text = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into());
     json!({
