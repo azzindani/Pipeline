@@ -373,7 +373,7 @@ fn persist(file: &Path, map: &HashMap<String, Grant>) {
 /// ! Behind the shared caddy-router, the socket is plain HTTP on :8080 — only
 /// the forwarded headers know it is really `https://pipe.casava.space`. Get this
 /// wrong and every absolute URL in the OAuth metadata points at the wrong host.
-fn base_url(headers: &HeaderMap) -> String {
+pub(crate) fn base_url(headers: &HeaderMap) -> String {
     let get = |k: &str| -> Option<String> {
         headers
             .get(k)?

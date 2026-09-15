@@ -267,6 +267,13 @@ Pipeline ships a second transport — **Streamable HTTP** — that exposes the s
 |---|---|---|---|
 | `POST` | `/mcp` | bearer required | JSON-RPC dispatch · `initialize` · `tools/list` · `tools/call` · `ping` |
 | `GET` | `/health` | none | Liveness probe |
+| `GET` | `/version` | none | Running version · alert on a stale deploy without a token |
+| `GET` | `/tokens/whoami` | bearer required | Which principal the token maps to |
+| `GET` | `/.well-known/oauth-protected-resource` · `…/mcp` | none | RFC 9728 metadata · root and path-inserted form serve one document |
+| `GET` | `/.well-known/oauth-authorization-server` · `…/mcp` | none | RFC 8414 metadata · same two forms |
+| `GET` `POST` | `/oauth/authorize` · `/oauth/register` · `/oauth/token` | none | Authorization Code + PKCE (S256 only) for claude.ai connectors |
+
+Every 401 carries `WWW-Authenticate: Bearer resource_metadata="<public origin>/.well-known/oauth-protected-resource"` — an absolute URL built from `X-Forwarded-Proto` / `X-Forwarded-Host`, so the proxy must forward both. `GET /mcp` is 405 with `Allow: POST`: responses are plain JSON, there is no server-initiated stream.
 
 ### Capability gate (`PIPELINE_REMOTE_MODE`)
 
@@ -321,16 +328,14 @@ Save. Claude lists the 19 tools immediately. Try `pipeline_meta.version` first �
 
 For Claude Code with a remote MCP server:
 
-```jsonc
-{
-  "mcpServers": {
-    "pipeline-remote": {
-      "url": "https://pipeline.example.com/mcp",
-      "headers": { "Authorization": "Bearer YOUR_TOKEN_HERE" }
-    }
-  }
-}
+```bash
+claude mcp add --scope user --transport http pipeline https://pipeline.example.com/mcp \
+  --header "Authorization: Bearer $PIPELINE_TOKEN"
 ```
+
+### Verifying a deployment
+
+`scripts/remote_smoke_test.sh` drives the deployed endpoint the way a client does — 401 without a token, the absolute discovery hint and both metadata URL forms, `whoami`, `initialize`, the full tool count, an undeclared argument refused by name, and the read-only gate. It reads `PIPELINE_DOMAIN` and `PIPELINE_TOKEN` from `.env` (or `DOMAIN` / `PIPELINE_TOKEN` from the environment), is ✗ part of CI, and exits non-zero on any failed check. Run it after every redeploy.
 
 ### Running locally (no VPS · for development)
 
