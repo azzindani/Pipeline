@@ -248,23 +248,76 @@ async fn an_unknown_action_lists_the_known_ones() {
 }
 
 #[test]
-fn every_specified_action_publishes_a_closed_schema() {
-    // `additionalProperties: false` is what makes an unknown key visible.
+fn every_declared_argument_is_published_and_a_fully_specified_tool_is_closed() {
+    // `additionalProperties: false` is what makes an unknown key visible to a client that
+    // enforces the schema. With no top-level combinator it can only be published per tool,
+    // so a tool is closed exactly when every one of its actions is specified.
     for t in registry() {
         let schema = t.input_schema();
-        let Some(clauses) = schema.get("allOf").and_then(|v| v.as_array()) else {
-            continue;
-        };
-        for c in clauses {
-            let args = &c["then"]["properties"]["args"];
-            assert_eq!(
-                args["additionalProperties"],
-                serde_json::json!(false),
-                "{} publishes an open schema · unknown args would pass silently",
+        let args = &schema["properties"]["args"];
+        let all_specified = t.actions.iter().all(|a| a.args.specified());
+        assert_eq!(
+            args["additionalProperties"],
+            serde_json::Value::Bool(!all_specified),
+            "{} · closed must mean every action is specified",
+            t.name.as_str()
+        );
+        for action in t.actions {
+            for a in action.args.args() {
+                let published = &args["properties"][a.name];
+                let described = published["description"].as_str().unwrap_or("");
+                assert!(
+                    described.contains(action.name),
+                    "{}.{} declares '{}' but the schema does not tie it to that action: {published}",
+                    t.name.as_str(),
+                    action.name,
+                    a.name
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn no_published_schema_uses_a_top_level_combinator() {
+    // The Anthropic API refuses allOf · anyOf · oneOf at the top of a tool's input schema,
+    // and Claude Code answers by dropping the tool with only a debug-log line. All 19 tools
+    // were invisible to every Claude client while the server reported healthy.
+    for t in registry() {
+        let schema = t.input_schema();
+        assert_eq!(
+            schema.get("type"),
+            Some(&serde_json::json!("object")),
+            "{}",
+            t.name.as_str()
+        );
+        for k in ["allOf", "anyOf", "oneOf", "if", "then", "else", "not"] {
+            assert!(
+                !schema.contains_key(k),
+                "{} publishes a top-level '{k}' · Claude clients drop the whole tool",
                 t.name.as_str()
             );
         }
     }
+}
+
+#[test]
+fn an_argument_whose_type_differs_by_action_publishes_no_type() {
+    // `pipeline_data.source` is an object for one action and a string for another. Any
+    // single `type` would make a schema-enforcing client refuse a call the server accepts.
+    let all = registry();
+    let data = all
+        .iter()
+        .find(|t| t.name.as_str() == "pipeline_data")
+        .expect("pipeline_data is registered");
+    let schema = data.input_schema();
+    let source = &schema["properties"]["args"]["properties"]["source"];
+    assert!(source.get("type").is_none(), "{source}");
+    let described = source["description"].as_str().unwrap_or("");
+    assert!(
+        described.contains("object · ") && described.contains("string · "),
+        "each action's type must be stated instead: {described}"
+    );
 }
 
 #[test]
