@@ -126,6 +126,23 @@ jobs:
       - name: report is machine-readable
         run: ./target/debug/pipeline report | python3 -c "import json,sys; json.load(sys.stdin)"
 
+      # ── The other repo ───────────────────────────────────────────────────
+      # ! Pipeline's build must fail when its standards binding rots, because
+      # nothing else notices. The binding drifted silently for weeks once:
+      # standards.pin sat at a commit from before a dozen new standards landed,
+      # `check` reported the drift correctly on every call, and no gate read it.
+      #
+      # Fails on: a pin behind the corpus · no pin at all · a route that binds
+      # nothing · an unresolved language choice. Each means Pipeline is
+      # enforcing rules that are not the ones in the Standards repo.
+      #
+      # Offline-safe like the run above — resolution falls back to a clone from
+      # origin when no cache is present.
+      - name: standards binding is sound
+        run: |
+          ./target/debug/pipeline standards fetch
+          ./target/debug/pipeline standards check
+
   # ── Stage 1 · unit ─────────────────────────────────────────────────────────
   # Fast, no containers. Runs in PARALLEL with static — a fmt nit should not
   # hide a failing test.

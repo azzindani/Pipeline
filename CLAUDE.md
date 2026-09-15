@@ -60,11 +60,22 @@ This is the authoritative reference. When any decision is ambiguous, consult the
 Pipeline loads standards at init and keeps a local cache in `.pipeline/standards/`. Standards are fetched by category on demand and updated on `pipeline update`.
 
 ```
-pipeline standards fetch              # clone/pull Standards repo locally
-pipeline standards list               # show all available standards
-pipeline standards show <category>    # read a specific standard
-pipeline standards apply <category>   # agent applies standard to current codebase
+pipeline standards fetch              # resolve the corpus · clone if no cache
+pipeline standards check              # binding sound? non-zero exit on drift — CI runs this
+pipeline standards route              # which standards bind here, and why
+pipeline standards list               # catalog of the bound corpus
+pipeline standards pin                # record the corpus commit in pipeline.yaml
 ```
+
+The full surface (`show` · `brief` · `checklist` · `update`) is on the MCP tool
+`pipeline_standards`. CLI carries the subset CI and a human need; both go
+through the same dispatcher, ✗ two implementations.
+
+! `standards check` is the gate that makes an improvement in the Standards repo
+reach this one. It fails on a pin behind the corpus · no pin · a route that
+binds nothing · an unresolved language choice. Pipeline's CI runs it on every
+push — the binding once drifted for weeks because `check` reported it correctly
+and no gate read the answer.
 
 ### Standards that apply to Pipeline itself
 
