@@ -127,6 +127,12 @@ check "initialize -> serverInfo pipeline-mcp" \
 r=$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
 n=$(json_at 'len(d["result"]["tools"])' <<<"$r")
 check "tools/list publishes $EXPECTED_TOOLS tools (got ${n:-none})" test "$n" = "$EXPECTED_TOOLS"
+# The Anthropic API refuses allOf · anyOf · oneOf at the top of a tool's input
+# schema, and a Claude client drops such a tool without failing the connection.
+# Every other check in this file passed while all 19 tools were dropped.
+dropped=$(json_at '[t["name"] for t in d["result"]["tools"] if "allOf" in t["inputSchema"] or "anyOf" in t["inputSchema"] or "oneOf" in t["inputSchema"]]' <<<"$r")
+check "no tool schema a Claude client would drop (top-level combinator in: ${dropped:-unreadable})" \
+  test "$dropped" = "[]"
 r=$(rpc '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"pipeline_meta","arguments":{"action":"version"}}}')
 check "pipeline_meta.version succeeds" test "$(json_at "$refused" <<<"$r")" = false
 

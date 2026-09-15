@@ -48,10 +48,18 @@ impl ToolDescriptor {
 
     /// Published JSON Schema for this tool's `tools/call` input.
     ///
-    /// `action` is an enum; per-action argument shapes ride in an `allOf` of
-    /// `if`/`then` clauses, which is how JSON Schema expresses "the valid args
-    /// depend on the discriminant". Actions with an unspecified arg set emit no
-    /// clause and stay permissive.
+    /// `action` is an enum. `args` publishes every argument any action declares, once,
+    /// each described with the actions that take it; [`Self::validate`] enforces which
+    /// ones apply to which action.
+    ///
+    /// ! ✗ a top-level `allOf` · `anyOf` · `oneOf`. Per-action shapes used to ride in a
+    /// top-level `allOf` of `if`/`then` clauses — the textbook way to say "args depend on
+    /// the discriminant" — and the Anthropic API refuses those combinators at the top of
+    /// a tool's input schema. Claude Code does not fail the connection over it: it drops
+    /// the tool and says so only in a debug log. All 19 tools were invisible to every
+    /// Claude client while `/health`, `tools/list` and the remote smoke test all passed.
+    /// JSON Schema cannot tie a property's shape to a sibling's value without a
+    /// combinator, so that precision lives in the runtime check, which already had it.
     ///
     /// ! Publication is advisory — clients are not obliged to enforce it, which
     /// is why [`Self::validate`] re-checks server-side. This exists so an agent
@@ -60,34 +68,90 @@ impl ToolDescriptor {
         use serde_json::{Map, Value, json};
 
         let names: Vec<&str> = self.actions.iter().map(|a| a.name).collect();
+
+        // Each declared argument once, with every action that declares it · first-seen order.
+        let mut uses: Vec<(&str, Vec<(&str, &crate::spec::ArgSpec)>)> = Vec::new();
+        for action in self.actions {
+            for arg in action.args.args() {
+                match uses.iter_mut().find(|(name, _)| *name == arg.name) {
+                    Some((_, by)) => by.push((action.name, arg)),
+                    None => uses.push((arg.name, vec![(action.name, arg)])),
+                }
+            }
+        }
+        let arg_props: Map<String, Value> = uses
+            .iter()
+            .map(|(name, by)| ((*name).to_owned(), Self::merged_arg_schema(by)))
+            .collect();
+        // Closed only when every action is specified · an unaudited action still accepts
+        // keys the registry has not caught up with, so `false` would then be a lie.
+        let open = !self.actions.iter().all(|a| a.args.specified());
+
         let mut props = Map::new();
         props.insert("action".into(), json!({"type": "string", "enum": names}));
         props.insert(
             "args".into(),
-            json!({"type": "object", "additionalProperties": true}),
+            json!({
+                "type": "object",
+                "description": "arguments for the chosen action · each property names the actions that take it",
+                "properties": Value::Object(arg_props),
+                "additionalProperties": open,
+            }),
         );
-
-        let clauses: Vec<Value> = self
-            .actions
-            .iter()
-            .filter(|a| a.args.specified())
-            .map(|a| {
-                json!({
-                    "if":   {"properties": {"action": {"const": a.name}}, "required": ["action"]},
-                    "then": {"properties": {"args": a.args_schema()}},
-                })
-            })
-            .collect();
 
         let mut schema = Map::new();
         schema.insert("type".into(), json!("object"));
         schema.insert("properties".into(), Value::Object(props));
         schema.insert("required".into(), json!(["action"]));
         schema.insert("additionalProperties".into(), Value::Bool(false));
-        if !clauses.is_empty() {
-            schema.insert("allOf".into(), Value::Array(clauses));
-        }
         schema
+    }
+
+    /// One published property for an argument that several actions may declare.
+    ///
+    /// Agreeing types publish that type. Disagreeing ones — or any `Any` — publish none
+    /// and state each action's type in the description instead: a wrong `type` would make
+    /// a schema-enforcing client refuse a call the server accepts.
+    fn merged_arg_schema(by: &[(&str, &crate::spec::ArgSpec)]) -> serde_json::Value {
+        use crate::spec::ArgType;
+
+        let first = by.first().map(|(_, a)| a.ty.as_json_type());
+        let agreed = by
+            .iter()
+            .all(|(_, a)| !matches!(a.ty, ArgType::Any) && Some(a.ty.as_json_type()) == first);
+
+        // Actions sharing the same text are listed together, in first-seen order.
+        let mut groups: Vec<(String, Vec<&str>)> = Vec::new();
+        for &(action, a) in by {
+            let text = match (agreed, a.ty) {
+                (true, _) => a.help.to_owned(),
+                (false, ArgType::Any) => format!("any · {}", a.help),
+                (false, ty) => format!("{} · {}", ty.as_json_type(), a.help),
+            };
+            match groups.iter_mut().find(|(t, _)| *t == text) {
+                Some((_, actions)) => actions.push(action),
+                None => groups.push((text, vec![action])),
+            }
+        }
+        let mut description = groups
+            .iter()
+            .map(|(text, actions)| format!("{}: {text}", actions.join(" · ")))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let required: Vec<&str> = by
+            .iter()
+            .filter(|(_, a)| a.required)
+            .map(|&(action, _)| action)
+            .collect();
+        if !required.is_empty() {
+            description.push_str(" · required by ");
+            description.push_str(&required.join(" · "));
+        }
+
+        match first {
+            Some(ty) if agreed => serde_json::json!({"type": ty, "description": description}),
+            _ => serde_json::json!({"description": description}),
+        }
     }
 
     /// Server-side argument check · the enforcement that actually binds.
