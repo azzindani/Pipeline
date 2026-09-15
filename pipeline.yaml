@@ -54,7 +54,7 @@ standards:
     # embedded case that standard permits, ✗ an exemption → docs/adr/0001.
     - Persistent store
     - Public package
-  pin: e07ac43e5be18533fe1077a61eefce96f0f9a224
+  pin: 71eaaebd6c2254c2b5365f6be45c239cc0172321
 
 # Promotion ladder. Omitting this block yields exactly these three with these
 # gates — the defaults live in pipeline-config, ✗ in this file. Declared here so

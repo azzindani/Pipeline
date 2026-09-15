@@ -49,7 +49,7 @@ use crate::registry::registry;
 use crate::server::ServerState;
 use crate::tools::ToolRequest;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -250,6 +250,18 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/.well-known/oauth-protected-resource",
             get(crate::oauth::protected_resource),
         )
+        // ! RFC 8414 §3 · RFC 9728 §3.1 path insertion: a client that derives the metadata
+        // URL from the resource `/mcp` asks for `/.well-known/<doc>/mcp`, ✗ the root form.
+        // Unrouted, that is a 404 and the connector handshake dead-ends — the MCP_* fleet
+        // shipped exactly this. Same handler, same document.
+        .route(
+            "/.well-known/oauth-authorization-server/mcp",
+            get(crate::oauth::metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            get(crate::oauth::protected_resource),
+        )
         .route("/oauth/register", post(crate::oauth::register))
         .route(
             "/oauth/authorize",
@@ -295,7 +307,7 @@ async fn version() -> impl IntoResponse {
 async fn whoami(State(state): State<AppState>, headers: HeaderMap) -> Response {
     match authenticate(&state, &headers) {
         Some(principal) => Json(json!({"token": principal, "authenticated": true})).into_response(),
-        None => unauthorized_json(&Value::Null),
+        None => unauthorized_json(&Value::Null, &headers),
     }
 }
 
@@ -313,7 +325,7 @@ async fn mcp_handler(
     Json(req): Json<Value>,
 ) -> Response {
     let Some(principal) = authenticate(&state, &headers) else {
-        return unauthorized_json(&req.get("id").cloned().unwrap_or(Value::Null));
+        return unauthorized_json(&req.get("id").cloned().unwrap_or(Value::Null), &headers);
     };
 
     let ip = client_ip(&headers, Some(peer));
@@ -471,13 +483,27 @@ async fn dispatch_method(state: &AppState, method: &str, id: &Value, req: &Value
 
 /// 401 with the RFC 9728 discovery hint — how claude.ai finds the OAuth surface from a
 /// bare 401 instead of just failing.
-fn unauthorized_json(id: &Value) -> Response {
+///
+/// ! The hint is an ABSOLUTE URL on the public origin: RFC 9728 §5.1 makes
+/// `resource_metadata` a URL, and a bare path left the client to guess the base. Built
+/// from the same forwarded headers as the metadata document's own URLs, so the hint and
+/// the document it names cannot disagree about the host. A host that cannot sit inside
+/// the quoted-string falls back to the relative form — a usable hint beats none.
+fn unauthorized_json(id: &Value, headers: &HeaderMap) -> Response {
+    const RELATIVE: &str = r#"Bearer resource_metadata="/.well-known/oauth-protected-resource""#;
+    let base = crate::oauth::base_url(headers);
+    let hint = Some(base)
+        .filter(|b| !b.contains(['"', '\\']))
+        .and_then(|b| {
+            HeaderValue::from_str(&format!(
+                r#"Bearer resource_metadata="{b}/.well-known/oauth-protected-resource""#
+            ))
+            .ok()
+        })
+        .unwrap_or_else(|| HeaderValue::from_static(RELATIVE));
     (
         StatusCode::UNAUTHORIZED,
-        [(
-            axum::http::header::WWW_AUTHENTICATE,
-            r#"Bearer resource_metadata="/.well-known/oauth-protected-resource""#,
-        )],
+        [(axum::http::header::WWW_AUTHENTICATE, hint)],
         Json(json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -722,6 +748,8 @@ mod tests {
         for path in [
             "/.well-known/oauth-authorization-server",
             "/.well-known/oauth-protected-resource",
+            "/.well-known/oauth-authorization-server/mcp",
+            "/.well-known/oauth-protected-resource/mcp",
             "/oauth/register",
             "/oauth/authorize",
             "/oauth/token",
