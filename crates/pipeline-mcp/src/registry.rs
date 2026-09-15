@@ -306,6 +306,28 @@ static REGISTRY: [ToolDescriptor; 19] = [
                 ]),
             ),
             ActionSpec::real(
+                "progress",
+                "Read | advance the long-run progress tracker · no args → read · any arg → apply then return new state.",
+                Of(&[
+                    opt("goal", Str, "one sentence · what this effort is for"),
+                    opt(
+                        "completed",
+                        Str,
+                        "step just finished · appended, ✗ replaces",
+                    ),
+                    opt(
+                        "remaining",
+                        List,
+                        "ordered remaining steps · index 0 is next",
+                    ),
+                    opt(
+                        "blocker",
+                        Str,
+                        "what blocks the next step · explicit null clears",
+                    ),
+                ]),
+            ),
+            ActionSpec::real(
                 "checkpoint",
                 "Persist a free-form progress note to memory under scope 'checkpoint'.",
                 Of(&[opt("note", Str, "note body · empty when omitted")]),
@@ -364,6 +386,46 @@ static REGISTRY: [ToolDescriptor; 19] = [
         name: ToolName::Plan,
         summary: "Idea intake · feasibility · PRD · features · milestones · ADRs · risks.",
         actions: &[
+            ActionSpec::real(
+                "task_add",
+                "Track a task · durable in project memory, ✗ a session list. Acceptance is required — a task nobody can verify finished never is.",
+                Of(&[
+                    req("title", Str, "one-line outcome"),
+                    req("acceptance", Str, "testable done condition"),
+                    opt("priority", Str, "P0 | P1 | P2 | P3 | P4 · default P2"),
+                    opt("detail", Str, "context"),
+                    opt("parent", Str, "goal | feature | bug this serves"),
+                ]),
+            ),
+            ActionSpec::real(
+                "task_list",
+                "List tasks by priority then age · surfaces 30-day stale and 7-day blocked, ✗ enforces them.",
+                Of(&[opt(
+                    "status",
+                    Str,
+                    "open | in_progress | blocked | done · omit → all",
+                )]),
+            ),
+            ActionSpec::real(
+                "task_update",
+                "Move a task · 'blocked' requires naming the blocker.",
+                Of(&[
+                    req("id", Str, "task id from task_list"),
+                    opt("status", Str, "open | in_progress | blocked | done"),
+                    opt(
+                        "blocker",
+                        Str,
+                        "what blocks it · required when status is blocked",
+                    ),
+                    opt("priority", Str, "P0 | P1 | P2 | P3 | P4"),
+                    opt("detail", Str, "updated context"),
+                ]),
+            ),
+            ActionSpec::real(
+                "mode_set",
+                "Declare build | maintain · decides which gates apply.",
+                Of(&[req("mode", Str, "build | maintain")]),
+            ),
             ActionSpec::real(
                 "idea_capture",
                 "Persist an idea · ! single fixed key: a second capture overwrites the first.",
@@ -652,6 +714,34 @@ static REGISTRY: [ToolDescriptor; 19] = [
                         "stack",
                         Str,
                         "override pipeline.yaml · rust | python-uv | bun | node | go",
+                    ),
+                ]),
+            ),
+            ActionSpec::real(
+                "devtool_add",
+                "Register a project-local tool the agent wrote · Pipeline validates the contract, ✗ the logic.",
+                Of(&[
+                    req("name", Str, "tool name · unique per project"),
+                    req("entry", Str, "command that runs it, from the project root"),
+                    req(
+                        "destructive",
+                        Bool,
+                        "does it mutate source | state · required, ✗ defaulted",
+                    ),
+                    opt("description", Str, "what it does"),
+                ]),
+            ),
+            ActionSpec::real("devtool_list", "List registered project tools.", NoArgs),
+            ActionSpec::real(
+                "devtool_run",
+                "Run a registered tool · destructive tools dry-run unless confirmed.",
+                Of(&[
+                    req("name", Str, "registered tool name"),
+                    opt("args", Str, "extra arguments appended to the entry command"),
+                    opt(
+                        "confirm",
+                        Bool,
+                        "execute a destructive tool · default false → dry run",
                     ),
                 ]),
             ),
@@ -1183,6 +1273,61 @@ static REGISTRY: [ToolDescriptor; 19] = [
                     ),
                 ]),
             ),
+            ActionSpec::real(
+                "motion_measure",
+                "Capture motion as scalars for one route · frame interval percentiles · paint · layout shift. ✗ video, ✗ pixels.",
+                Of(&[
+                    opt("url", Str, "origin to open · required for the web backend"),
+                    opt(
+                        "backend",
+                        Str,
+                        "web · others refused by name until implemented",
+                    ),
+                    opt(
+                        "route",
+                        Str,
+                        "route label for the baseline · defaults to url",
+                    ),
+                    opt(
+                        "environment",
+                        Str,
+                        "dev | staging | production · defaults to dev",
+                    ),
+                    opt(
+                        "hardware_class",
+                        Str,
+                        "machine class · cross-class comparison is refused",
+                    ),
+                    opt(
+                        "target_frame_interval_ms",
+                        Num,
+                        "declared target · 60fps → 16.7",
+                    ),
+                ]),
+            ),
+            ActionSpec::real(
+                "motion_baseline",
+                "Commit a capture as the baseline for an environment + route · explicit, ✗ automatic on first run.",
+                Of(&[
+                    req("record", Obj, "the object motion_measure returned"),
+                    opt("environment", Str, "overrides the record's environment"),
+                    opt("route", Str, "overrides the record's route"),
+                ]),
+            ),
+            ActionSpec::real(
+                "motion_compare",
+                "Compare a capture against the committed baseline · missing baseline | vanished metric → refused, ✗ passed.",
+                Of(&[
+                    req("record", Obj, "the object motion_measure returned"),
+                    opt("environment", Str, "overrides the record's environment"),
+                    opt("route", Str, "overrides the record's route"),
+                    opt(
+                        "budgets",
+                        Obj,
+                        "metric → {absolute, percent} · wider bound wins",
+                    ),
+                ]),
+            ),
         ],
     },
     ToolDescriptor {
@@ -1417,6 +1562,11 @@ static REGISTRY: [ToolDescriptor; 19] = [
             ActionSpec::real(
                 "capability_graph",
                 "Build nodes + edges by reading every digest on disk.",
+                NoArgs,
+            ),
+            ActionSpec::real(
+                "fleet_health",
+                "One pass over every registered repo · per repo: managed or not, branch, uncommitted count, last run + age, consecutive failures, maturity level, high audit findings, blocked tasks · loudest first · gathers, ✗ grades.",
                 NoArgs,
             ),
             ActionSpec::real(
@@ -1661,6 +1811,45 @@ static REGISTRY: [ToolDescriptor; 19] = [
                 Of(&[req("rule", Str, "PromQL expression")]),
             ),
             ActionSpec::real(
+                "resource_measure",
+                "Run a command and record CPU · wall · peak memory · efficiency ratios. Unmeasurable fields are reported, ✗ zeroed.",
+                Of(&[
+                    req("command", Str, "shell command to measure"),
+                    opt("label", Str, "history key · defaults to the command"),
+                    opt(
+                        "constraint",
+                        Str,
+                        "constraint profile in force · omit → unconstrained",
+                    ),
+                    opt(
+                        "work_units",
+                        Num,
+                        "units of work completed · required for efficiency ratios",
+                    ),
+                ]),
+            ),
+            ActionSpec::real(
+                "throttle_test",
+                "Measure under a declared constraint · refuses when no constraint mechanism exists rather than mislabelling an unconstrained run.",
+                Of(&[
+                    req("command", Str, "shell command to measure"),
+                    req("profile", Str, "constraint profile name"),
+                    opt("work_units", Num, "units of work completed"),
+                ]),
+            ),
+            ActionSpec::real(
+                "efficiency_report",
+                "Compare a label's latest resource record against its predecessor · efficiency as a ratio, ✗ raw speed.",
+                Of(&[
+                    req("label", Str, "history key used by resource_measure"),
+                    opt(
+                        "tolerance_percent",
+                        Num,
+                        "movement treated as unchanged · default 5",
+                    ),
+                ]),
+            ),
+            ActionSpec::real(
                 "perf_baseline",
                 "Measure a baseline from recorded passing stage durations · refuses on short history and says how many more runs are needed.",
                 Of(&[
@@ -1800,6 +1989,23 @@ static REGISTRY: [ToolDescriptor; 19] = [
                 "Count recorded failures grouped by stage · a read error is an error, ✗ zero.",
                 NoArgs,
             ),
+            ActionSpec::real(
+                "record_fix",
+                "Record what was tried against a failure and whether it worked · the write half suggest_fix reads.",
+                Of(&[
+                    req(
+                        "failure_id",
+                        Str,
+                        "id from known_issues | suggest_fix candidates",
+                    ),
+                    req("fix", Str, "what was applied"),
+                    req(
+                        "worked",
+                        Bool,
+                        "did it resolve the failure · record false too",
+                    ),
+                ]),
+            ),
             ActionSpec::scaffold(
                 "suggest_fix",
                 "Keyword LIKE search over past failure messages · ! ✗ vector search · ranking is not meaningful.",
@@ -1843,6 +2049,11 @@ static REGISTRY: [ToolDescriptor; 19] = [
                 NoArgs,
             ),
             ActionSpec::real(
+                "maturity",
+                "Project maturity level 0-5, computed from evidence present in run history + captures · ✗ declared.",
+                NoArgs,
+            ),
+            ActionSpec::real(
                 "velocity_metrics",
                 "Pass rate · median inner-loop ms · failures by stage, computed from recorded runs.",
                 NoArgs,
@@ -1881,6 +2092,25 @@ static REGISTRY: [ToolDescriptor; 19] = [
                     ),
                     req("value", Any, "type checked against the schema for that key"),
                 ]),
+            ),
+            ActionSpec::real(
+                "review_brief",
+                "Assemble review material · diff · size against code_review §2 · human-only paths. Material for a review, ✗ a review.",
+                Of(&[opt(
+                    "base",
+                    Str,
+                    "ref to diff against · default origin/main",
+                )]),
+            ),
+            ActionSpec::real(
+                "health",
+                "Project health in one call · last run, its AGE, consecutive failures, uncommitted files. Reports concerns, ✗ a quality verdict.",
+                NoArgs,
+            ),
+            ActionSpec::real(
+                "audit",
+                "Wider pass · gaps against declared gates, standards binding, stage evidence, tracked work. Names gaps, ✗ judges acceptability.",
+                NoArgs,
             ),
             ActionSpec::real(
                 "self_check",
@@ -2076,9 +2306,9 @@ mod tests {
         }
         assert_eq!(
             (real, scaffold, planned),
-            (148, 20, 7),
+            (168, 20, 7),
             "fidelity split moved · update the fidelity doc too"
         );
-        assert_eq!(real + scaffold + planned, 175, "action count drift");
+        assert_eq!(real + scaffold + planned, 195, "action count drift");
     }
 }

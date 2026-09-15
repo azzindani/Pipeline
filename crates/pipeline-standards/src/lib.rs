@@ -1,4 +1,6 @@
 //! Standards integration — Pipeline's binding to an external, separately-versioned
+//!
+//! kind: component
 //! standards corpus (`github.com/azzindani/Standards`).
 //!
 //! Standards is NOT vendored and NOT a monorepo path. It is a **dependency**:
@@ -53,6 +55,14 @@ pub enum StandardsError {
          upgrade Pipeline or pin standards to a compatible commit"
     )]
     SchemaMismatch { found: u32, supported: u32 },
+
+    #[error(
+        "index.json at {path} carries no {missing} · the file parsed but holds nothing \
+         to route with. A corpus that binds zero standards is a malformed index, \
+         \u{2717} a project with no obligations · regenerate upstream with \
+         `tools/validate.py --emit-index`"
+    )]
+    IndexHollow { path: String, missing: String },
 
     #[error("unknown standard '{id}' · call pipeline_standards.list to see the catalog")]
     UnknownStandard { id: String },

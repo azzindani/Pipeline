@@ -1,4 +1,14 @@
-//! `pipeline-lsp` — placeholder crate, layout locked at POC scaffold.
+//! `pipeline-lsp` — STUB. Layout locked at POC scaffold, ✗ implemented.
+//!
+//! kind: component
+//! status: stub
+//! charter: LSP server · v2, nothing implements it yet
+//! implemented-in: —
+//!
+//! ! `implemented-in` is the honest part. The charter above is live behaviour
+//! today — it just lives in a `pipeline-mcp` handler rather than here, so the
+//! workspace layout advertises a separation that does not exist yet. Moving it
+//! down is the activation, ✗ writing new code here.
 //!
 //! See `PLAN.md` for the milestone that activates this crate.
 

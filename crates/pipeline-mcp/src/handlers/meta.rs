@@ -1,11 +1,12 @@
 //! `pipeline_meta` handler · explain · version · self_check · config get/set.
 
+use crate::handlers::{ensure_memory, load_config_in_cwd};
 use crate::server::ServerState;
 use crate::tools::{ToolRequest, ToolResponse};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-pub async fn handle(req: ToolRequest, _state: Arc<ServerState>) -> ToolResponse {
+pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
     match req.action.as_str() {
         "version" => ToolResponse::ok(json!({
             "pipeline_mcp": crate::VERSION,
@@ -15,6 +16,9 @@ pub async fn handle(req: ToolRequest, _state: Arc<ServerState>) -> ToolResponse 
             "pipeline_stages": pipeline_stages::VERSION,
         })),
         "self_check" => self_check().await,
+        "health" => health(state.clone()).await,
+        "audit" => audit(state.clone()).await,
+        "review_brief" => review_brief(&req.args),
         "explain" => explain(&req.args),
         "config_get" => config_get(&req.args).await,
         "config_set" => config_set(&req.args).await,
@@ -401,6 +405,401 @@ fn explain(args: &Value) -> ToolResponse {
         _ => "Unknown topic. Try: pipeline · stages · memory · tools.",
     };
     ToolResponse::ok(json!({"topic": topic, "text": text}))
+}
+
+// ── health + audit ──────────────────────────────────────────────────────────
+//
+// ! Both GATHER · ✗ judge. Pipeline reports what is true about the project and
+// names what is missing; whether that is acceptable is the caller's decision.
+// A tool that returns a verdict on code quality is guessing, and an agent that
+// trusts the guess stops looking.
+//
+// `health` answers "what shape is this in right now" in one call · `audit` is
+// the slower, wider pass that names every gap against the loaded standards.
+
+/// Fast project health · designed to be the first call of a session.
+async fn health(state: Arc<ServerState>) -> ToolResponse {
+    let cfg = match load_config_in_cwd() {
+        Ok(c) => c,
+        Err(e) => return err(format!("config: {e}")),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(format!("memory: {e}")),
+    };
+
+    let runs = mem.run_history(&cfg.project, 20).await.unwrap_or_default();
+    let last = runs.first();
+    // ! Age matters as much as outcome. A green run from three weeks ago says
+    // nothing about the tree as it stands now, and reporting only "pass" would
+    // let a stale success read as a current one.
+    let last_run_age_days = last.and_then(|r| days_since(&r.created_at));
+    let consecutive_failures = runs.iter().take_while(|r| r.status != "pass").count();
+
+    let dirty = git_lines(&["status", "--porcelain"]).map(|l| l.len());
+    let branch = git_lines(&["rev-parse", "--abbrev-ref", "HEAD"]).and_then(|l| l.first().cloned());
+
+    let mut concerns: Vec<String> = Vec::new();
+    match last {
+        None => concerns.push("no run recorded · nothing here has been verified".into()),
+        Some(r) if r.status != "pass" => {
+            concerns.push(format!("last run failed at stage '{}'", r.stage));
+        }
+        _ => {}
+    }
+    if last_run_age_days.is_some_and(|d| d >= 7) {
+        concerns.push(format!(
+            "last run is {} days old · its result describes an older tree",
+            last_run_age_days.unwrap_or_default()
+        ));
+    }
+    if consecutive_failures >= 3 {
+        concerns.push(format!(
+            "{consecutive_failures} consecutive failures · the loop is not converging"
+        ));
+    }
+    if dirty.is_some_and(|n| n > 0) {
+        concerns.push(format!(
+            "{} uncommitted file(s) · a run measures the tree, ✗ the commit",
+            dirty.unwrap_or_default()
+        ));
+    }
+
+    ToolResponse::ok(json!({
+        "project": cfg.project,
+        "branch": branch,
+        "uncommitted_files": dirty,
+        "last_run": last.map(|r| json!({
+            "profile": r.profile,
+            "stage": r.stage,
+            "status": r.status,
+            "age_days": last_run_age_days,
+        })),
+        "consecutive_failures": consecutive_failures,
+        "concerns": concerns,
+        "verdict": if concerns.is_empty() { "no concerns found" } else { "see concerns" },
+    }))
+}
+
+/// Wider pass · what this project is missing against the standards it loads.
+async fn audit(state: Arc<ServerState>) -> ToolResponse {
+    let cfg = match load_config_in_cwd() {
+        Ok(c) => c,
+        Err(e) => return err(format!("config: {e}")),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(format!("memory: {e}")),
+    };
+
+    let findings = audit_findings(&cfg, &mem).await;
+    let high = findings.iter().filter(|f| f["severity"] == "high").count();
+    ToolResponse::ok(json!({
+        "project": cfg.project,
+        "findings": findings,
+        "high": high,
+        "total": findings.len(),
+        // ! Reported, ✗ judged. Whether these gaps are acceptable is the
+        // caller's call — Pipeline names them.
+        "note": "gaps found, ✗ a quality verdict · severity ranks attention, not acceptability",
+    }))
+}
+
+/// One project's audit findings, severity-sorted.
+///
+/// ! Split out so `pipeline_repo.fleet_health` audits every registered repo
+/// through THIS function rather than its own copy of the rules. A second
+/// implementation drifts, and a fleet view that grades a tree differently from
+/// `pipeline_meta.audit` on the same tree is worse than no fleet view.
+pub(crate) async fn audit_findings(
+    cfg: &pipeline_config::PipelineConfig,
+    mem: &pipeline_memory::Memory,
+) -> Vec<Value> {
+    let mut findings: Vec<Value> = Vec::new();
+    let mut note = |area: &str, severity: &str, detail: String| {
+        findings.push(json!({ "area": area, "severity": severity, "detail": detail }));
+    };
+
+    // Gates declared but never measured are the defect this session found in
+    // Pipeline itself: a gate that never runs provides nothing and reads as
+    // protection.
+    if cfg.gates.coverage.is_none() {
+        note("gates", "medium", "no coverage gate declared".into());
+    }
+    if cfg.gates.critical_vulns.is_none() {
+        note(
+            "gates",
+            "medium",
+            "no critical-vulnerability gate declared".into(),
+        );
+    }
+
+    // Standards binding.
+    match (&cfg.standards.source, &cfg.standards.pin) {
+        (_, None) => note(
+            "standards",
+            "high",
+            "no standards pin · upstream can move a gate under you without a commit".into(),
+        ),
+        (Some(src), _) if src.starts_with('/') => note(
+            "standards",
+            "medium",
+            format!("standards.source '{src}' is an absolute path · portable to no other machine"),
+        ),
+        _ => {}
+    }
+    if cfg.standards.project_type.is_none() {
+        note(
+            "standards",
+            "low",
+            "no project_type · only always-on and language routes load".into(),
+        );
+    }
+
+    let runs = mem.run_history(&cfg.project, 200).await.unwrap_or_default();
+    let evidence_gaps = stage_evidence_gaps(&runs);
+
+    // Tracked work · untracked work is invisible debt (workflow §8).
+    let tasks_raw = mem
+        .recall(&cfg.project, "task", "list")
+        .await
+        .ok()
+        .flatten();
+    let task_count = tasks_raw
+        .and_then(|raw| serde_json::from_str::<Vec<Value>>(&raw).ok())
+        .map_or(0, |t| t.len());
+    if task_count == 0 {
+        note(
+            "workflow",
+            "low",
+            "no tracked tasks · untracked work is invisible debt".into(),
+        );
+    }
+
+    // Learning loop · a project that never records a fix cannot surface one.
+    let fixes_recorded = runs.is_empty()
+        || mem
+            .recall(&cfg.project, "progress", "tracker")
+            .await
+            .ok()
+            .flatten()
+            .is_some();
+    if !fixes_recorded {
+        note(
+            "memory",
+            "low",
+            "no progress tracker · a context reset loses the thread".into(),
+        );
+    }
+
+    findings.extend(evidence_gaps);
+    // Severity first, so the caller reads the loudest gap without sorting.
+    findings.sort_by_key(|f| match f["severity"].as_str() {
+        Some("high") => 0,
+        Some("medium") => 1,
+        _ => 2,
+    });
+
+    findings
+}
+
+/// Stage evidence gaps · a stage that never ran and one that ran red are both
+/// absent evidence.
+///
+/// ! Split out of `audit` to keep it readable, ✗ because it is separable: the
+/// never-ran and ran-red branches must stay adjacent, since treating either as
+/// a pass is the same mistake.
+fn stage_evidence_gaps(runs: &[pipeline_memory::RunRecord]) -> Vec<Value> {
+    // Runs arrive newest-first, so the first sighting of a stage is its latest.
+    let mut latest: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    for r in runs {
+        latest.entry(r.stage.as_str()).or_insert(r.status.as_str());
+    }
+    let mut out = Vec::new();
+    for required in ["static", "unit", "container", "integration"] {
+        let severity = if matches!(required, "static" | "unit") {
+            "high"
+        } else {
+            "medium"
+        };
+        let detail = match latest.get(required) {
+            None => format!("stage '{required}' has never run · absent evidence, ✗ a pass"),
+            Some(&status) if status != "pass" => {
+                format!("stage '{required}' last ran and FAILED · a red stage is not evidence")
+            }
+            _ => continue,
+        };
+        out.push(json!({ "area": "evidence", "severity": severity, "detail": detail }));
+    }
+    out
+}
+
+/// Assemble the material a reviewer needs · ✗ perform the review.
+///
+/// ! `code_review/STANDARDS.md` §12 is explicit: AI findings are suggestions,
+/// ✗ verdicts, and AI cannot approve. So this gathers — diff, size against the
+/// §2 thresholds, sensitive paths — and returns it for the reviewer to judge.
+/// A tool that returned findings here would be the thing §12 forbids, wearing a
+/// tool's authority.
+///
+/// ! Sensitive paths are flagged for HUMAN-ONLY review (§12), ✗ merely noted.
+/// Auth, crypto and financial logic is where an AI reviewer misses subtle flaws
+/// most expensively.
+fn review_brief(args: &Value) -> ToolResponse {
+    // code_review §2 · owner of PR size across the repo.
+    const LINES_TARGET: usize = 400;
+    const LINES_LIMIT: usize = 800;
+    const FILES_TARGET: usize = 10;
+    const FILES_LIMIT: usize = 20;
+
+    let base = args
+        .get("base")
+        .and_then(Value::as_str)
+        .unwrap_or("origin/main");
+
+    let Some(stat) = git_lines(&["diff", "--numstat", &format!("{base}...HEAD")]) else {
+        return err(format!(
+            "cannot diff against '{base}' · not a git repository, | the ref does not exist"
+        ));
+    };
+
+    let mut files: Vec<Value> = Vec::new();
+    let mut total_lines = 0usize;
+    // Generated and lock files are excluded from the size judgement by §2, and
+    // listed separately so their absence from the count is visible rather than
+    // silent.
+    let mut excluded: Vec<String> = Vec::new();
+    for line in &stat {
+        let cols: Vec<&str> = line.split('\t').collect();
+        let [added, removed, path] = cols[..] else {
+            continue;
+        };
+        let changed = added.parse::<usize>().unwrap_or(0) + removed.parse::<usize>().unwrap_or(0);
+        if is_size_exempt(path) {
+            excluded.push(path.to_owned());
+            continue;
+        }
+        total_lines += changed;
+        files.push(json!({ "path": path, "added": added, "removed": removed }));
+    }
+
+    let sensitive: Vec<&str> = files
+        .iter()
+        .filter_map(|f| f["path"].as_str())
+        .filter(|p| is_sensitive(p))
+        .collect();
+
+    let mut size_notes: Vec<String> = Vec::new();
+    if total_lines > LINES_LIMIT {
+        size_notes.push(format!(
+            "{total_lines} lines changed · over the {LINES_LIMIT} hard limit · split before review"
+        ));
+    } else if total_lines > LINES_TARGET {
+        size_notes.push(format!(
+            "{total_lines} lines changed · over the {LINES_TARGET} target · review will be slower and worse"
+        ));
+    }
+    if files.len() > FILES_LIMIT {
+        size_notes.push(format!(
+            "{} files · over the {FILES_LIMIT} hard limit",
+            files.len()
+        ));
+    } else if files.len() > FILES_TARGET {
+        size_notes.push(format!(
+            "{} files · over the {FILES_TARGET} target",
+            files.len()
+        ));
+    }
+
+    let commits = git_lines(&["rev-list", "--count", &format!("{base}..HEAD")])
+        .and_then(|l| l.first().and_then(|n| n.parse::<usize>().ok()));
+    if commits.is_some_and(|c| c > 10) {
+        size_notes.push(format!(
+            "{} commits · over the 10 limit · each commit should be one logical unit",
+            commits.unwrap_or_default()
+        ));
+    }
+
+    ToolResponse {
+        ok: true,
+        data: json!({
+            "base": base,
+            "files": files,
+            "files_changed": files.len(),
+            "lines_changed": total_lines,
+            "commits": commits,
+            "size_exempt": excluded,
+            "size_notes": size_notes,
+            // ! Named, ✗ reviewed. §12 puts these outside an AI reviewer's remit.
+            "human_only_paths": sensitive,
+            "checklist": "pipeline_standards.checklist · 15 rows mapped to their owning standard",
+            "note": "material for a review, ✗ a review · findings are the reviewer's to make (code_review §12)",
+        }),
+        next_suggested: vec!["pipeline_standards.checklist".into()],
+        memory_refs: vec![],
+        error: None,
+    }
+}
+
+/// Paths excluded from the size judgement by `code_review` §2.
+fn is_size_exempt(path: &str) -> bool {
+    const LOCKS: [&str; 6] = [
+        "Cargo.lock",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "poetry.lock",
+        "uv.lock",
+    ];
+    LOCKS.iter().any(|l| path.ends_with(l))
+        || path.contains("/generated/")
+        || path.contains("/migrations/")
+        || std::path::Path::new(path)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("snap"))
+}
+
+/// Code where `code_review` §12 requires a human reviewer.
+///
+/// ! Deliberately broad. A false positive costs one human read; a false
+/// negative sends auth or crypto through AI-only review, which is the outcome
+/// §12 exists to prevent.
+fn is_sensitive(path: &str) -> bool {
+    const MARKERS: [&str; 12] = [
+        "auth",
+        "oauth",
+        "token",
+        "secret",
+        "crypt",
+        "password",
+        "session",
+        "permission",
+        "payment",
+        "billing",
+        "invoice",
+        "ledger",
+    ];
+    let lower = path.to_lowercase();
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// Run a git command, returning its stdout lines · `None` outside a repo.
+fn git_lines(args: &[&str]) -> Option<Vec<String>> {
+    let out = std::process::Command::new("git").args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect(),
+    )
+}
+
+fn days_since(ts: &str) -> Option<i64> {
+    let then = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
+    Some((chrono::Utc::now() - then.with_timezone(&chrono::Utc)).num_days())
 }
 
 #[cfg(test)]

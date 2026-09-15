@@ -35,6 +35,7 @@ pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
         "handover" => handover(state).await,
         "start" => start(req.args, state).await,
         "checkpoint" => checkpoint(req.args, state).await,
+        "progress" => progress(req.args, state).await,
         "agent_register" => agent_register(req.args, state).await,
         "context" => context(&req.args, state).await,
         "file_context" => file_context(&req.args, state).await,
@@ -185,6 +186,80 @@ async fn checkpoint(args: Value, state: Arc<ServerState>) -> ToolResponse {
         data: blob,
         next_suggested: vec!["pipeline_session.handover".into()],
         memory_refs: vec![format!("checkpoint:{id}")],
+        error: None,
+    }
+}
+
+/// Read | advance the long-run progress tracker.
+///
+/// ! Distinct from `checkpoint`, which appends a free-form note nobody parses.
+/// This is structured and ordered, because its consumer is an agent resuming
+/// after a context reset — it needs to know which step is next, ✗ to read prose
+/// and infer one.
+///
+/// No arguments → pure read. Any argument → apply, then return the new state,
+/// so a caller never needs a second round trip to see what it wrote.
+async fn progress(args: Value, state: Arc<ServerState>) -> ToolResponse {
+    let cfg = match load_config_in_cwd() {
+        Ok(c) => c,
+        Err(e) => return err(format!("config: {e}")),
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(format!("memory: {e}")),
+    };
+    let mut tracker = match mem.progress(&cfg.project).await {
+        Ok(p) => p,
+        Err(e) => return err(e.to_string()),
+    };
+
+    let mut touched = false;
+    if let Some(goal) = args.get("goal").and_then(Value::as_str) {
+        tracker.goal = Some(goal.to_owned());
+        touched = true;
+    }
+    // `completed` appends · the record of what is done is never rewritten from
+    // the caller's memory of it, which after a reset is exactly what is missing.
+    if let Some(done) = args.get("completed").and_then(Value::as_str) {
+        tracker.completed.push(done.to_owned());
+        tracker.remaining.retain(|r| r != done);
+        touched = true;
+    }
+    if let Some(remaining) = args.get("remaining").and_then(Value::as_array) {
+        tracker.remaining = remaining
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect();
+        touched = true;
+    }
+    if let Some(blocker) = args.get("blocker") {
+        // Explicit null clears · omission leaves it alone. A blocker that
+        // cleared itself on any unrelated update would hide a live blocker.
+        tracker.blocker = blocker.as_str().map(ToOwned::to_owned);
+        touched = true;
+    }
+
+    if touched {
+        tracker.updated_at = Some(pipeline_memory::now_rfc3339());
+        if let Err(e) = mem.set_progress(&cfg.project, &tracker).await {
+            return err(e.to_string());
+        }
+    }
+
+    let next = tracker.remaining.first().cloned();
+    ToolResponse {
+        ok: true,
+        data: json!({
+            "goal": tracker.goal,
+            "completed": tracker.completed,
+            "remaining": tracker.remaining,
+            "blocker": tracker.blocker,
+            "updated_at": tracker.updated_at,
+            "next_step": next,
+        }),
+        next_suggested: vec!["pipeline_session.handover".into()],
+        memory_refs: vec!["progress:tracker".into()],
         error: None,
     }
 }
