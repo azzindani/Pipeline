@@ -422,55 +422,41 @@ async fn dispatch_method(state: &AppState, method: &str, id: &Value, req: &Value
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_owned();
-            let arguments = params.get("arguments").cloned().unwrap_or_default();
-            let action = arguments
-                .get("action")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned();
+            let arguments = params.get("arguments").unwrap_or(&Value::Null);
+            let tool_req = match ToolRequest::from_arguments(&name, arguments) {
+                Ok(r) => r,
+                Err(e) => return tool_call_result(&id, &crate::tools::ToolResponse::refused(e)),
+            };
 
             // Capability gate · enforce read-only mode before dispatching.
-            if state.mode == RemoteMode::ReadOnly && !is_safe_action(&name, &action) {
-                let resp = json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "content": [{
-                            "type": "text",
-                            "text": serde_json::to_string(&json!({
-                                "ok": false,
-                                "data": {},
-                                "next_suggested": [],
-                                "memory_refs": [],
-                                "error": format!(
-                                    "blocked by PIPELINE_REMOTE_MODE=read_only · '{name}.{action}' is destructive · \
-                                     unlock by setting PIPELINE_REMOTE_MODE=full only when behind authenticated proxy + TLS"
-                                ),
-                            })).unwrap_or_else(|_| "{}".into()),
-                        }],
-                        "isError": true,
-                    },
-                });
-                return Json(resp).into_response();
+            //
+            // ! Only for a call that could reach a handler. An action the registry does not
+            // know never does — dispatch refuses it and names the real ones — so calling a
+            // typo "destructive" sent the caller hunting a permission problem instead of a
+            // spelling. A tool with no descriptor keeps the gate unless dispatch would also
+            // refuse its name: nothing downstream would validate it.
+            let unroutable = match crate::registry::descriptor_for(&name) {
+                Some(d) => d.action(&tool_req.action).is_none(),
+                None => !crate::tools::ToolName::ALL
+                    .iter()
+                    .any(|t| t.as_str() == name),
+            };
+            if state.mode == RemoteMode::ReadOnly
+                && !unroutable
+                && !is_safe_action(&name, &tool_req.action)
+            {
+                return tool_call_result(
+                    &id,
+                    &crate::tools::ToolResponse::refused(format!(
+                        "blocked by PIPELINE_REMOTE_MODE=read_only · '{name}.{}' is destructive · \
+                         unlock by setting PIPELINE_REMOTE_MODE=full only when behind authenticated proxy + TLS",
+                        tool_req.action
+                    )),
+                );
             }
 
-            let inner_args = arguments.get("args").cloned().unwrap_or(Value::Null);
-            let tool_req = ToolRequest {
-                action,
-                args: inner_args,
-            };
             let resp = dispatch::call_tool(&name, tool_req, state.server.clone()).await;
-            let is_error = !resp.ok;
-            let payload = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into());
-            Json(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "content": [{"type": "text", "text": payload}],
-                    "isError": is_error,
-                },
-            }))
-            .into_response()
+            tool_call_result(&id, &resp)
         }
         other => Json(json!({
             "jsonrpc": "2.0",
@@ -479,6 +465,21 @@ async fn dispatch_method(state: &AppState, method: &str, id: &Value, req: &Value
         }))
         .into_response(),
     }
+}
+
+/// A `tools/call` result carrying one tool envelope. Refusals and answers share the shape,
+/// so a caller reads `isError` plus the envelope's `error` the same way for both.
+fn tool_call_result(id: &Value, resp: &crate::tools::ToolResponse) -> Response {
+    let payload = serde_json::to_string(resp).unwrap_or_else(|_| "{}".into());
+    Json(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "content": [{"type": "text", "text": payload}],
+            "isError": !resp.ok,
+        },
+    }))
+    .into_response()
 }
 
 /// 401 with the RFC 9728 discovery hint — how claude.ai finds the OAuth surface from a
