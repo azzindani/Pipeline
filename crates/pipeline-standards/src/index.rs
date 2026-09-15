@@ -120,7 +120,40 @@ impl Index {
                 supported: SUPPORTED_SCHEMA,
             });
         }
+        index.validate(&path.display().to_string())?;
         Ok(index)
+    }
+
+    /// Refuse an index that parses but holds nothing to route with.
+    ///
+    /// ! The schema number alone proved nothing. Every field below carries
+    /// `#[serde(default)]`, so `{"schema":1}` deserialized cleanly and routing
+    /// then bound zero standards and reported it as a SUCCESS — `list` returned
+    /// `total: 0`, `brief` returned `count: 0`, and an agent read "no standards
+    /// apply" as an answer rather than as a broken corpus.
+    ///
+    /// ! Absent ✗ empty. A Standards repo always has standards, always has a
+    /// tier order, and always has an always-on set — those are invariants of the
+    /// producer, so their absence is a malformed index, ✗ a project without
+    /// obligations.
+    fn validate(&self, path: &str) -> Result<(), StandardsError> {
+        let missing: Vec<&str> = [
+            ("standards", self.standards.is_empty()),
+            ("tier_order", self.tier_order.is_empty()),
+            ("always_on", self.always_on.is_empty()),
+        ]
+        .iter()
+        .filter(|(_, empty)| *empty)
+        .map(|(name, _)| *name)
+        .collect();
+
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(StandardsError::IndexHollow {
+            path: path.to_owned(),
+            missing: missing.join(" · "),
+        })
     }
 
     pub fn get(&self, id: &str) -> Option<&Standard> {
@@ -143,5 +176,65 @@ impl Index {
                 .cmp(&self.tier_rank(b))
                 .then_with(|| a.cmp(b))
         });
+    }
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+
+    /// A corpus that parses but binds nothing.
+    ///
+    /// ! The regression: every field here carries `#[serde(default)]`, so
+    /// `{"schema":1}` deserialized cleanly, routing bound zero standards, and
+    /// `list` reported `total: 0` with `ok: true`. An agent read "no standards
+    /// apply" as an answer instead of as a broken corpus.
+    #[test]
+    fn a_hollow_index_is_refused_rather_than_read_as_zero_obligations() {
+        let index: Index = serde_json::from_str(r#"{"schema":1}"#).expect("parses");
+        let err = index.validate("/x/index.json").expect_err("must refuse");
+        let msg = err.to_string();
+        for field in ["standards", "tier_order", "always_on"] {
+            assert!(msg.contains(field), "refusal must name '{field}': {msg}");
+        }
+    }
+
+    /// Each invariant is checked separately · a corpus missing only one of them
+    /// is just as unroutable as one missing all three.
+    #[test]
+    fn each_missing_invariant_is_named_on_its_own() {
+        let cases = [
+            (
+                r#"{"schema":1,"tier_order":["Core"],"always_on":["a"]}"#,
+                "standards",
+            ),
+            (
+                r#"{"schema":1,"always_on":["a"],"standards":[{"id":"a","domain":"a","path":"a/STANDARDS.md","title":"A","purpose":"p"}]}"#,
+                "tier_order",
+            ),
+            (
+                r#"{"schema":1,"tier_order":["Core"],"standards":[{"id":"a","domain":"a","path":"a/STANDARDS.md","title":"A","purpose":"p"}]}"#,
+                "always_on",
+            ),
+        ];
+        for (json, expected) in cases {
+            let index: Index = serde_json::from_str(json).expect("parses");
+            let msg = index
+                .validate("/x/index.json")
+                .expect_err("must refuse")
+                .to_string();
+            assert!(msg.contains(expected), "expected '{expected}' in: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_populated_index_validates() {
+        let index: Index = serde_json::from_str(
+            r#"{"schema":1,"tier_order":["Foundation","Core"],"always_on":["architecture"],
+                "standards":[{"id":"architecture","domain":"architecture",
+                "path":"architecture/STANDARDS.md","title":"A","purpose":"p"}]}"#,
+        )
+        .expect("parses");
+        index.validate("/x/index.json").expect("must accept");
     }
 }

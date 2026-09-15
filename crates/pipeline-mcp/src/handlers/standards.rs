@@ -396,7 +396,12 @@ async fn check() -> ToolResponse {
             "bound_standards": routed.ids.len(),
             "obligations": total,
             "blocking": blocking,
-            "checklists": lists,
+            // ! Counts here, items in `checklist`. This action returned every
+            // item for every bound standard — ~14k tokens to answer "is the
+            // binding sound", which is a yes/no plus a reason. The verdict call
+            // stays cheap enough to make on every loop; the caller that wants
+            // the obligations asks for them.
+            "checklists": "call pipeline_standards.checklist for the items",
             "adjudication": "checklist items are prose obligations · agent scores them against the codebase",
         }),
         next_suggested: if ok {
@@ -408,7 +413,19 @@ async fn check() -> ToolResponse {
             ]
         },
         memory_refs: vec![],
-        error: None,
+        // ! A refused call states why in `error`. This returned ok:false with
+        // error:null, so a caller checking `ok` then reading `error` was handed
+        // a failure with no reason — the blocking list was in `data` and easy to
+        // never look at.
+        error: if ok {
+            None
+        } else {
+            Some(format!(
+                "standards binding is not sound · {} blocker(s) · {}",
+                blocking.len(),
+                blocking.join(" ; ")
+            ))
+        },
     }
 }
 
