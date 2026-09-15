@@ -78,16 +78,34 @@ impl Resolved {
         let Some(pin) = self.pin.as_deref() else {
             return false;
         };
-        let pinned = git(
-            &self.root,
-            &["show", &format!("{pin}:{}", crate::index::INDEX_FILE)],
-        )
-        .await;
         let current = tokio::fs::read_to_string(self.root.join(crate::index::INDEX_FILE)).await;
-        match (pinned, current) {
+        match (self.index_at(pin).await, current) {
             (Ok(a), Ok(b)) => a.trim() != b.trim(),
             _ => true,
         }
+    }
+
+    /// `index.json` as of one commit, deepening a shallow cache if needed.
+    ///
+    /// ! The cache is cloned `--depth 1`, so in CI the pinned commit is absent
+    /// from it and the comparison above would answer "unknown" — blocking — on
+    /// every run where the pin trails HEAD. That is the common case, so a
+    /// shallow cache alone would have left this gate permanently red.
+    ///
+    /// ✗ fetch into a user-owned source: the deepen is guarded by
+    /// [`Origin::is_pipeline_owned`], since Pipeline must never mutate a clone
+    /// the user manages.
+    async fn index_at(&self, pin: &str) -> Result<String, StandardsError> {
+        let path = format!("{pin}:{}", crate::index::INDEX_FILE);
+        if let Ok(text) = git(&self.root, &["show", &path]).await {
+            return Ok(text);
+        }
+        if self.origin.is_pipeline_owned() {
+            // GitHub serves an arbitrary reachable SHA on request, so one
+            // shallow fetch brings the pinned commit into a depth-1 cache.
+            let _ = git(&self.root, &["fetch", "--depth", "1", "origin", pin]).await;
+        }
+        git(&self.root, &["show", &path]).await
     }
 
     /// No pin recorded yet → first resolve, caller should write one.
