@@ -199,6 +199,90 @@ async fn whoami_names_the_principal() {
     assert_eq!(s, StatusCode::UNAUTHORIZED);
 }
 
+#[tokio::test]
+async fn the_401_hint_is_an_absolute_url_that_resolves() {
+    // RFC 9728 §5.1: `resource_metadata` is a URL. A bare path left the client to guess the
+    // origin. Behind the router the socket is plain :8080, so the hint must come from the
+    // forwarded headers — the same origin the metadata document itself reports.
+    let fx = ro();
+    let fwd = [
+        ("x-forwarded-proto", "https"),
+        ("x-forwarded-host", "pipe.example.test"),
+    ];
+    let list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+    let want = r#"Bearer resource_metadata="https://pipe.example.test/.well-known/oauth-protected-resource""#;
+
+    let (s, h, _) = call(
+        &fx,
+        build("POST", "/mcp", &[fwd[0], fwd[1], JSONH], Body::from(list)),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!(header(&h, "www-authenticate"), Some(want));
+
+    // Every 401 carries the same hint, not only the one on /mcp.
+    let (s, h, _) = call(&fx, build("GET", "/tokens/whoami", &fwd, Body::empty())).await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!(header(&h, "www-authenticate"), Some(want));
+
+    // Follow it: the document it names is public and describes this resource.
+    let (s, _, body) = call(
+        &fx,
+        build(
+            "GET",
+            "/.well-known/oauth-protected-resource",
+            &fwd,
+            Body::empty(),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(
+        body.contains(r#""resource":"https://pipe.example.test/mcp""#),
+        "metadata: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_host_that_cannot_be_quoted_falls_back_to_the_relative_hint() {
+    // A quote in the forwarded host would break out of the quoted-string. Keep a usable
+    // hint rather than emit a malformed header or none at all.
+    let fx = ro();
+    let (s, h, _) = call(
+        &fx,
+        build(
+            "GET",
+            "/tokens/whoami",
+            &[("x-forwarded-host", "evil\"host")],
+            Body::empty(),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        header(&h, "www-authenticate"),
+        Some(r#"Bearer resource_metadata="/.well-known/oauth-protected-resource""#)
+    );
+}
+
+#[tokio::test]
+async fn path_inserted_discovery_urls_serve_the_same_documents() {
+    // RFC 8414 §3 · RFC 9728 §3.1: a client deriving the metadata URL from the resource
+    // `/mcp` inserts the well-known segment ahead of the path. Both forms must answer, and
+    // with one document — two that could drift would be worse than a 404.
+    let fx = ro();
+    for doc in ["oauth-protected-resource", "oauth-authorization-server"] {
+        let root_uri = format!("/.well-known/{doc}");
+        let (s, _, root) = call(&fx, build("GET", &root_uri, &[], Body::empty())).await;
+        assert_eq!(s, StatusCode::OK, "{root_uri}");
+
+        let inserted_uri = format!("/.well-known/{doc}/mcp");
+        let (s, _, inserted) = call(&fx, build("GET", &inserted_uri, &[], Body::empty())).await;
+        assert_eq!(s, StatusCode::OK, "{inserted_uri} must not 404");
+        assert_eq!(inserted, root, "{doc}: both URLs must serve one document");
+    }
+}
+
 // ══ MCP wire contract ═══════════════════════════════════════════════════════════════════
 
 #[tokio::test]
