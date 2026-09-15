@@ -83,6 +83,53 @@ pub struct ToolRequest {
     pub args: serde_json::Value,
 }
 
+impl ToolRequest {
+    /// Parse a `tools/call` `arguments` object · the one shape every transport shares.
+    ///
+    /// ! A top-level key other than `action` · `args` is an **error**, ✗ dropped. The
+    /// published schema already says `additionalProperties: false`, but each transport
+    /// read only the two keys it knew, so `{"action":"explain","topic":"memory"}` ran with
+    /// `topic` silently discarded and reported success. Flattening per-action arguments is
+    /// the commonest way a caller lands here, so the refusal says where they belong.
+    ///
+    /// # Errors
+    /// `arguments` present but not an object · an unknown top-level key.
+    pub fn from_arguments(tool: &str, arguments: &serde_json::Value) -> Result<Self, String> {
+        let obj = match arguments {
+            serde_json::Value::Object(m) => m,
+            // Absent · dispatch then refuses the empty action and names the real ones.
+            serde_json::Value::Null => {
+                return Ok(Self {
+                    action: String::new(),
+                    args: serde_json::Value::Null,
+                });
+            }
+            _ => {
+                return Err(format!(
+                    "{tool}: 'arguments' must be an object · {{\"action\": …, \"args\": {{…}}}}"
+                ));
+            }
+        };
+        if let Some(key) = obj
+            .keys()
+            .find(|k| !matches!(k.as_str(), "action" | "args"))
+        {
+            return Err(format!(
+                "{tool}: unknown argument '{key}' · accepted at the top level: action · args · \
+                 per-action arguments go inside 'args'"
+            ));
+        }
+        Ok(Self {
+            action: obj
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            args: obj.get("args").cloned().unwrap_or(serde_json::Value::Null),
+        })
+    }
+}
+
 /// Outbound response envelope · `next_suggested` closes the agent loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResponse {
@@ -97,6 +144,17 @@ pub struct ToolResponse {
 }
 
 impl ToolResponse {
+    /// A request refused before any handler ran · the error says what to change.
+    pub fn refused(error: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            data: serde_json::json!({}),
+            next_suggested: Vec::new(),
+            memory_refs: Vec::new(),
+            error: Some(error.into()),
+        }
+    }
+
     pub fn ok(data: serde_json::Value) -> Self {
         Self {
             ok: true,
@@ -124,6 +182,45 @@ impl ToolResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arguments_parse_into_action_and_args() {
+        let req = ToolRequest::from_arguments(
+            "pipeline_meta",
+            &serde_json::json!({"action": "explain", "args": {"topic": "memory"}}),
+        )
+        .unwrap();
+        assert_eq!(req.action, "explain");
+        assert_eq!(req.args, serde_json::json!({"topic": "memory"}));
+
+        // Absent `arguments` parses to an empty action, which dispatch then refuses by name.
+        let bare = ToolRequest::from_arguments("pipeline_meta", &serde_json::Value::Null).unwrap();
+        assert_eq!(bare.action, "");
+        assert!(bare.args.is_null());
+    }
+
+    #[test]
+    fn a_flattened_argument_is_refused_by_name_not_dropped() {
+        // The published schema says additionalProperties:false at the top level; this is
+        // where that binds. Before, `topic` vanished and the call reported success.
+        let err = ToolRequest::from_arguments(
+            "pipeline_meta",
+            &serde_json::json!({"action": "explain", "topic": "memory"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown argument 'topic'"), "{err}");
+        assert!(
+            err.contains("inside 'args'"),
+            "the refusal must say where the argument belongs: {err}"
+        );
+    }
+
+    #[test]
+    fn non_object_arguments_are_refused() {
+        let err = ToolRequest::from_arguments("pipeline_meta", &serde_json::json!("explain"))
+            .unwrap_err();
+        assert!(err.contains("must be an object"), "{err}");
+    }
 
     #[test]
     fn all_nineteen_tool_names() {

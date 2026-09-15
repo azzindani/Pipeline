@@ -365,6 +365,44 @@ async fn read_only_blocks_a_destructive_action_but_allows_a_safe_one() {
     );
 }
 
+#[tokio::test]
+async fn a_flattened_argument_is_refused_by_name_on_the_wire() {
+    // The published inputSchema is `{action, args}` with additionalProperties:false. The
+    // transport read those two keys and dropped the rest, so this ran `explain` with no
+    // topic and reported success.
+    let fx = ro();
+    let flat = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pipeline_meta","arguments":{"action":"explain","topic":"memory"}}}"#;
+    let (s, _, body) = mcp(&fx, "sk-alice", flat).await;
+    assert_eq!(s, StatusCode::OK); // a tool refusal rides inside a 200
+    assert!(
+        body.contains(r#""isError":true"#),
+        "must be refused: {body}"
+    );
+    assert!(
+        body.contains("unknown argument 'topic'"),
+        "the refusal must name the key: {body}"
+    );
+}
+
+#[tokio::test]
+async fn read_only_names_a_misspelled_action_unknown_not_destructive() {
+    let fx = ro();
+    let typo = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pipeline_meta","arguments":{"action":"verzion"}}}"#;
+    let (s, _, body) = mcp(&fx, "sk-alice", typo).await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(body.contains(r#""isError":true"#), "{body}");
+    assert!(
+        !body.contains("blocked by PIPELINE_REMOTE_MODE"),
+        "a typo is not a permission problem: {body}"
+    );
+    assert!(body.contains("unknown action"), "{body}");
+    // The probe is `verzion`, so a refusal that merely echoes it cannot satisfy this.
+    assert!(
+        body.contains("version"),
+        "the refusal must name the real actions: {body}"
+    );
+}
+
 // ══ rate limiting ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]

@@ -136,6 +136,15 @@ r=$(rpc '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"pipelin
 check "an undeclared argument is refused" test "$(json_at "$refused" <<<"$r")" = true
 check "the refusal names the argument" \
   grep -qF "unknown argument 'smoke_undeclared_arg'" <<<"$(json_at "$said" <<<"$r")"
+# The same inside `args`, where the per-action validator answers.
+r=$(rpc '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"pipeline_meta","arguments":{"action":"version","args":{"smoke_undeclared_arg":1}}}}')
+check "an undeclared argument inside args is refused by name" \
+  grep -qF "unknown argument 'smoke_undeclared_arg'" <<<"$(json_at "$said" <<<"$r")"
+# A misspelled action is an unknown action that names the real ones, ✗ a
+# permission error. The probe is `verzion`, so echoing it cannot match `version`.
+r=$(rpc '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"pipeline_meta","arguments":{"action":"verzion"}}}')
+check "a misspelled action is refused as unknown, naming 'version'" \
+  grep -qE "unknown action.*known:.*version" <<<"$(json_at "$said" <<<"$r")"
 
 case "$mode" in
   read_only)
