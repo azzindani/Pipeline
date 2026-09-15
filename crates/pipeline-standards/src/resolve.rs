@@ -57,6 +57,39 @@ impl Resolved {
         self.pin.as_ref().is_some_and(|p| !sha_eq(p, &self.sha))
     }
 
+    /// Did the corpus move in a way that changes what this project must satisfy?
+    ///
+    /// ! A sha difference alone is the wrong question. Every merge into Standards
+    /// moves HEAD, so a typo fix in a standard's prose turned a consumer's CI red
+    /// and the honest answer was "nothing you must satisfy changed". A gate that
+    /// cries wolf gets switched off, which costs the real signal.
+    ///
+    /// The obligations ARE `index.json` — routes, tiers, checklists. So the
+    /// question is whether the index the pin recorded differs from the index at
+    /// HEAD, which git can answer without a second field in pipeline.yaml.
+    ///
+    /// Unknown → drifted. An unreachable pin (shallow clone, rewritten history,
+    /// a pin from another repo) is exactly when a consumer must look, so an
+    /// unanswerable comparison is never treated as "unchanged".
+    pub async fn obligations_moved(&self) -> bool {
+        if !self.is_drifted() {
+            return false;
+        }
+        let Some(pin) = self.pin.as_deref() else {
+            return false;
+        };
+        let pinned = git(
+            &self.root,
+            &["show", &format!("{pin}:{}", crate::index::INDEX_FILE)],
+        )
+        .await;
+        let current = tokio::fs::read_to_string(self.root.join(crate::index::INDEX_FILE)).await;
+        match (pinned, current) {
+            (Ok(a), Ok(b)) => a.trim() != b.trim(),
+            _ => true,
+        }
+    }
+
     /// No pin recorded yet → first resolve, caller should write one.
     pub fn is_unpinned(&self) -> bool {
         self.pin.is_none()
