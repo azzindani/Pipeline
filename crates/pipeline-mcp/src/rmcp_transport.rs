@@ -92,22 +92,11 @@ impl ServerHandler for PipelineRmcpHandler {
         params: CallToolRequestParams,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let arguments = params.arguments.unwrap_or_default();
-        let action = arguments
-            .get("action")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned();
-        let inner_args = arguments
-            .get("args")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-
-        let req = ToolRequest {
-            action,
-            args: inner_args,
+        let arguments = serde_json::Value::Object(params.arguments.unwrap_or_default());
+        let resp = match ToolRequest::from_arguments(&params.name, &arguments) {
+            Ok(req) => dispatch::call_tool(&params.name, req, self.state.clone()).await,
+            Err(e) => crate::tools::ToolResponse::refused(e),
         };
-        let resp = dispatch::call_tool(&params.name, req, self.state.clone()).await;
         let is_error = !resp.ok;
         let payload = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into());
 
