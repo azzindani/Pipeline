@@ -12,11 +12,46 @@ pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
         "recall" => recall(req.args, state).await,
         "history" => history(req.args, state).await,
         "suggest_fix" => suggest_fix(req.args, state).await,
+        "record_fix" => record_fix(req.args, state).await,
         "known_issues" => known_issues(state).await,
         "pattern_report" => pattern_report(state).await,
         "export" => export(req.args, state).await,
         "import" => import(req.args, state).await,
         other => err(format!("unknown action 'pipeline_memory.{other}'")),
+    }
+}
+
+/// Record what was tried against a failure and whether it worked.
+///
+/// ! The write half of the learning loop. `suggest_fix` reads `fix_worked`;
+/// until this existed nothing set it, so every lookup returned zero prior fixes
+/// — indistinguishable from a genuinely new error.
+async fn record_fix(args: Value, state: Arc<ServerState>) -> ToolResponse {
+    let Some(failure_id) = args.get("failure_id").and_then(Value::as_str) else {
+        return err("missing 'failure_id'".into());
+    };
+    let Some(fix) = args.get("fix").and_then(Value::as_str) else {
+        return err("missing 'fix'".into());
+    };
+    // ! Required, ✗ defaulted to true. A silent default would record every
+    // attempt as a success and poison the very lookup this feeds.
+    let Some(worked) = args.get("worked").and_then(Value::as_bool) else {
+        return err(
+            "missing 'worked' · record failed attempts too, they are what stops a retry".into(),
+        );
+    };
+    let mem = match ensure_memory(&state).await {
+        Ok(m) => m,
+        Err(e) => return err(e),
+    };
+    match mem.record_fix(failure_id, fix, worked).await {
+        Ok(true) => ToolResponse::ok(json!({
+            "failure_id": failure_id,
+            "fix": fix,
+            "worked": worked,
+        })),
+        Ok(false) => err(format!("no failure with id '{failure_id}'")),
+        Err(e) => err(e.to_string()),
     }
 }
 

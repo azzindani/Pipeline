@@ -75,7 +75,210 @@ pub async fn handle(req: ToolRequest, _state: Arc<ServerState>) -> ToolResponse 
         "a11y_check" => a11y_check(&req.args).await,
         "against_env" => against_env(&req.args).await,
         "devtools_eval" => devtools_eval(&req.args).await,
+        "motion_measure" => motion_measure(&req.args).await,
+        "motion_baseline" => motion_baseline(&req.args),
+        "motion_compare" => motion_compare(&req.args),
         other => err(format!("unknown action 'pipeline_e2e.{other}'")),
+    }
+}
+
+// ── motion ──────────────────────────────────────────────────────────────────
+
+/// Script evaluated in the page · reduces motion to scalars.
+///
+/// ! Runs entirely in the page and returns numbers. Nothing here captures video
+/// | pixels: the maturity standard's numeric-evidence rule makes scalars the
+/// finding, and a screenshot supporting evidence at most.
+const MOTION_JS: &str = r"
+const nav = performance.getEntriesByType('navigation')[0] || {};
+const paint = performance.getEntriesByType('paint');
+const fp = paint.find(p => p.name === 'first-contentful-paint');
+let shift = 0;
+for (const e of performance.getEntriesByType('layout-shift') || []) {
+  if (!e.hadRecentInput) shift += e.value;
+}
+return new Promise(resolve => {
+  const frames = [];
+  let last = performance.now();
+  let n = 0;
+  const tick = now => {
+    frames.push(now - last);
+    last = now;
+    if (++n < 120) requestAnimationFrame(tick);
+    else {
+      frames.sort((a, b) => a - b);
+      const at = q => frames.length ? frames[Math.min(frames.length - 1,
+        Math.floor(frames.length * q))] : 0;
+      resolve({
+        frame_interval_p50: at(0.50),
+        frame_interval_p95: at(0.95),
+        frame_interval_p99: at(0.99),
+        frames_sampled: frames.length,
+        time_to_first_paint: fp ? fp.startTime : null,
+        dom_interactive: nav.domInteractive || null,
+        layout_shift_cumulative: shift,
+      });
+    }
+  };
+  requestAnimationFrame(tick);
+});
+";
+
+/// Where a baseline for one environment + route lives.
+fn motion_baseline_path(environment: &str, route: &str) -> PathBuf {
+    // Route becomes one filename component · `/` and `.` would escape the dir.
+    let safe: String = route
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    Path::new(".pipeline")
+        .join("motion")
+        .join(environment)
+        .join(format!("{safe}.json"))
+}
+
+/// Capture motion metrics for one route.
+///
+/// ! Target is a descriptor (`url` | `session`), ✗ only a URL — the same action
+/// takes a native | scene backend later without a contract change. A backend it
+/// cannot resolve is refused by name, ✗ silently treated as web.
+async fn motion_measure(args: &Value) -> ToolResponse {
+    let backend = str_arg(args, "backend").unwrap_or("web");
+    if backend != "web" {
+        return err(format!(
+            "backend '{backend}' has no capture path yet · web is the only one implemented ·              the metric schema is backend-neutral, so this is a missing backend, ✗ a missing action"
+        ));
+    }
+    let Some(url) = str_arg(args, "url") else {
+        return err("missing 'url' · the web backend needs an origin to open".into());
+    };
+    let cwd = match cwd() {
+        Ok(p) => p,
+        Err(e) => return err(e),
+    };
+    let cmd = vec!["node".into(), "-e".into(), devtools_script(url, MOTION_JS)];
+    let cmdline = one_shot_argv(&mount_for(&cwd), &[], &cmd);
+    let r = docker(&cmdline, &cwd, "motion_measure", INSTALL_LIMIT).await;
+    let shaped = shape_eval_result(r, None);
+    if !shaped.ok {
+        return shaped;
+    }
+
+    let hardware_class = str_arg(args, "hardware_class").unwrap_or("unspecified");
+    let target = args
+        .get("target_frame_interval_ms")
+        .and_then(Value::as_f64)
+        .unwrap_or(16.7);
+    let raw = shaped.data.get("result").cloned().unwrap_or(json!({}));
+
+    ToolResponse::ok(json!({
+        "route": str_arg(args, "route").unwrap_or(url),
+        "environment": str_arg(args, "environment").unwrap_or("dev"),
+        "captured_at": pipeline_memory::now_rfc3339(),
+        "conditions": {
+            "hardware_class": hardware_class,
+            "target_frame_interval_ms": target,
+        },
+        "metrics": raw,
+        "backend": backend,
+    }))
+}
+
+/// Commit a capture as the baseline for an environment + route.
+///
+/// ! Explicit action, ✗ automatic on first run. An accidental baseline encodes
+/// whatever state happened to be measured first as "correct", and every later
+/// comparison inherits it.
+fn motion_baseline(args: &Value) -> ToolResponse {
+    let Some(record) = args.get("record") else {
+        return err("missing 'record' · pass the object motion_measure returned".into());
+    };
+    let environment = str_arg(args, "environment")
+        .or_else(|| record.get("environment").and_then(Value::as_str))
+        .unwrap_or("dev");
+    let Some(route) =
+        str_arg(args, "route").or_else(|| record.get("route").and_then(Value::as_str))
+    else {
+        return err("missing 'route' · not in args and not in the record".into());
+    };
+
+    let cwd = match cwd() {
+        Ok(p) => p,
+        Err(e) => return err(e),
+    };
+    let path = cwd.join(motion_baseline_path(environment, route));
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return err(format!("mkdir {}: {e}", parent.display()));
+        }
+    }
+    let body = match serde_json::to_string_pretty(record) {
+        Ok(b) => b,
+        Err(e) => return err(format!("serialize record: {e}")),
+    };
+    if let Err(e) = std::fs::write(&path, body) {
+        return err(format!("write {}: {e}", path.display()));
+    }
+    ToolResponse::ok(json!({
+        "environment": environment,
+        "route": route,
+        "path": path.display().to_string(),
+    }))
+}
+
+/// Compare a capture against the committed baseline.
+fn motion_compare(args: &Value) -> ToolResponse {
+    let Some(record) = args.get("record") else {
+        return err("missing 'record' · pass the object motion_measure returned".into());
+    };
+    let environment = str_arg(args, "environment")
+        .or_else(|| record.get("environment").and_then(Value::as_str))
+        .unwrap_or("dev");
+    let Some(route) =
+        str_arg(args, "route").or_else(|| record.get("route").and_then(Value::as_str))
+    else {
+        return err("missing 'route' · not in args and not in the record".into());
+    };
+    let cwd = match cwd() {
+        Ok(p) => p,
+        Err(e) => return err(e),
+    };
+    let path = cwd.join(motion_baseline_path(environment, route));
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        // ! A missing baseline is reported as missing, ✗ as a pass — the same
+        // rule visual_regression already follows.
+        return err(format!(
+            "no baseline at {} · record one with motion_baseline before comparing",
+            path.display()
+        ));
+    };
+
+    let baseline: pipeline_core::motion::MotionRecord = match serde_json::from_str(&raw) {
+        Ok(b) => b,
+        Err(e) => return err(format!("baseline at {} is unreadable: {e}", path.display())),
+    };
+    let current: pipeline_core::motion::MotionRecord = match serde_json::from_value(record.clone())
+    {
+        Ok(c) => c,
+        Err(e) => return err(format!("record is not a motion record: {e}")),
+    };
+    let budgets = args
+        .get("budgets")
+        .and_then(|b| serde_json::from_value(b.clone()).ok())
+        .unwrap_or_default();
+
+    let comparison = pipeline_core::motion::compare(&baseline, &current, &budgets);
+    let passed = matches!(
+        comparison.outcome,
+        pipeline_core::motion::ComparisonOutcome::Pass
+    );
+    let data = serde_json::to_value(&comparison).unwrap_or_else(|_| json!({}));
+    ToolResponse {
+        ok: passed,
+        data,
+        next_suggested: vec![],
+        memory_refs: vec![],
+        error: (!passed).then(|| "motion comparison did not pass".to_owned()),
     }
 }
 

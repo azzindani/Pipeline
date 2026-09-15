@@ -1,5 +1,7 @@
 //! Pipeline MCP server · 19 super tools dispatching by `action`.
 //!
+//! kind: composite
+//!
 //! Hand-rolled JSON-RPC 2.0 over stdio. Implements `initialize` ·
 //! `tools/list` · `tools/call`. Tool calls deserialize into `ToolRequest`
 //! and route through `dispatch::call_tool` which fans out to per-tool

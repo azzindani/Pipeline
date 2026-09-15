@@ -20,6 +20,9 @@ pub async fn handle(req: ToolRequest, _state: Arc<ServerState>) -> ToolResponse 
         "template_list" => template_list(),
         "scaffold" => scaffold(&req.args),
         "template_register" => template_register(&req.args).await,
+        "devtool_add" => devtool_add(&req.args),
+        "devtool_list" => devtool_list(),
+        "devtool_run" => devtool_run(&req.args).await,
         other => err(format!("unknown action 'pipeline_project.{other}'")),
     }
 }
@@ -34,7 +37,7 @@ async fn init(args: &Value) -> ToolResponse {
         .or_else(|| args.get("template"))
         .and_then(Value::as_str)
         .unwrap_or("custom");
-    let stack = args.get("stack").and_then(Value::as_str).unwrap_or("");
+    let declared_stack = args.get("stack").and_then(Value::as_str).unwrap_or("");
     // adopt · bring an existing repo under Pipeline instead of scaffolding a new
     // one. Writes only the missing files · ✗ overwrites anything already there.
     let adopt = args
@@ -51,6 +54,21 @@ async fn init(args: &Value) -> ToolResponse {
         },
     };
 
+    // ! Detect the stack when adopting and none was declared. Someone bringing
+    // an existing project under Pipeline should not have to name what the repo
+    // already says about itself — and a wrong guess is worse than none, so an
+    // undetectable tree yields "" and the caller is told rather than defaulted.
+    let detected = if adopt && declared_stack.is_empty() {
+        detect_stack(&parent.join(&name))
+    } else {
+        None
+    };
+    let stack = if declared_stack.is_empty() {
+        detected.as_deref().unwrap_or("")
+    } else {
+        declared_stack
+    };
+
     // A registered template is instantiated for real · it is only reachable here
     // because built-ins win the name, so the lookup runs after that check.
     if !template.is_empty() && !templates::is_builtin(template) {
@@ -63,10 +81,23 @@ async fn init(args: &Value) -> ToolResponse {
         }
     }
 
+    if adopt && stack.is_empty() {
+        return err(format!(
+            "cannot infer the runtime of '{name}' · no single manifest found, | the repo is \
+             polyglot · pass stack=rust | go | python-uv | bun | node"
+        ));
+    }
+
     match templates::init_project_with(&parent, &name, template, stack, adopt) {
         Ok(outcome) => ToolResponse {
             ok: true,
-            data: serde_json::to_value(&outcome).unwrap_or(json!({})),
+            data: {
+                let mut v = serde_json::to_value(&outcome).unwrap_or(json!({}));
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("stack_detected".into(), json!(detected.is_some()));
+                }
+                v
+            },
             next_suggested: vec![
                 "pipeline_session.lock".into(),
                 "pipeline_plan.create".into(),
@@ -84,6 +115,40 @@ async fn init(args: &Value) -> ToolResponse {
              pipeline_project.template_register"
         )),
         Err(e) => err(e.to_string()),
+    }
+}
+
+/// Infer the runtime from what an existing repo already declares.
+///
+/// ! Manifest files only · ✗ guessing from file extensions. A repo with one
+/// stray `.py` in a Rust workspace is a Rust project, and extension-counting
+/// gets that wrong in exactly the codebases worth adopting.
+///
+/// Ambiguity resolves to `None`, ✗ to a first match: a polyglot repo needs the
+/// caller to say which runtime the pipeline is for.
+fn detect_stack(root: &Path) -> Option<String> {
+    const MANIFESTS: [(&str, &str); 6] = [
+        ("Cargo.toml", "rust"),
+        ("go.mod", "go"),
+        ("pyproject.toml", "python-uv"),
+        ("requirements.txt", "python-uv"),
+        ("bun.lockb", "bun"),
+        ("package.json", "node"),
+    ];
+    let mut found: Vec<&str> = Vec::new();
+    for (file, runtime) in MANIFESTS {
+        if root.join(file).exists() && !found.contains(&runtime) {
+            found.push(runtime);
+        }
+    }
+    // bun and node both ship package.json · bun.lockb is the discriminator, so
+    // its presence settles the pair rather than making the repo ambiguous.
+    if found.contains(&"bun") {
+        found.retain(|r| *r != "node");
+    }
+    match found.as_slice() {
+        [single] => Some((*single).to_owned()),
+        _ => None,
     }
 }
 
@@ -1269,5 +1334,227 @@ mod scaffold_tests {
         assert!(looks_like_git("/srv/templates/tpl.git"));
         assert!(!looks_like_git("/srv/templates/tpl"));
         assert!(!looks_like_git("./tpl"));
+    }
+}
+
+// ── project tools ───────────────────────────────────────────────────────────
+//
+// ! Pipeline HOSTS agent-authored tools · ✗ generates them (docs/MATURITY.md
+// §10.1). Generation needs domain knowledge Pipeline does not have and would
+// emit scaffolds. Pipeline validates the CONTRACT — name, entry point, declared
+// destructiveness — ✗ the logic.
+//
+// Conventions → `primitives/STANDARDS.md` §11: project-local and committed,
+// one documented entry point, destructive tools default to dry-run.
+
+/// Where the registry lives · committed with the project, ✗ in `.pipeline/`,
+/// which is Pipeline's own scratch and gitignored in most projects.
+fn devtools_path(cwd: &std::path::Path) -> std::path::PathBuf {
+    cwd.join("devtools.json")
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct DevTool {
+    name: String,
+    /// Command run from the project root.
+    entry: String,
+    description: String,
+    /// Mutates source | state · such a tool defaults to dry-run.
+    #[serde(default)]
+    destructive: bool,
+    registered_at: String,
+}
+
+fn load_devtools(cwd: &std::path::Path) -> Vec<DevTool> {
+    std::fs::read_to_string(devtools_path(cwd))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_devtools(cwd: &std::path::Path, tools: &[DevTool]) -> Result<(), String> {
+    let body = serde_json::to_string_pretty(tools).map_err(|e| e.to_string())?;
+    std::fs::write(devtools_path(cwd), body).map_err(|e| e.to_string())
+}
+
+/// Register a tool the agent wrote.
+fn devtool_add(args: &Value) -> ToolResponse {
+    let Some(name) = args.get("name").and_then(Value::as_str) else {
+        return err("missing 'name'".into());
+    };
+    let Some(entry) = args.get("entry").and_then(Value::as_str) else {
+        return err("missing 'entry' · the command that runs this tool".into());
+    };
+    // ! Required, ✗ defaulted. A tool that rewrites source and never said so is
+    // the one case where a wrong default does damage, so the caller declares it.
+    let Some(destructive) = args.get("destructive").and_then(Value::as_bool) else {
+        return err(
+            "missing 'destructive' · declare whether this tool mutates source or state".into(),
+        );
+    };
+    let Ok(cwd) = std::env::current_dir() else {
+        return err("cwd unavailable".into());
+    };
+
+    let mut tools = load_devtools(&cwd);
+    let replaced = tools.iter().any(|t| t.name == name);
+    tools.retain(|t| t.name != name);
+    tools.push(DevTool {
+        name: name.to_owned(),
+        entry: entry.to_owned(),
+        description: args
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        destructive,
+        registered_at: pipeline_memory::now_rfc3339(),
+    });
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    if let Err(e) = save_devtools(&cwd, &tools) {
+        return err(format!("write devtools.json: {e}"));
+    }
+    ToolResponse::ok(json!({
+        "name": name,
+        "entry": entry,
+        "destructive": destructive,
+        "replaced": replaced,
+        "path": devtools_path(&cwd).display().to_string(),
+    }))
+}
+
+fn devtool_list() -> ToolResponse {
+    let Ok(cwd) = std::env::current_dir() else {
+        return err("cwd unavailable".into());
+    };
+    let tools = load_devtools(&cwd);
+    ToolResponse::ok(json!({
+        "count": tools.len(),
+        "tools": tools,
+        "path": devtools_path(&cwd).display().to_string(),
+    }))
+}
+
+/// Execute a registered tool.
+///
+/// ! A destructive tool requires `confirm: true`. Dry-run is the default
+/// because the caller most likely to run one blind is an agent that has lost
+/// its context and is re-reading the registry.
+async fn devtool_run(args: &Value) -> ToolResponse {
+    let Some(name) = args.get("name").and_then(Value::as_str) else {
+        return err("missing 'name'".into());
+    };
+    let Ok(cwd) = std::env::current_dir() else {
+        return err("cwd unavailable".into());
+    };
+    let tools = load_devtools(&cwd);
+    let Some(tool) = tools.iter().find(|t| t.name == name) else {
+        let known: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        return err(format!(
+            "no tool '{name}' · registered: {}",
+            if known.is_empty() {
+                "none".to_owned()
+            } else {
+                known.join(" · ")
+            }
+        ));
+    };
+
+    let confirmed = args
+        .get("confirm")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if tool.destructive && !confirmed {
+        return ToolResponse::ok(json!({
+            "name": name,
+            "entry": tool.entry,
+            "dry_run": true,
+            "reason": "tool is declared destructive · pass confirm:true to execute",
+        }));
+    }
+
+    let extra = args.get("args").and_then(Value::as_str).unwrap_or("");
+    let command = if extra.is_empty() {
+        tool.entry.clone()
+    } else {
+        format!("{} {extra}", tool.entry)
+    };
+    let out = tokio::process::Command::new("sh")
+        .args(["-c", &command])
+        .current_dir(&cwd)
+        .output()
+        .await;
+    let Ok(out) = out else {
+        return err(format!("spawn '{command}' failed"));
+    };
+    ToolResponse {
+        // ! `ok` is whether the tool RAN · its exit code is the tool's verdict.
+        ok: true,
+        data: json!({
+            "name": name,
+            "command": command,
+            "dry_run": false,
+            "exit_code": out.status.code(),
+            "stdout": String::from_utf8_lossy(&out.stdout),
+            "stderr": String::from_utf8_lossy(&out.stderr),
+        }),
+        next_suggested: vec![],
+        memory_refs: vec![],
+        error: None,
+    }
+}
+
+#[cfg(test)]
+mod adopt_tests {
+    use super::detect_stack;
+
+    fn tree(files: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for f in files {
+            std::fs::write(dir.path().join(f), "").expect("write");
+        }
+        dir
+    }
+
+    #[test]
+    fn a_single_manifest_settles_the_runtime() {
+        assert_eq!(
+            detect_stack(tree(&["Cargo.toml"]).path()).as_deref(),
+            Some("rust")
+        );
+        assert_eq!(
+            detect_stack(tree(&["go.mod"]).path()).as_deref(),
+            Some("go")
+        );
+        assert_eq!(
+            detect_stack(tree(&["pyproject.toml"]).path()).as_deref(),
+            Some("python-uv")
+        );
+    }
+
+    #[test]
+    fn bun_wins_over_node_because_its_lockfile_is_the_discriminator() {
+        // ! Both ship package.json · without this the commonest JS repo shape
+        // would read as ambiguous and refuse.
+        assert_eq!(
+            detect_stack(tree(&["package.json", "bun.lockb"]).path()).as_deref(),
+            Some("bun")
+        );
+        assert_eq!(
+            detect_stack(tree(&["package.json"]).path()).as_deref(),
+            Some("node")
+        );
+    }
+
+    #[test]
+    fn a_polyglot_repo_refuses_rather_than_picking_first() {
+        // ! A wrong guess configures the wrong stages and every later run is
+        // measuring the wrong thing. Refusing makes the caller decide.
+        assert_eq!(detect_stack(tree(&["Cargo.toml", "go.mod"]).path()), None);
+    }
+
+    #[test]
+    fn an_empty_tree_yields_none_not_a_default() {
+        assert_eq!(detect_stack(tree(&[]).path()), None);
     }
 }

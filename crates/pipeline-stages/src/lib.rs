@@ -1,5 +1,7 @@
 //! Pipeline stages · concrete `Stage` implementations + profile runner.
 //!
+//! kind: component
+//!
 //! - `StaticStage`: `cargo fmt --check` + `cargo clippy -D warnings`
 //! - `UnitStage`: `cargo test --workspace`
 //! - `ContainerStage`: `docker build` + image-size gate

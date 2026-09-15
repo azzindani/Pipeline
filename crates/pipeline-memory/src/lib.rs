@@ -1,5 +1,7 @@
 //! Pipeline memory · `SQLite`-backed structured + KV store.
 //!
+//! kind: component
+//!
 //! Schema in `schema.sql` · CLAUDE.md §"Memory architecture" describes the
 //! three logical layers (structured · semantic · working). Day-2 ships the
 //! structured layer end-to-end; semantic (sqlite-vec) lands in MVP.
@@ -30,6 +32,8 @@ pub enum MemoryError {
     SessionNotFound(String),
     #[error("project not found: {0}")]
     ProjectNotFound(String),
+    #[error("serialize progress: {0}")]
+    Serialize(#[from] serde_json::Error),
 }
 
 /// Owned handle to the project's SQLite memory store.
@@ -255,12 +259,50 @@ impl Memory {
                 id,
                 name,
                 stack: stack.unwrap_or_default(),
+                current_branch: current_branch(),
+                last_good_commit: self.last_good_commit(project_id).await?,
             },
             active_session: active_lock,
             last_run,
             recent_failures,
             active_work: self.active_work(project_id).await?,
+            progress: self.progress(project_id).await?,
         })
+    }
+
+    /// Newest commit with a passing run · `None` when none has passed.
+    ///
+    /// ! Scoped to runs that recorded a `commit_sha`. A run without one cannot
+    /// vouch for a commit, so it is skipped rather than credited to HEAD.
+    pub async fn last_good_commit(&self, project_id: &str) -> Result<Option<String>, MemoryError> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT commit_sha FROM pipeline_runs
+             WHERE project_id = ? AND status = 'pass' AND commit_sha IS NOT NULL
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(sha,)| sha))
+    }
+
+    /// Read the progress tracker · absent → default, ✗ error.
+    pub async fn progress(&self, project_id: &str) -> Result<Progress, MemoryError> {
+        let raw = self.recall(project_id, "progress", "tracker").await?;
+        Ok(raw
+            .and_then(|r| serde_json::from_str(&r).ok())
+            .unwrap_or_default())
+    }
+
+    /// Write the progress tracker whole.
+    pub async fn set_progress(
+        &self,
+        project_id: &str,
+        progress: &Progress,
+    ) -> Result<(), MemoryError> {
+        let blob = serde_json::to_string(progress).map_err(MemoryError::Serialize)?;
+        self.remember(project_id, "progress", "tracker", &blob)
+            .await
     }
 
     /// Rebuild the planning context from what `pipeline_plan.*` stored.
@@ -363,6 +405,33 @@ impl Memory {
         .execute(&self.pool)
         .await?;
         Ok(id)
+    }
+
+    /// Close the learning loop · record what was tried against a failure and
+    /// whether it worked.
+    ///
+    /// ! Without this the loop CLAUDE.md describes cannot close. `fix_applied`
+    /// and `fix_worked` were read in three places and written in none, so
+    /// `suggest_fix`'s filter on `fix_worked == Some(1)` could never match and
+    /// every lookup returned zero prior fixes — silently, because zero matches
+    /// is also what a genuinely new error looks like.
+    ///
+    /// A failed fix is recorded too. Knowing what did NOT work is the half that
+    /// stops an agent retrying it on the next occurrence.
+    pub async fn record_fix(
+        &self,
+        failure_id: &str,
+        fix: &str,
+        worked: bool,
+    ) -> Result<bool, MemoryError> {
+        let result =
+            sqlx::query("UPDATE failures SET fix_applied = ?, fix_worked = ? WHERE id = ?")
+                .bind(fix)
+                .bind(i64::from(worked))
+                .bind(failure_id)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn log_failure(&self, failure: &NewFailure<'_>) -> Result<String, MemoryError> {
@@ -806,6 +875,16 @@ pub struct ProjectInfo {
     pub id: String,
     pub name: String,
     pub stack: String,
+    /// Branch the working tree is on · read from git at packet build time.
+    ///
+    /// ! From git, ✗ from stored state. A branch recorded at the last run is
+    /// wrong the moment someone checks out another one, and a cold agent
+    /// trusting a stale branch acts on the wrong tree.
+    #[serde(default)]
+    pub current_branch: Option<String>,
+    /// Newest commit whose pipeline run passed · `None` until one does.
+    #[serde(default)]
+    pub last_good_commit: Option<String>,
 }
 
 /// What the project is *trying to do* · reconstructed from the stored plan.
@@ -843,6 +922,28 @@ pub struct MilestoneBrief {
     pub exit_criteria: Vec<String>,
 }
 
+/// Where a long-running effort actually stands.
+///
+/// ! Distinct from [`ActiveWork`], which is the *plan* — what the project
+/// intends to build. This is the *thread*: what the current effort has already
+/// done and what it was about to do. An agent that loses its context keeps the
+/// plan (it is stored) but loses the thread, and then redoes finished work or
+/// resumes at the wrong step. Re-read this after every context reset.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Progress {
+    /// One sentence · what this effort is for. ✗ the project's goal, this
+    /// effort's goal.
+    pub goal: Option<String>,
+    /// Append-only. Steps finished, oldest first.
+    pub completed: Vec<String>,
+    /// Ordered. Next step is index 0.
+    pub remaining: Vec<String>,
+    /// What is preventing the next step · `None` when unblocked.
+    pub blocker: Option<String>,
+    /// ISO timestamp of the last update · staleness is a signal.
+    pub updated_at: Option<String>,
+}
+
 /// Canonical handover packet · CLAUDE.md §"Handover protocol".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandoverPacket {
@@ -851,6 +952,42 @@ pub struct HandoverPacket {
     pub last_run: Option<RunRecord>,
     pub recent_failures: Vec<FailureRecord>,
     pub active_work: ActiveWork,
+    /// Empty rather than absent on a project that never recorded progress —
+    /// an absent field would be indistinguishable from "no progress made".
+    pub progress: Progress,
+}
+
+/// HEAD's commit sha · `None` outside a repository | when git is unavailable.
+///
+/// ! Recorded at run time so `last_good_commit` has something to vouch for.
+/// Without it every run stores `commit_sha: NULL`, the query finds nothing, and
+/// the field is permanently null — present in the packet, useless in it.
+pub fn head_commit() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!sha.is_empty()).then_some(sha)
+}
+
+/// Current git branch · `None` outside a repository | when git is unavailable.
+///
+/// ! Detached HEAD yields `None` rather than the literal "HEAD", which would
+/// read as a branch named HEAD.
+fn current_branch() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!name.is_empty() && name != "HEAD").then_some(name)
 }
 
 /// Re-sort scope rows oldest-first on the payload's own `created_at`.

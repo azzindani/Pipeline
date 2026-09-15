@@ -607,6 +607,7 @@ fn is_safe_action(tool: &str, action: &str) -> bool {
                 | "list_capabilities"
                 | "compare"
                 | "capability_graph"
+                | "fleet_health"
                 | "re_status"
                 | "re_report"
         ),

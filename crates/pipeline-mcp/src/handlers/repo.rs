@@ -62,6 +62,7 @@ pub async fn handle(req: ToolRequest, _state: Arc<ServerState>) -> ToolResponse 
         "port_validate" => port_validate(&req.args).await,
         "apply_standards" => apply_standards(&req.args).await,
         "capability_graph" => capability_graph().await,
+        "fleet_health" => fleet_health().await,
         "re_analyze" => re_analyze(&req.args).await,
         "re_status" => re_status(&req.args).await,
         "re_report" => re_report(&req.args).await,
@@ -114,6 +115,17 @@ async fn register(args: &Value) -> ToolResponse {
 async fn list() -> ToolResponse {
     match read_registry().await {
         Ok(r) => ToolResponse::ok(json!({"repos": r.repos})),
+        Err(e) => err(e),
+    }
+}
+
+/// One pass over every registered repo · see [`crate::handlers::fleet`].
+///
+/// ! Lives here because the registry lives here · the scan itself is a separate
+/// module so this file does not grow another few hundred lines.
+async fn fleet_health() -> ToolResponse {
+    match read_registry().await {
+        Ok(r) => crate::handlers::fleet::fleet_health(r.repos).await,
         Err(e) => err(e),
     }
 }
@@ -265,6 +277,14 @@ fn clone_dir(alias: &str) -> PathBuf {
 ///
 /// ✗ use this in `remove` — deleting a local repo's "clone" must stay pointed at
 /// `clone_dir`, or `delete_clone` would erase the user's actual source tree.
+pub(crate) fn repo_root_of(entry: &RegistryEntry) -> PathBuf {
+    if entry.kind == "local" {
+        PathBuf::from(strip_local_prefix(&entry.url))
+    } else {
+        clone_dir(&entry.alias)
+    }
+}
+
 async fn repo_root(alias: &str) -> Result<PathBuf, String> {
     let reg = read_registry().await?;
     let entry = reg
@@ -272,11 +292,7 @@ async fn repo_root(alias: &str) -> Result<PathBuf, String> {
         .iter()
         .find(|r| r.alias == alias)
         .ok_or_else(|| format!("alias '{alias}' not registered"))?;
-    Ok(if entry.kind == "local" {
-        PathBuf::from(strip_local_prefix(&entry.url))
-    } else {
-        clone_dir(alias)
-    })
+    Ok(repo_root_of(entry))
 }
 
 fn digest_file(alias: &str) -> PathBuf {

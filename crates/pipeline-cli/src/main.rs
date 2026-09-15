@@ -1,4 +1,6 @@
 //! `pipeline` binary · single entry point for CLI · MCP server · dev daemon.
+//!
+//! kind: composite
 
 use clap::{Parser, Subcommand};
 use pipeline_core::{StageProfile, StageStatus};
@@ -56,6 +58,29 @@ enum Command {
     Report,
     /// Print the loaded pipeline.yaml config (debug)
     Config,
+    /// Standards binding · the seam with the Standards repo
+    Standards {
+        #[command(subcommand)]
+        action: StandardsAction,
+    },
+}
+
+/// ! Thin wrappers over the MCP actions, ✗ a second implementation. The agent
+/// surface and the CLI must answer identically about the same tree — two code
+/// paths would drift, and the one CI runs would stop describing the one an
+/// agent sees.
+#[derive(Subcommand)]
+enum StandardsAction {
+    /// Resolve the corpus, cloning it if no cache is present
+    Fetch,
+    /// Verify the binding is sound · non-zero exit on drift, no pin, or a dead route
+    Check,
+    /// Which standards bind to this project, and why
+    Route,
+    /// Catalog of every standard in the bound corpus
+    List,
+    /// Record the corpus commit in pipeline.yaml
+    Pin,
 }
 
 #[tokio::main]
@@ -82,9 +107,46 @@ async fn main() -> anyhow::Result<()> {
         Command::Watch => println!("[stub] watch · POC week 1"),
         Command::Init { name, kind } => init_project(&name, kind.as_deref()).await?,
         Command::Report => report().await?,
+        Command::Standards { action } => standards(&action).await?,
         Command::Config => print_config()?,
     }
     Ok(())
+}
+
+/// Run one standards action through the MCP dispatcher and print its payload.
+///
+/// ! Exits non-zero when the action refuses, so CI fails on a rotten binding.
+/// The binding drifted silently for weeks once: `standards.pin` sat at a commit
+/// from before a dozen new standards landed, `check` reported it correctly on
+/// every call, and no gate ever read the answer.
+async fn standards(action: &StandardsAction) -> anyhow::Result<()> {
+    let name = match action {
+        StandardsAction::Fetch => "fetch",
+        StandardsAction::Check => "check",
+        StandardsAction::Route => "route",
+        StandardsAction::List => "list",
+        StandardsAction::Pin => "pin",
+    };
+
+    let resp = pipeline_mcp::call_tool(
+        "pipeline_standards",
+        pipeline_mcp::ToolRequest {
+            action: name.to_owned(),
+            args: serde_json::Value::Null,
+        },
+        std::sync::Arc::new(pipeline_mcp::ServerState::new()),
+    )
+    .await;
+
+    println!("{}", serde_json::to_string_pretty(&resp.data)?);
+    if resp.ok {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "standards {name}: {}",
+        resp.error
+            .unwrap_or_else(|| "refused without a reason".to_owned())
+    )
 }
 
 /// Point the server at a project root. Every handler reads pipeline.yaml and
@@ -174,6 +236,8 @@ async fn run_profile(profile_arg: &str) -> anyhow::Result<()> {
             .failure
             .as_ref()
             .and_then(|f| serde_json::to_string(f).ok());
+        // ! Recorded per run so `last_good_commit` has something to vouch for.
+        let head = pipeline_memory::head_commit();
         mem.log_run(&NewRun {
             project_id: &project_id,
             session_id: session_ref,
@@ -182,7 +246,7 @@ async fn run_profile(profile_arg: &str) -> anyhow::Result<()> {
             status: status_label(r.status),
             duration_ms: r.duration.as_millis(),
             triggered_by: Some("pipeline-cli"),
-            commit_sha: None,
+            commit_sha: head.as_deref(),
             stdout: Some(&r.stdout),
             stderr: Some(&r.stderr),
             failure_json: failure_json.as_deref(),

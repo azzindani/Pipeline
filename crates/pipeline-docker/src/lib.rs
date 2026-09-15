@@ -1,5 +1,7 @@
 //! Pipeline Docker control · shell-out to `docker` and `docker compose`.
 //!
+//! kind: component
+//!
 //! Day-4b ships a thin shell-out wrapper. CLAUDE.md design target is the
 //! `bollard` crate for the Engine API; migration is mechanical and lands
 //! incrementally as we need streaming logs / finer container control.
