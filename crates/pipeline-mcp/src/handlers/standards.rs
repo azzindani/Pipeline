@@ -368,12 +368,26 @@ async fn check() -> ToolResponse {
     let total: usize = lists.iter().map(|c| c.items.len()).sum();
 
     let mut blocking: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    // ! Blocking on a sha difference alone made every Standards merge turn this
+    // red, including one that only fixed a typo. What binds this project is
+    // index.json, so that is what decides: obligations moved → block · corpus
+    // moved with identical obligations → say so and pass.
     if resolved.is_drifted() {
-        blocking.push(format!(
-            "standards drift · pinned {} but corpus is at {} · gates may have moved",
+        let msg = format!(
+            "standards drift · pinned {} but corpus is at {}",
             resolved.pin.as_deref().unwrap_or("?"),
             resolved.short_sha()
-        ));
+        );
+        if resolved.obligations_moved().await {
+            blocking.push(format!(
+                "{msg} · obligations changed · re-pin after reviewing"
+            ));
+        } else {
+            notes.push(format!(
+                "{msg} · obligations identical · pipeline_standards.pin records the move"
+            ));
+        }
     }
     if resolved.is_unpinned() {
         blocking.push("no standards.pin in pipeline.yaml · gates are unversioned".to_owned());
@@ -396,6 +410,7 @@ async fn check() -> ToolResponse {
             "bound_standards": routed.ids.len(),
             "obligations": total,
             "blocking": blocking,
+            "notes": notes,
             // ! Counts here, items in `checklist`. This action returned every
             // item for every bound standard — ~14k tokens to answer "is the
             // binding sound", which is a yes/no plus a reason. The verdict call
