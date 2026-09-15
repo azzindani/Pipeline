@@ -120,7 +120,16 @@ fn help_lists_every_documented_subcommand() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (ok, stdout, _) = run(&["--help"], dir.path());
     assert!(ok, "--help must succeed");
-    for cmd in ["mcp", "run", "dev", "watch", "init", "report", "config"] {
+    for cmd in [
+        "mcp",
+        "run",
+        "dev",
+        "watch",
+        "init",
+        "report",
+        "config",
+        "standards",
+    ] {
         assert!(stdout.contains(cmd), "--help omits '{cmd}': {stdout}");
     }
 }
@@ -134,4 +143,40 @@ fn version_is_reported() {
         stdout.chars().any(|c| c.is_ascii_digit()),
         "--version printed no version: {stdout}"
     );
+}
+
+/// ! CI depends on this exit code. `pipeline standards check` is the gate that
+/// makes an improvement in the Standards repo reach this one: when the pin
+/// falls behind the corpus, or no route binds, the build must go red. A gate
+/// that reports a problem on stdout and exits 0 is not a gate — which is how
+/// the binding drifted for weeks while `check` described the drift correctly on
+/// every call.
+#[test]
+fn standards_check_exits_non_zero_when_the_binding_is_not_sound() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("pipeline.yaml"), MINIMAL).expect("write config");
+
+    // No corpus reachable · no cache, no source, cloning disabled for `check`.
+    let (ok, _stdout, stderr) = run(&["standards", "check"], dir.path());
+    assert!(
+        !ok,
+        "an unresolvable corpus must fail the build, ✗ pass quietly"
+    );
+    assert!(
+        stderr.contains("standards"),
+        "the failure must name what went wrong: {stderr}"
+    );
+}
+
+#[test]
+fn standards_subcommands_are_discoverable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (ok, stdout, _) = run(&["standards", "--help"], dir.path());
+    assert!(ok, "standards --help must succeed");
+    for action in ["fetch", "check", "route", "list", "pin"] {
+        assert!(
+            stdout.contains(action),
+            "standards --help omits '{action}': {stdout}"
+        );
+    }
 }
