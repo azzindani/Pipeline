@@ -12,6 +12,7 @@ Blocked items name their blocker. ✗ mark a task done while its verification is
 
 | # | Task | Detail |
 |---|---|---|
+| 43 | Re-pin standards after landing | `standards.pin` is `30be632`, a commit on `claude/relaxed-noether-j1l68e`. A squash-merge to `main` destroys that sha, and a fresh `pipeline standards fetch` from the git URL then cannot check the pin out. Run `pipeline_standards.pin` again once the Standards branch is on `main` · blocked by #28 |
 | 28 | Land both branches on `main` | Pipeline `claude/relaxed-noether-j1l68e` is ~37 commits ahead, Standards ~11. Both green. ✗ merged: this session's instructions forbid pushing to a branch other than the designated one without explicit permission, and both `CLAUDE.md` files forbid opening a PR unasked. Say merge | PR |
 
 ---
@@ -101,3 +102,5 @@ Pipeline 432 → 505 tests · fmt + clippy clean · `pipeline run fast` green. S
 | 40 | Standards: `testing/PROBES.md` · `observability/LOGS.md` · `database/ENGINES.md` — probes with response+log dual assertion · log store as a queryable database · PostgreSQL as the production default |
 | 41 | `index.json` regenerated (was stale by 1,224 lines, so no standard added this session was reaching Pipeline's router) · 26 markdownlint errors cleared — the `\|` density operator was splitting table cells |
 | 42 | Pipeline declares the `Persistent store` surface · `docs/adr/0001` records SQLite under the embedded exception the new engine standard requires |
+| 44 | Standards↔Pipeline seam audited end to end — all 9 `pipeline_standards` actions driven against the real 54-standard corpus · every standard resolves · 5 resolution failure modes refuse with actionable errors |
+| 45 | Three seam defects fixed: a hollow-but-parseable index read as `ok:true, total:0` · `check` returning `ok:false, error:null` · `check` shipping 14,271 tokens of checklist to answer a yes/no (now 95) · `tests/standards_seam.rs` locks all three plus a payload budget |
