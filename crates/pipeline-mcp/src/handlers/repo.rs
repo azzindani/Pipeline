@@ -343,6 +343,7 @@ fn infer_alias(url: &str) -> Option<String> {
 }
 
 async fn clone_repo(url: &str, dir: &Path) -> Result<(), String> {
+    super::refuse_git_option("url", url)?;
     if let Some(parent) = dir.parent() {
         tokio::fs::create_dir_all(parent)
             .await
