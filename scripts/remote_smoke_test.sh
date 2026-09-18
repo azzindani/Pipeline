@@ -157,6 +157,17 @@ case "$mode" in
     r=$(rpc '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"pipeline_docker","arguments":{"action":"build"}}}')
     check "read_only blocks a destructive action (pipeline_docker.build)" \
       grep -qF 'blocked by PIPELINE_REMOTE_MODE=read_only' <<<"$(json_at "$said" <<<"$r")"
+    # Runs `cargo test` · a "read" that executes the project's code stays blocked.
+    r=$(rpc '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"pipeline_test","arguments":{"action":"flake_detect"}}}')
+    check "read_only blocks a read that executes code (pipeline_test.flake_detect)" \
+      grep -qF 'blocked by PIPELINE_REMOTE_MODE=read_only' <<<"$(json_at "$said" <<<"$r")"
+    # A pure read the gate used to refuse as "destructive" reaches its handler.
+    # Asserted on the answer existing AND carrying no gate text, so an empty or
+    # missing reply cannot pass.
+    r=$(rpc '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"pipeline_meta","arguments":{"action":"health"}}}')
+    reached() { [ -n "$1" ] && ! grep -qF 'blocked by' <<<"$1"; }
+    check "read_only lets a pure read through (pipeline_meta.health)" \
+      reached "$(json_at "$said" <<<"$r")"
     ;;
   full)
     # ✗ probe the gate in full mode — the probe would really build an image.

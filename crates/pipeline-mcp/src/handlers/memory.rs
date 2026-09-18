@@ -289,16 +289,9 @@ async fn export(args: Value, state: Arc<ServerState>) -> ToolResponse {
         Err(e) => return err(e),
     };
 
-    let cwd = match std::env::current_dir() {
-        Ok(p) => p,
-        Err(e) => return err(format!("cwd: {e}")),
-    };
-    let path = cwd.join(".pipeline").join(format!("export.{format}"));
-    if let Some(parent) = path.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return err(format!("mkdir {}: {e}", parent.display()));
-        }
-    }
+    // ! Format is validated BEFORE it touches a path. It is joined into the file name,
+    // and the mkdir used to run first — so `format: "x/../../../tmp/d/y"` created
+    // directories outside `.pipeline/` before the unsupported format was refused.
     let body = match format {
         // ✗ fall back to "{}" — writing an empty bundle under ok:true loses the
         // whole export and reports success.
@@ -314,6 +307,16 @@ async fn export(args: Value, state: Arc<ServerState>) -> ToolResponse {
             ));
         }
     };
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return err(format!("cwd: {e}")),
+    };
+    let path = cwd.join(".pipeline").join(format!("export.{format}"));
+    if let Some(parent) = path.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return err(format!("mkdir {}: {e}", parent.display()));
+        }
+    }
     if let Err(e) = tokio::fs::write(&path, &body).await {
         return err(format!("write: {e}"));
     }
