@@ -246,6 +246,11 @@ async fn push(args: &Value, state: Arc<ServerState>) -> ToolResponse {
         .and_then(Value::as_str)
         .unwrap_or("origin");
     let branch_arg = args.get("branch").and_then(Value::as_str);
+    for (field, value) in [("remote", Some(remote)), ("branch", branch_arg)] {
+        if let Some(Err(e)) = value.map(|v| super::refuse_git_option(field, v)) {
+            return err(e);
+        }
+    }
     let cwd = match std::env::current_dir() {
         Ok(p) => p,
         Err(e) => return err(format!("cwd: {e}")),

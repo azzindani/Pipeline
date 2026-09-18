@@ -33,6 +33,11 @@ RUN cargo build --release --bin pipeline
 # ---------- runtime ----------
 FROM debian:bookworm-slim AS runtime
 
+# ! git + curl only, on purpose. The remote server runs PIPELINE_REMOTE_MODE=read_only,
+# which blocks every action needing cargo · rustc · docker · trivy · node · python —
+# they all execute code or containers. Installing them would arm actions the gate
+# exists to stop (`test.flake_detect` runs `cargo test`) and grow the image by GBs.
+# `meta.self_check` reports them `found: false`, and says why.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates git curl \
  && rm -rf /var/lib/apt/lists/* \

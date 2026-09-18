@@ -207,6 +207,7 @@ async fn init_registered(
 }
 
 async fn clone_shallow(source: &str, dest: &Path) -> Result<(), String> {
+    super::refuse_git_option("source", source)?;
     if let Some(p) = dest.parent() {
         std::fs::create_dir_all(p).map_err(|e| format!("mkdir template cache: {e}"))?;
     }
@@ -976,6 +977,7 @@ async fn validate_source(source: &str) -> Result<String, String> {
         }
         return Ok("path".to_owned());
     }
+    super::refuse_git_option("source", source)?;
     let run = Command::new("git")
         .args(["ls-remote", "--exit-code", source, "HEAD"])
         // ✗ block on a credential prompt · an MCP server has no terminal to answer it.

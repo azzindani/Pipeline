@@ -375,6 +375,14 @@ async fn self_check() -> ToolResponse {
         "docker": docker,
         "git": git,
         "tools_registered": crate::registry().len(),
+        // ! `found: false` is not a fault on the remote server. Its image ships git
+        // + curl only, on purpose: every action that needs cargo · rustc · docker
+        // executes code or containers, and PIPELINE_REMOTE_MODE=read_only blocks
+        // all of them. Installing them would arm actions the gate exists to stop.
+        "note": "cargo · rustc · docker are needed only by actions that execute \
+                 (run.stage · test.* · docker.build|run · docs.update_from_code); \
+                 the remote read_only image omits them by design · git serves every \
+                 read_only action that shells out",
     }))
 }
 
@@ -656,6 +664,9 @@ fn review_brief(args: &Value) -> ToolResponse {
         .get("base")
         .and_then(Value::as_str)
         .unwrap_or("origin/main");
+    if let Err(e) = super::refuse_git_option("base", base) {
+        return err(e);
+    }
 
     let Some(stat) = git_lines(&["diff", "--numstat", &format!("{base}...HEAD")]) else {
         return err(format!(

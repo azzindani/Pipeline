@@ -74,6 +74,11 @@ async fn generate(args: &Value) -> ToolResponse {
 async fn changelog(args: &Value) -> ToolResponse {
     let from = args.get("from").and_then(Value::as_str);
     let to = args.get("to").and_then(Value::as_str).unwrap_or("HEAD");
+    for (field, value) in [("from", from), ("to", Some(to))] {
+        if let Some(Err(e)) = value.map(|v| super::refuse_git_option(field, v)) {
+            return err(e);
+        }
+    }
     let cwd = match std::env::current_dir() {
         Ok(p) => p,
         Err(e) => return err(format!("cwd: {e}")),

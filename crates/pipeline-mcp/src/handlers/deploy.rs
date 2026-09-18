@@ -573,7 +573,12 @@ async fn diff(args: &Value) -> ToolResponse {
         Err(e) => return err(format!("cwd: {e}")),
     };
     let base = match args.get("base").and_then(Value::as_str) {
-        Some(b) => b.to_owned(),
+        Some(b) => {
+            if let Err(e) = super::refuse_git_option("base", b) {
+                return err(format!("diff[{env}]: {e}"));
+            }
+            b.to_owned()
+        }
         None => match resolve_base_tag(&cwd).await {
             Ok(t) => t,
             Err(e) => return err(format!("diff[{env}]: {e}")),

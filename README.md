@@ -257,8 +257,9 @@ Pipeline ships a second transport — **Streamable HTTP** — that exposes the s
 [VPS · Caddy reverse proxy · TLS termination via Let's Encrypt]
        ↓ HTTP localhost:8080
 [pipeline mcp --transport http · capability gate enforced]
-       ↓ docker.sock mount
-[Docker daemon · stages execute here]
+       ↓ read_only (default) · git + the memory volume · ✗ Docker
+       ↓ full · docker.sock via a local compose override
+[Docker daemon · stages execute here · full mode only]
 ```
 
 ### Endpoints
@@ -281,14 +282,16 @@ Two modes · default is read-only:
 
 | Mode | What's allowed | When to use |
 |---|---|---|
-| `read_only` (default) | ~50 read actions: `meta.version` · `run.status` · `repo.list` · `memory.recall` · `report.dashboard` · etc. | always · safe default |
+| `read_only` (default) | the reads in `READ_ONLY_ACTIONS` (`crates/pipeline-mcp/src/http_transport.rs`): `meta.version` · `meta.health` · `meta.audit` · `run.status` · `repo.list` · `memory.recall` · `report.dashboard` · etc. ✗ anything that writes, executes project code, or reaches a caller-chosen address | always · safe default |
 | `full` | every action including `run.stage/commit/push` · `docker.build/run` · `repo.register` · `simulate.chaos_inject` | only behind authenticated proxy + TLS · single-tenant blast radius |
 
-Destructive actions in `read_only` return:
+Anything off the list in `read_only` returns:
 
 ```json
-{ "ok": false, "error": "blocked by PIPELINE_REMOTE_MODE=read_only · 'pipeline_run.stage' is destructive · unlock by setting PIPELINE_REMOTE_MODE=full only when behind authenticated proxy + TLS" }
+{ "ok": false, "error": "blocked by PIPELINE_REMOTE_MODE=read_only · 'pipeline_run.stage' is not on the read-only allowlist (it writes, executes project code, | reaches a caller-chosen address) · unlock by setting PIPELINE_REMOTE_MODE=full only when behind authenticated proxy + TLS" }
 ```
+
+Blocked although they only read: `deploy.health` (fetches a caller-supplied URL) · `data.db_diff` (connects to a caller-supplied DSN). `test.flake_detect` runs the test suite, so it executes project code.
 
 ### Quick deploy (VPS · Docker Compose · Caddy)
 
@@ -360,7 +363,7 @@ curl -H "Authorization: Bearer dev-token" \
 - [ ] `PIPELINE_REMOTE_MODE=read_only` unless you trust every token holder
 - [ ] Firewall: deny inbound to anything except 80/443 · SSH if needed
 - [ ] Pipeline volumes are private (`pipeline-memory`, `pipeline-workspace`) · single-tenant
-- [ ] Docker socket mount: only if `mode=full` is needed; remove for pure read-only deployments
+- [ ] Docker socket: ✗ mounted by the shipped compose · add it in a local override only for `mode=full` with container stages · it is root on the host
 - [ ] Consider a separate VPS per project · the host = the blast radius
 
 ---
