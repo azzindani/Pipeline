@@ -92,10 +92,12 @@ services:
       - ./pipeline-workspace:/work
       # Persistent memory · session log · run history · digests.
       - pipeline-memory:/work/.pipeline
-      # Docker socket · needed for stages that build/run containers. Comment
-      # out if PIPELINE_REMOTE_MODE=read_only and you want zero escalation
-      # surface — but `pipeline_run` + `pipeline_deploy` will fail.
-      - /var/run/docker.sock:/var/run/docker.sock
+      # ✗ Docker socket. Mounting it hands every token holder root on the host,
+      # and in read_only mode nothing may use it: every action that needs Docker
+      # is blocked, and the image ships no docker CLI. It was mounted until
+      # 2026-09-18 — owned root:988 while the container runs as 10001:999, so it
+      # was unusable as well as dangerous. PIPELINE_REMOTE_MODE=full with container
+      # stages needs it back: add it in a local override, ✗ here.
     working_dir: /work
     networks:
       - pipeline_net

@@ -30,8 +30,9 @@
 //!   `PIPELINE_TOKEN` — the server refuses to start with none set. Unlike Folio and
 //!   Sift, there is no unauthenticated mode; a misconfigured lock must be a locked
 //!   door, not an open one.
-//! - **`PIPELINE_REMOTE_MODE=read_only`** (default) blocks every destructive
-//!   action in `is_safe_action`. `full` only behind an authenticated proxy + TLS.
+//! - **`PIPELINE_REMOTE_MODE=read_only`** (default) blocks every action absent from
+//!   `READ_ONLY_ACTIONS` — anything that writes, executes project code, or reaches
+//!   a caller-chosen address. `full` only behind an authenticated proxy + TLS.
 //! - **Bodies are capped.** An unbounded reader on a public endpoint lets one
 //!   POST grow the heap until the container OOMs. `/mcp` gets a generous cap
 //!   (tool args can be large); the pre-auth OAuth surface gets a tight one.
@@ -447,9 +448,14 @@ async fn dispatch_method(state: &AppState, method: &str, id: &Value, req: &Value
             {
                 return tool_call_result(
                     &id,
+                    // ! "not on the read-only allowlist", ✗ "destructive": `deploy.health`
+                    // only reads, and is blocked because it fetches a caller-supplied URL.
+                    // Calling it destructive sent callers looking for a write that isn't there.
                     &crate::tools::ToolResponse::refused(format!(
-                        "blocked by PIPELINE_REMOTE_MODE=read_only · '{name}.{}' is destructive · \
-                         unlock by setting PIPELINE_REMOTE_MODE=full only when behind authenticated proxy + TLS",
+                        "blocked by PIPELINE_REMOTE_MODE=read_only · '{name}.{}' is not on the \
+                         read-only allowlist (it writes, executes project code, | reaches a \
+                         caller-chosen address) · unlock by setting PIPELINE_REMOTE_MODE=full \
+                         only when behind authenticated proxy + TLS",
                         tool_req.action
                     )),
                 );
@@ -602,56 +608,120 @@ fn build_tool_list() -> Vec<Value> {
         .collect()
 }
 
-/// Read-only allow-list. Any `(tool, action)` pair NOT in this set is
-/// considered destructive and blocked when `PIPELINE_REMOTE_MODE=read_only`.
+/// Read-only allow-list · `(tool, actions)`. Any pair NOT listed is blocked when
+/// `PIPELINE_REMOTE_MODE=read_only`.
+///
+/// ! An entry means the action only READS: no file write, no process that runs project
+/// code, no connection to an address the caller picks. Each entry was checked against
+/// its handler, ✗ its name. Deliberately absent although they sound like reads:
+///
+/// | Action | Why blocked |
+/// |---|---|
+/// | `deploy.health` | `curl`s a caller-supplied URL · SSRF from a public endpoint |
+/// | `data.db_diff` | connects to a caller-supplied DSN |
+/// | `test.flake_detect` | runs `cargo test` · executes the project's code |
+/// | `memory.export` | writes `.pipeline/export.*` and returns only its path |
+/// | `standards.fetch` · `update` · `pin` | network · cache · `pipeline.yaml` writes |
+/// | `docs.diagram` · `security.threat_model` | write files |
+///
+/// Git-backed entries (`deploy.diff` · `docs.changelog` · `meta.review_brief`) are safe
+/// only because their handlers refuse a ref starting with `-` — `--output=<file>` is a
+/// git flag. The `registry_names_every_read_only_action` test pins every entry to a real
+/// action so a typo here cannot silently block a read.
+const READ_ONLY_ACTIONS: &[(&str, &[&str])] = &[
+    (
+        "pipeline_session",
+        &["handover", "context", "file_context", "task_context"],
+    ),
+    (
+        "pipeline_plan",
+        &[
+            "prd_read",
+            "features_list",
+            "research_notes_list",
+            "research_notes_show",
+            "risk_list",
+            "progress",
+            "milestone_progress",
+            "task_list",
+        ],
+    ),
+    (
+        "pipeline_standards",
+        &["brief", "list", "show", "checklist", "route", "check"],
+    ),
+    ("pipeline_project", &["template_list", "devtool_list"]),
+    (
+        "pipeline_run",
+        &["status", "logs", "fix_suggestion", "explain"],
+    ),
+    (
+        "pipeline_repo",
+        &[
+            "list",
+            "list_capabilities",
+            "compare",
+            "capability_graph",
+            "fleet_health",
+            "re_status",
+            "re_report",
+        ],
+    ),
+    (
+        "pipeline_docker",
+        &["inspect", "logs", "compose_ps", "compose_logs"],
+    ),
+    (
+        "pipeline_observe",
+        &[
+            "logs_aggregate",
+            "perf_compare",
+            "optimize_suggest",
+            "efficiency_report",
+        ],
+    ),
+    (
+        "pipeline_memory",
+        &[
+            "recall",
+            "history",
+            "known_issues",
+            "suggest_fix",
+            "pattern_report",
+        ],
+    ),
+    (
+        "pipeline_report",
+        &[
+            "dashboard",
+            "last",
+            "summary",
+            "velocity_metrics",
+            "burndown",
+            "maturity",
+        ],
+    ),
+    (
+        "pipeline_meta",
+        &[
+            "version",
+            "self_check",
+            "explain",
+            "config_get",
+            "health",
+            "audit",
+            "review_brief",
+        ],
+    ),
+    ("pipeline_security", &["compliance_check"]),
+    ("pipeline_deploy", &["diff"]),
+    ("pipeline_docs", &["changelog"]),
+];
+
 fn is_safe_action(tool: &str, action: &str) -> bool {
-    match tool {
-        "pipeline_session" => matches!(
-            action,
-            "handover" | "context" | "file_context" | "task_context"
-        ),
-        "pipeline_plan" => matches!(
-            action,
-            "prd_read"
-                | "features_list"
-                | "research_notes_list"
-                | "research_notes_show"
-                | "risk_list"
-                | "progress"
-                | "milestone_progress"
-        ),
-        // fetch · update · pin mutate (network / cache / pipeline.yaml) → not read-only.
-        "pipeline_standards" => matches!(
-            action,
-            "brief" | "list" | "show" | "checklist" | "route" | "check"
-        ),
-        "pipeline_project" => action == "template_list",
-        "pipeline_run" => matches!(action, "status" | "logs" | "fix_suggestion" | "explain"),
-        "pipeline_test" => action == "flake_detect",
-        "pipeline_repo" => matches!(
-            action,
-            "list"
-                | "list_capabilities"
-                | "compare"
-                | "capability_graph"
-                | "fleet_health"
-                | "re_status"
-                | "re_report"
-        ),
-        "pipeline_docker" => matches!(action, "inspect" | "logs" | "compose_ps" | "compose_logs"),
-        "pipeline_data" => action == "db_diff",
-        "pipeline_observe" => matches!(action, "logs_aggregate" | "perf_compare"),
-        "pipeline_memory" => matches!(
-            action,
-            "recall" | "history" | "known_issues" | "suggest_fix" | "pattern_report" | "export"
-        ),
-        "pipeline_report" => matches!(
-            action,
-            "dashboard" | "last" | "summary" | "velocity_metrics" | "burndown"
-        ),
-        "pipeline_meta" => matches!(action, "version" | "self_check" | "explain" | "config_get"),
-        _ => false,
-    }
+    READ_ONLY_ACTIONS
+        .iter()
+        .any(|(t, actions)| *t == tool && actions.contains(&action))
 }
 
 #[cfg(test)]
@@ -725,6 +795,18 @@ mod tests {
         assert!(is_safe_action("pipeline_meta", "version"));
         assert!(is_safe_action("pipeline_run", "status"));
         assert!(is_safe_action("pipeline_repo", "list"));
+        // Reads that used to be refused as "destructive".
+        for (tool, action) in [
+            ("pipeline_meta", "health"),
+            ("pipeline_meta", "audit"),
+            ("pipeline_meta", "review_brief"),
+            ("pipeline_security", "compliance_check"),
+            ("pipeline_observe", "optimize_suggest"),
+            ("pipeline_deploy", "diff"),
+            ("pipeline_docs", "changelog"),
+        ] {
+            assert!(is_safe_action(tool, action), "{tool}.{action}");
+        }
     }
 
     #[test]
@@ -736,6 +818,38 @@ mod tests {
         assert!(!is_safe_action("pipeline_docker", "run"));
         assert!(!is_safe_action("pipeline_simulate", "chaos_inject"));
         assert!(!is_safe_action("pipeline_deploy", "target"));
+    }
+
+    #[test]
+    fn reads_that_execute_write_or_reach_out_stay_blocked() {
+        // Each reads nothing it shouldn't, and each was on the list or looked like it
+        // belonged there — see READ_ONLY_ACTIONS for why every one is absent.
+        for (tool, action) in [
+            ("pipeline_deploy", "health"),
+            ("pipeline_data", "db_diff"),
+            ("pipeline_test", "flake_detect"),
+            ("pipeline_memory", "export"),
+            ("pipeline_docs", "diagram"),
+            ("pipeline_security", "threat_model"),
+            ("pipeline_standards", "fetch"),
+        ] {
+            assert!(!is_safe_action(tool, action), "{tool}.{action}");
+        }
+    }
+
+    #[test]
+    fn registry_names_every_read_only_action() {
+        // A misspelled entry would block a real read with no error anywhere.
+        for (tool, actions) in READ_ONLY_ACTIONS {
+            let d = crate::registry::descriptor_for(tool)
+                .unwrap_or_else(|| panic!("READ_ONLY_ACTIONS names unknown tool {tool}"));
+            for action in *actions {
+                assert!(
+                    d.action(action).is_some(),
+                    "READ_ONLY_ACTIONS names {tool}.{action}, which the registry does not know"
+                );
+            }
+        }
     }
 
     // constant_time_eq now lives in `crate::auth` alongside the TokenRegistry
