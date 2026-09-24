@@ -14,6 +14,11 @@ ENV CARGO_TERM_COLOR=never \
     CARGO_NET_RETRY=4 \
     RUSTFLAGS="-C strip=symbols"
 
+# Cap build parallelism on a shared host · `--build-arg CARGO_BUILD_JOBS=2`. Unset
+# (no default) → cargo uses every core. A full-width release build on a 4-core VPS
+# hosting ~40 containers took the machine down on 2026-09-24.
+ARG CARGO_BUILD_JOBS
+
 WORKDIR /usr/src/pipeline
 
 # Build dependencies first for cache reuse.
