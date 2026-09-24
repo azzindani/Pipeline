@@ -109,7 +109,7 @@ impl ServerHandler for PipelineRmcpHandler {
 
 /// Run the rmcp-backed MCP server on stdio · blocks until stdin closes.
 pub async fn serve_stdio_rmcp() -> Result<(), crate::McpError> {
-    let state = Arc::new(ServerState::new());
+    let state = Arc::new(ServerState::stdio());
     let handler = PipelineRmcpHandler::new(state);
     let service = handler
         .serve(stdio())

@@ -14,9 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 
-pub async fn handle(req: ToolRequest, _state: Arc<ServerState>) -> ToolResponse {
+pub async fn handle(req: ToolRequest, state: Arc<ServerState>) -> ToolResponse {
     match req.action.as_str() {
-        "init" => init(&req.args).await,
+        "init" => init(&req.args, &state).await,
         "template_list" => template_list(),
         "scaffold" => scaffold(&req.args),
         "template_register" => template_register(&req.args).await,
@@ -27,7 +27,7 @@ pub async fn handle(req: ToolRequest, _state: Arc<ServerState>) -> ToolResponse 
     }
 }
 
-async fn init(args: &Value) -> ToolResponse {
+async fn init(args: &Value, state: &ServerState) -> ToolResponse {
     let name = match args.get("name").and_then(Value::as_str) {
         Some(n) => n.to_owned(),
         None => return err("missing 'name'".into()),
@@ -77,7 +77,7 @@ async fn init(args: &Value) -> ToolResponse {
             Err(e) => return err(format!("cwd: {e}")),
         };
         if let Some(reg) = templates::find_registered(&cwd, template) {
-            return init_registered(&cwd, &parent, &name, &reg, stack, adopt).await;
+            return init_registered(&cwd, &parent, &name, &reg, stack, adopt, state).await;
         }
     }
 
@@ -89,23 +89,26 @@ async fn init(args: &Value) -> ToolResponse {
     }
 
     match templates::init_project_with(&parent, &name, template, stack, adopt) {
-        Ok(outcome) => ToolResponse {
-            ok: true,
-            data: {
-                let mut v = serde_json::to_value(&outcome).unwrap_or(json!({}));
-                if let Some(o) = v.as_object_mut() {
-                    o.insert("stack_detected".into(), json!(detected.is_some()));
-                }
-                v
-            },
-            next_suggested: vec![
-                "pipeline_session.lock".into(),
-                "pipeline_plan.create".into(),
-                "pipeline_run.stage(fast)".into(),
-            ],
-            memory_refs: vec![],
-            error: None,
-        },
+        Ok(outcome) => {
+            let resp = ToolResponse {
+                ok: true,
+                data: {
+                    let mut v = serde_json::to_value(&outcome).unwrap_or(json!({}));
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert("stack_detected".into(), json!(detected.is_some()));
+                    }
+                    v
+                },
+                next_suggested: vec![
+                    "pipeline_session.lock".into(),
+                    "pipeline_plan.create".into(),
+                    "pipeline_run.stage(fast)".into(),
+                ],
+                memory_refs: vec![],
+                error: None,
+            };
+            follow_root(state, &outcome.root, resp).await
+        }
         Err(InitError::NotEmpty(p)) => err(format!(
             "target '{p}' is non-empty · pass adopt=true to bring an existing \
              project under Pipeline (writes only what is missing)"
@@ -116,6 +119,107 @@ async fn init(args: &Value) -> ToolResponse {
         )),
         Err(e) => err(e.to_string()),
     }
+}
+
+/// Where the server resolves its project once `init` returns.
+#[derive(Debug, PartialEq, Eq)]
+enum Rooting {
+    /// Already there · adopt of the current root.
+    Already,
+    /// Move there · every later call reads the new project.
+    Move,
+    /// Stay put · why, and what to call instead of the suggestions that assumed a move.
+    Keep { reason: String, next: Vec<String> },
+}
+
+/// Decide, ✗ act · pure so the policy is testable without moving the test process.
+fn plan_rooting(
+    owns_root: bool,
+    attached: Option<&str>,
+    here: Option<&Path>,
+    target: &Path,
+) -> Rooting {
+    if here == Some(target) {
+        return Rooting::Already;
+    }
+    let shown = target.display();
+    if !owns_root {
+        return Rooting::Keep {
+            reason: format!(
+                "shared server · its root is fixed at startup · serve this project with \
+                 `pipeline mcp --project {shown}`"
+            ),
+            next: vec![],
+        };
+    }
+    // ! A session opened on the old root lives in the old memory.db · after a move
+    // its lock could not be released from here, and the next agent finds it held.
+    if let Some(p) = attached {
+        return Rooting::Keep {
+            reason: format!(
+                "this connection is attached to project '{p}' · moving would orphan that \
+                 session · end it, then pipeline_project.init(name, parent, adopt=true) on \
+                 {shown} roots the server there"
+            ),
+            next: vec!["pipeline_session.end(session_id)".into()],
+        };
+    }
+    Rooting::Move
+}
+
+/// Root the server at the project `init` produced, then say where it is rooted.
+///
+/// ! Every handler resolves the project from the process cwd, and `init` writes into
+/// `<parent>/<name>`. A server started in a directory of projects — a harness's shared
+/// `/workspace` — kept reading `<cwd>/pipeline.yaml` after init, so every call init
+/// suggested next failed on a file that was never going to be there.
+///
+/// A kept root withdraws those suggestions: they assumed the move.
+async fn follow_root(state: &ServerState, root: &Path, mut resp: ToolResponse) -> ToolResponse {
+    let target = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let here = std::env::current_dir().and_then(|c| c.canonicalize()).ok();
+    let attached = state.project_id.lock().await.clone();
+    let mut rooting = plan_rooting(
+        state.owns_root,
+        attached.as_deref(),
+        here.as_deref(),
+        &target,
+    );
+    if rooting == Rooting::Move {
+        // Under the memory lock · a concurrent call cannot open memory.db between the
+        // move and the reset, and cache the old project's handle as the new one's.
+        let mut memory = state.memory.lock().await;
+        match std::env::set_current_dir(&target) {
+            Ok(()) => *memory = None,
+            Err(e) => {
+                rooting = Rooting::Keep {
+                    reason: format!("chdir {}: {e}", target.display()),
+                    next: vec![],
+                };
+            }
+        }
+    }
+    let now = std::env::current_dir().unwrap_or_else(|_| target.clone());
+    let mut stamp = json!({
+        "server_root": now.display().to_string(),
+        "server_rooted": !matches!(rooting, Rooting::Keep { .. }),
+    });
+    match rooting {
+        Rooting::Already => {}
+        Rooting::Move => {
+            if let Some(from) = &here {
+                stamp["server_moved_from"] = json!(from.display().to_string());
+            }
+        }
+        Rooting::Keep { reason, next } => {
+            stamp["server_root_note"] = json!(reason);
+            resp.next_suggested = next;
+        }
+    }
+    if let (Some(o), Value::Object(s)) = (resp.data.as_object_mut(), stamp) {
+        o.extend(s);
+    }
+    resp
 }
 
 /// Infer the runtime from what an existing repo already declares.
@@ -163,6 +267,7 @@ async fn init_registered(
     reg: &RegisteredTemplate,
     stack: &str,
     adopt: bool,
+    state: &ServerState,
 ) -> ToolResponse {
     let source_dir = if reg.kind == "git" {
         let cache = templates::registry_path(cwd)
@@ -184,20 +289,23 @@ async fn init_registered(
     };
 
     match templates::instantiate_registered(parent, name, &reg.name, &source_dir, stack, adopt) {
-        Ok(outcome) => ToolResponse {
-            ok: true,
-            data: json!({
-                "outcome": serde_json::to_value(&outcome).unwrap_or(json!({})),
-                "template_origin": "registered",
-                "source": reg.source,
-            }),
-            next_suggested: vec![
-                "pipeline_session.lock".into(),
-                "pipeline_run.stage(fast)".into(),
-            ],
-            memory_refs: vec![],
-            error: None,
-        },
+        Ok(outcome) => {
+            let resp = ToolResponse {
+                ok: true,
+                data: json!({
+                    "outcome": serde_json::to_value(&outcome).unwrap_or(json!({})),
+                    "template_origin": "registered",
+                    "source": reg.source,
+                }),
+                next_suggested: vec![
+                    "pipeline_session.lock".into(),
+                    "pipeline_run.stage(fast)".into(),
+                ],
+                memory_refs: vec![],
+                error: None,
+            };
+            follow_root(state, &outcome.root, resp).await
+        }
         Err(InitError::NotEmpty(p)) => err(format!(
             "target '{p}' is non-empty · pass adopt=true to bring an existing \
              project under Pipeline (writes only what is missing)"
@@ -1558,5 +1666,54 @@ mod adopt_tests {
     #[test]
     fn an_empty_tree_yields_none_not_a_default() {
         assert_eq!(detect_stack(tree(&[]).path()), None);
+    }
+}
+
+#[cfg(test)]
+mod rooting_tests {
+    use super::{Rooting, plan_rooting};
+    use std::path::Path;
+
+    const SHARED: &str = "/workspace";
+    const NEW: &str = "/workspace/demo";
+
+    #[test]
+    fn a_stdio_server_follows_the_project_it_just_created() {
+        // ! The harness case: rooted at a directory of projects, no session open.
+        assert_eq!(
+            plan_rooting(true, None, Some(Path::new(SHARED)), Path::new(NEW)),
+            Rooting::Move
+        );
+    }
+
+    #[test]
+    fn adopting_the_current_root_is_not_a_move() {
+        assert_eq!(
+            plan_rooting(false, Some("demo"), Some(Path::new(NEW)), Path::new(NEW)),
+            Rooting::Already
+        );
+    }
+
+    #[test]
+    fn a_shared_server_keeps_its_root_and_withdraws_the_suggestions() {
+        // Every principal on an HTTP server shares one cwd · a move would retarget them all.
+        let Rooting::Keep { reason, next } =
+            plan_rooting(false, None, Some(Path::new(SHARED)), Path::new(NEW))
+        else {
+            panic!("a shared server must not move");
+        };
+        assert!(reason.contains("--project /workspace/demo"), "{reason}");
+        assert!(next.is_empty(), "suggestions assumed the move: {next:?}");
+    }
+
+    #[test]
+    fn an_open_session_pins_the_root_rather_than_being_orphaned() {
+        let Rooting::Keep { reason, next } =
+            plan_rooting(true, Some("vera"), Some(Path::new(SHARED)), Path::new(NEW))
+        else {
+            panic!("an attached connection must not move");
+        };
+        assert!(reason.contains("'vera'"), "must name the project: {reason}");
+        assert_eq!(next, ["pipeline_session.end(session_id)"]);
     }
 }
