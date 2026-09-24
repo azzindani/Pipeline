@@ -28,16 +28,29 @@ pub struct ServerState {
     /// Capabilities the agent advertised on register · informational only,
     /// surfaces in handover packets.
     pub agent_capabilities: Arc<Mutex<Vec<String>>>,
+    /// ! This connection is the process's only client, so it may move the process
+    /// cwd — the project root every handler resolves from. True on stdio (one agent
+    /// per process) · false on HTTP, where every principal shares one cwd and a
+    /// move would retarget them all.
+    pub owns_root: bool,
 }
 
 impl ServerState {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// State for a stdio connection · the one client of this process.
+    pub fn stdio() -> Self {
+        Self {
+            owns_root: true,
+            ..Self::default()
+        }
+    }
 }
 
 pub async fn run_stdio() -> Result<(), McpError> {
-    let state = Arc::new(ServerState::new());
+    let state = Arc::new(ServerState::stdio());
 
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin).lines();

@@ -724,7 +724,7 @@ static REGISTRY: [ToolDescriptor; 19] = [
         actions: &[
             ActionSpec::real(
                 "init",
-                "Scaffold a project from a template · reports files_written + files_skipped · refuses a non-empty target unless adopt.",
+                "Scaffold a project from a template · reports files_written + files_skipped · refuses a non-empty target unless adopt · roots a stdio server at the project (server_root).",
                 Of(&[
                     req(
                         "name",
