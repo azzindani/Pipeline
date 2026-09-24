@@ -42,10 +42,25 @@ pub(crate) async fn ensure_memory(
     Ok(mem)
 }
 
+/// ! A missing pipeline.yaml names the server's root and the way out. The bare
+/// "No such file or directory" left an agent on a server rooted in a directory of
+/// projects retrying calls that could never find one.
 pub(crate) fn load_config_in_cwd() -> Result<pipeline_config::PipelineConfig, String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let path = cwd.join("pipeline.yaml");
-    pipeline_config::PipelineConfig::load(&path).map_err(|e| e.to_string())
+    pipeline_config::PipelineConfig::load(&path).map_err(|e| match &e {
+        pipeline_config::ConfigError::Io { source, .. }
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            format!(
+                "{e} · this server is rooted at {} and no project lives there · \
+                 pipeline_project.init(name, parent?) creates one (adopt=true for an existing \
+                 repo) and roots a stdio server in it · | start the server with --project <dir>",
+                cwd.display()
+            )
+        }
+        _ => e.to_string(),
+    })
 }
 
 /// Refuse a caller-supplied git positional (revision · remote · branch · URL) that git

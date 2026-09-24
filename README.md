@@ -222,6 +222,15 @@ For the rmcp-backed transport:
 }
 ```
 
+### Which project the server works on
+
+Every call resolves the project from the server's root: its working directory, or
+`--project <dir>`. A stdio server started in a directory of projects roots itself at
+whatever `pipeline_project.init` creates or adopts, and the response reports it
+(`server_root` · `server_rooted`). It stays put while it holds a session, and an HTTP
+server never moves, since all its callers share one root. Serve another project from its
+own `--project` server.
+
 ### opencode / Codex / Kilo / other MCP clients
 
 Same shape — any client that speaks MCP stdio works. Point the client's `command` field at the `pipeline` binary with `mcp` as the only argument.
