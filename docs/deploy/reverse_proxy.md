@@ -4,6 +4,10 @@ Pipeline's HTTP transport listens on plain HTTP (`:8080` in the container) and n
 binds `:80`/`:443` itself. Exposing it publicly means putting a TLS-terminating reverse
 proxy of your choice in front of it. Any proxy works when it meets the contract below.
 
+The public hostname is the deployment's own setting, `PIPELINE_DOMAIN` in `.env` (see
+`.env.example`); the proxy serves that name, and `scripts/remote_smoke_test.sh` reads the same
+variable. No hostname is written into this repository.
+
 ## Routes
 
 | Path | Upstream | Auth |
