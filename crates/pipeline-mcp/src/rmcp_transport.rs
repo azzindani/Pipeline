@@ -21,8 +21,9 @@ use crate::tools::ToolRequest;
 use rmcp::ServiceExt;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, ErrorData, Implementation, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool, ToolsCapability,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+    Implementation, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig,
+    Tool, ToolsCapability,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::stdio;
@@ -42,9 +43,9 @@ impl PipelineRmcpHandler {
 }
 
 impl ServerHandler for PipelineRmcpHandler {
-    fn get_info(&self) -> ServerInfo {
-        // Build via Default + field assignment · ServerInfo is non-exhaustive.
-        let mut info = ServerInfo::default();
+    fn get_info(&self) -> ServerConfig {
+        // Build via Default + field assignment · ServerConfig is non-exhaustive.
+        let mut info = ServerConfig::default();
         let mut caps = ServerCapabilities::default();
         let mut tools_cap = ToolsCapability::default();
         tools_cap.list_changed = Some(false);
@@ -91,7 +92,7 @@ impl ServerHandler for PipelineRmcpHandler {
         &self,
         params: CallToolRequestParams,
         _ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         let arguments = serde_json::Value::Object(params.arguments.unwrap_or_default());
         let resp = match ToolRequest::from_arguments(&params.name, &arguments) {
             Ok(req) => dispatch::call_tool(&params.name, req, self.state.clone()).await,
@@ -101,9 +102,9 @@ impl ServerHandler for PipelineRmcpHandler {
         let payload = serde_json::to_string(&resp).unwrap_or_else(|_| "{}".into());
 
         let mut result = CallToolResult::default();
-        result.content = vec![Content::text(payload)];
+        result.content = vec![ContentBlock::text(payload)];
         result.is_error = Some(is_error);
-        Ok(result)
+        Ok(result.into())
     }
 }
 

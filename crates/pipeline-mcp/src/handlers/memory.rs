@@ -312,10 +312,10 @@ async fn export(args: Value, state: Arc<ServerState>) -> ToolResponse {
         Err(e) => return err(format!("cwd: {e}")),
     };
     let path = cwd.join(".pipeline").join(format!("export.{format}"));
-    if let Some(parent) = path.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return err(format!("mkdir {}: {e}", parent.display()));
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        return err(format!("mkdir {}: {e}", parent.display()));
     }
     if let Err(e) = tokio::fs::write(&path, &body).await {
         return err(format!("write: {e}"));

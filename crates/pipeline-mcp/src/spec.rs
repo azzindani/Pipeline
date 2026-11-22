@@ -230,20 +230,20 @@ impl ActionSpec {
     pub fn describe(&self) -> String {
         use std::fmt::Write as _;
         let mut s = format!("{}{}: {}", self.fidelity.badge(), self.name, self.summary);
-        if let ArgSet::Of(args) = self.args {
-            if !args.is_empty() {
-                let rendered: Vec<String> = args
-                    .iter()
-                    .map(|a| {
-                        if a.required {
-                            a.name.to_owned()
-                        } else {
-                            format!("{}?", a.name)
-                        }
-                    })
-                    .collect();
-                let _ = write!(s, " ({})", rendered.join(", "));
-            }
+        if let ArgSet::Of(args) = self.args
+            && !args.is_empty()
+        {
+            let rendered: Vec<String> = args
+                .iter()
+                .map(|a| {
+                    if a.required {
+                        a.name.to_owned()
+                    } else {
+                        format!("{}?", a.name)
+                    }
+                })
+                .collect();
+            let _ = write!(s, " ({})", rendered.join(", "));
         }
         s
     }

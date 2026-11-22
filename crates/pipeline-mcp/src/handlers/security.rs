@@ -530,10 +530,10 @@ fn dockerfile_runtime_user(body: &str) -> Option<String> {
                 .find(|(a, _)| a.as_deref() == Some(base.as_str()))
                 .and_then(|(_, u)| u.clone());
             stages.push((alias, inherited));
-        } else if directive.eq_ignore_ascii_case("USER") {
-            if let Some(last) = stages.last_mut() {
-                last.1 = toks.get(1).map(|u| (*u).to_owned());
-            }
+        } else if directive.eq_ignore_ascii_case("USER")
+            && let Some(last) = stages.last_mut()
+        {
+            last.1 = toks.get(1).map(|u| (*u).to_owned());
         }
     }
     stages.last().and_then(|(_, u)| u.clone())
@@ -566,10 +566,10 @@ fn unpinned_bases(body: &str) -> Vec<String> {
             continue;
         }
         let Some(base) = toks.get(1) else { continue };
-        if let Some(i) = toks.iter().position(|x| x.eq_ignore_ascii_case("AS")) {
-            if let Some(a) = toks.get(i + 1) {
-                aliases.push(a.to_ascii_lowercase());
-            }
+        if let Some(i) = toks.iter().position(|x| x.eq_ignore_ascii_case("AS"))
+            && let Some(a) = toks.get(i + 1)
+        {
+            aliases.push(a.to_ascii_lowercase());
         }
         let lower = base.to_ascii_lowercase();
         if aliases.contains(&lower) || lower.contains('@') {

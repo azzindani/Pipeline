@@ -275,10 +275,10 @@ async fn init_registered(
             .join(&reg.name);
         // Re-clone rather than pull · a stale cache silently instantiates an old
         // template, and "which revision did I get" must have one answer.
-        if cache.exists() {
-            if let Err(e) = std::fs::remove_dir_all(&cache) {
-                return err(format!("clear template cache: {e}"));
-            }
+        if cache.exists()
+            && let Err(e) = std::fs::remove_dir_all(&cache)
+        {
+            return err(format!("clear template cache: {e}"));
         }
         if let Err(e) = clone_shallow(&reg.source, &cache).await {
             return err(e);
@@ -325,7 +325,7 @@ async fn clone_shallow(source: &str, dest: &Path) -> Result<(), String> {
         // ✗ block on a credential prompt · an MCP server has no terminal to answer it.
         .env("GIT_TERMINAL_PROMPT", "0")
         .output();
-    match tokio::time::timeout(Duration::from_secs(180), run).await {
+    match tokio::time::timeout(Duration::from_mins(3), run).await {
         Err(_) => Err(format!("git clone '{source}' timed out after 180s")),
         Ok(Err(e)) => Err(format!("git spawn: {e} · is git installed?")),
         Ok(Ok(o)) if o.status.success() => Ok(()),
@@ -1006,10 +1006,10 @@ fn package_key(manifest: &str, key: &str) -> Option<String> {
         if !in_package {
             continue;
         }
-        if let Some((k, v)) = t.split_once('=') {
-            if k.trim() == key {
-                return Some(v.trim().to_owned());
-            }
+        if let Some((k, v)) = t.split_once('=')
+            && k.trim() == key
+        {
+            return Some(v.trim().to_owned());
         }
     }
     None

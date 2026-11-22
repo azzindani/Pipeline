@@ -200,7 +200,7 @@ pub async fn serve_http(bind: Option<&str>) -> Result<(), crate::McpError> {
     if limiter.enabled() {
         let sweeper = Arc::clone(&limiter);
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            let mut tick = tokio::time::interval(std::time::Duration::from_mins(1));
             tick.tick().await; // interval fires immediately; skip that one
             loop {
                 tick.tick().await;
@@ -565,12 +565,11 @@ fn ratelimit_headers(state: &AppState, d: &crate::ratelimit::Decision) -> Header
 /// can forge, and without it every direct client keyed to the same literal `"unknown"`:
 /// one shared bucket, so a single noisy client starved everyone else.
 fn client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
-    if let Some(v) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(last) = v.split(',').next_back().map(str::trim) {
-            if !last.is_empty() {
-                return last.to_owned();
-            }
-        }
+    if let Some(v) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
+        && let Some(last) = v.split(',').next_back().map(str::trim)
+        && !last.is_empty()
+    {
+        return last.to_owned();
     }
     if let Some(v) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
         let v = v.trim();
@@ -758,7 +757,7 @@ mod tests {
 
     #[test]
     fn a_single_hop_from_our_own_edge_is_taken_as_is() {
-        // Our caddy sets (not appends) XFF, so the single value IS the real peer.
+        // A proxy that sets (not appends) XFF leaves one value, and it IS the real peer.
         let h = hdrs(&[("x-forwarded-for", "203.0.113.7")]);
         assert_eq!(client_ip(&h, Some(peer("172.18.0.2:5000"))), "203.0.113.7");
     }

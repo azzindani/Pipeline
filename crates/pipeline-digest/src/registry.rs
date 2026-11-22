@@ -123,10 +123,10 @@ fn workspace_crates(root: &Path) -> BTreeSet<String> {
     let crates_dir = root.join("crates");
     if let Ok(entries) = std::fs::read_dir(&crates_dir) {
         for e in entries.flatten() {
-            if e.path().is_dir() {
-                if let Some(name) = e.file_name().to_str() {
-                    set.insert(name.replace('-', "_"));
-                }
+            if e.path().is_dir()
+                && let Some(name) = e.file_name().to_str()
+            {
+                set.insert(name.replace('-', "_"));
             }
         }
     }

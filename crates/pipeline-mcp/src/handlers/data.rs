@@ -265,10 +265,10 @@ async fn schema_generate(args: &Value) -> ToolResponse {
         Err(e) => return err(e),
     };
 
-    if let Some(parent) = path.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return err(format!("mkdir: {e}"));
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        return err(format!("mkdir: {e}"));
     }
     if let Err(e) = tokio::fs::write(&path, &sql).await {
         return err(format!("write: {e}"));
@@ -362,17 +362,17 @@ fn render_schema(root: &Value, tables: &[Value]) -> Result<String, String> {
         if let (Some(p), Some(n)) = (
             t.get("partition_by").and_then(Value::as_str),
             t.get("partitions").and_then(Value::as_u64),
-        ) {
-            if p.trim_start().to_ascii_uppercase().starts_with("HASH") && n > 0 {
-                out.push('\n');
-                let _ = writeln!(out, "DO $$\nBEGIN\n    FOR i IN 0..{} LOOP", n - 1);
-                let _ = writeln!(
-                    out,
-                    "        EXECUTE format('CREATE TABLE {name}_p%s PARTITION OF {name} \
+        ) && p.trim_start().to_ascii_uppercase().starts_with("HASH")
+            && n > 0
+        {
+            out.push('\n');
+            let _ = writeln!(out, "DO $$\nBEGIN\n    FOR i IN 0..{} LOOP", n - 1);
+            let _ = writeln!(
+                out,
+                "        EXECUTE format('CREATE TABLE {name}_p%s PARTITION OF {name} \
                      FOR VALUES WITH (MODULUS {n}, REMAINDER %s)', i, i);"
-                );
-                out.push_str("    END LOOP;\nEND $$;\n");
-            }
+            );
+            out.push_str("    END LOOP;\nEND $$;\n");
         }
 
         for idx in t
@@ -496,10 +496,10 @@ async fn etl_create(args: &Value) -> ToolResponse {
     if path.exists() {
         return err(format!("refusing to overwrite {}", path.display()));
     }
-    if let Some(parent) = path.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return err(format!("mkdir: {e}"));
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        return err(format!("mkdir: {e}"));
     }
     if let Err(e) = tokio::fs::write(&path, &body).await {
         return err(format!("write: {e}"));
@@ -1113,10 +1113,10 @@ async fn anonymize(args: &Value) -> ToolResponse {
     if let Err(e) = anon.verify(rows) {
         return err(e);
     }
-    if let Some(parent) = dst.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return err(format!("mkdir: {e}"));
-        }
+    if let Some(parent) = dst.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        return err(format!("mkdir: {e}"));
     }
     if let Err(e) = tokio::fs::write(&dst, &body).await {
         return err(format!("write {}: {e}", dst.display()));
@@ -1228,10 +1228,10 @@ fn anonymize_csv(input: &str, anon: &mut Anonymizer) -> Result<(String, u64), St
         }
         let mut fields = fields;
         for (i, slot) in p.iter().enumerate() {
-            if let Some((key, s)) = slot {
-                if let Some(v) = anon.apply(key, *s, &fields[i], "") {
-                    fields[i] = v;
-                }
+            if let Some((key, s)) = slot
+                && let Some(v) = anon.apply(key, *s, &fields[i], "")
+            {
+                fields[i] = v;
             }
         }
         let _ = writeln!(out, "{}", join_csv(&fields));

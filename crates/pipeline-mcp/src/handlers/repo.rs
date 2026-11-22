@@ -712,10 +712,10 @@ async fn extract(args: &Value) -> ToolResponse {
             target_rel.display()
         ));
     }
-    if let Some(parent) = target_rel.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return err(format!("mkdir: {e}"));
-        }
+    if let Some(parent) = target_rel.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        return err(format!("mkdir: {e}"));
     }
     let count = match copy_recursive(&src, &target_rel).await {
         Ok(n) => n,
@@ -1484,10 +1484,10 @@ fn parse_go_mod(text: &str) -> Vec<String> {
         if candidate.is_empty() || candidate.starts_with("//") {
             continue;
         }
-        if let Some(name) = candidate.split_whitespace().next() {
-            if !out.iter().any(|d| d == name) {
-                out.push(name.to_owned());
-            }
+        if let Some(name) = candidate.split_whitespace().next()
+            && !out.iter().any(|d| d == name)
+        {
+            out.push(name.to_owned());
         }
     }
     out
@@ -1635,17 +1635,17 @@ const RE_SUPPORTED_TYPES: &[&str] = &["codebase", "auto"];
 /// `target` → a directory to scan. A registered alias wins over a path, since
 /// an alias is the deliberate reference.
 async fn resolve_analysis_root(target: &str) -> Result<PathBuf, String> {
-    if let Ok(reg) = read_registry().await {
-        if reg.repos.iter().any(|r| r.alias == target) {
-            let root = repo_root(target).await?;
-            if tokio::fs::try_exists(&root).await.unwrap_or(false) {
-                return Ok(root);
-            }
-            return Err(format!(
-                "alias '{target}' is registered but {} does not exist · call pipeline_repo.digest first",
-                root.display()
-            ));
+    if let Ok(reg) = read_registry().await
+        && reg.repos.iter().any(|r| r.alias == target)
+    {
+        let root = repo_root(target).await?;
+        if tokio::fs::try_exists(&root).await.unwrap_or(false) {
+            return Ok(root);
         }
+        return Err(format!(
+            "alias '{target}' is registered but {} does not exist · call pipeline_repo.digest first",
+            root.display()
+        ));
     }
     let path = PathBuf::from(strip_local_prefix(target));
     if tokio::fs::try_exists(&path).await.unwrap_or(false) {
@@ -1701,10 +1701,10 @@ async fn re_analyze(args: &Value) -> ToolResponse {
     });
 
     let job_path = re_job_file(&job_id);
-    if let Some(parent) = job_path.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return err(format!("mkdir: {e}"));
-        }
+    if let Some(parent) = job_path.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        return err(format!("mkdir: {e}"));
     }
     if let Err(e) = tokio::fs::write(&job_path, blob.to_string()).await {
         return err(format!("write: {e}"));

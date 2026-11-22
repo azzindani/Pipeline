@@ -57,10 +57,10 @@ async fn generate(args: &Value) -> ToolResponse {
             ));
         }
     };
-    if let Some(parent) = path.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return err(format!("mkdir: {e}"));
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        return err(format!("mkdir: {e}"));
     }
     if path.exists() {
         return err(format!("refusing to overwrite {}", path.display()));
@@ -226,10 +226,10 @@ async fn diagram(args: &Value) -> ToolResponse {
             path.display()
         ));
     }
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return err(format!("mkdir: {e}"));
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return err(format!("mkdir: {e}"));
     }
     let edges: usize = nodes.iter().map(|n| n.deps.len()).sum();
     if let Err(e) = std::fs::write(&path, render_crate_graph(&nodes)) {
@@ -357,12 +357,11 @@ fn parse_package_name(manifest: &str) -> Option<String> {
             in_package = t == "[package]";
             continue;
         }
-        if in_package {
-            if let Some((k, v)) = t.split_once('=') {
-                if k.trim() == "name" {
-                    return quoted_values(v).into_iter().next();
-                }
-            }
+        if in_package
+            && let Some((k, v)) = t.split_once('=')
+            && k.trim() == "name"
+        {
+            return quoted_values(v).into_iter().next();
         }
     }
     None
@@ -381,12 +380,12 @@ fn parse_dependency_names(manifest: &str) -> Vec<String> {
         if let Some(header) = t.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
             let h = header.trim();
             // `[dependencies.foo]` names one dependency and opens no key list.
-            if let Some((section, name)) = h.rsplit_once('.') {
-                if section.ends_with("dependencies") {
-                    out.push(name.trim().to_owned());
-                    in_deps = false;
-                    continue;
-                }
+            if let Some((section, name)) = h.rsplit_once('.')
+                && section.ends_with("dependencies")
+            {
+                out.push(name.trim().to_owned());
+                in_deps = false;
+                continue;
             }
             in_deps = h.ends_with("dependencies");
             continue;
@@ -592,10 +591,10 @@ async fn spec_generate(args: &Value) -> ToolResponse {
             path.display()
         ));
     }
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return err(format!("mkdir: {e}"));
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return err(format!("mkdir: {e}"));
     }
     let title = spec_title(&root);
     if let Err(e) = std::fs::write(&path, render_openapi(&title, &scan.routes)) {

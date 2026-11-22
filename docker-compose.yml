@@ -1,11 +1,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Pipeline · VPS deployment using the shared `reverse-proxy`.
+# Pipeline · Docker Compose deployment.
 #
-# Pairs with the reverse proxy · the central Caddy container owns :80/:443
-# and routes by hostname to each project. This compose file:
 #   - builds + runs the Pipeline MCP HTTP server on internal :8080
-#   - creates `pipeline_net` so the router can join it as external
-#   - exposes NO host ports (router reaches via the shared network)
+#   - creates `pipeline_net` so a reverse proxy can join it
+#   - exposes NO host ports
 #
 # Bring up:
 #   docker compose up -d --build
@@ -13,31 +11,10 @@
 # Sanity check from the host (token comes from .env):
 #   docker exec pipeline wget -qO- http://127.0.0.1:8080/health
 #
-# Wire the public route (one-time, after setting PIPELINE_DOMAIN in .env):
-#   1. Add `pipeline_net` to the reverse proxy's compose file:
-#         networks:
-#           pipeline_net:
-#             external: true
-#             name: pipeline_pipeline_net
-#      and add `- pipeline_net` to the caddy service's networks list.
-#   2. Add this block to the reverse proxy's config (uses $PIPELINE_DOMAIN
-#      from this project's .env, already loaded via env_file):
-#         {$PIPELINE_DOMAIN} {
-#             encode zstd gzip
-#             reverse_proxy pipeline:8080 {
-#                 header_up Host {host}
-#                 transport http {
-#                     read_timeout  300s
-#                     write_timeout 300s
-#                 }
-#             }
-#             log { output stdout; format console }
-#         }
-#   3. Add /root/Pipeline/.env to reverse-proxy's `env_file:` list.
-#   4. cd the reverse proxy && docker compose up -d
-#
+# Public exposure: put a TLS-terminating reverse proxy of your choice in front of
+# pipeline:8080 — the contract it must meet is docs/deploy/reverse_proxy.md.
 # Auth + capability gate are enforced by Pipeline itself (PIPELINE_TOKEN,
-# PIPELINE_REMOTE_MODE) — Caddy adds TLS, nothing more.
+# PIPELINE_REMOTE_MODE) — the proxy adds TLS, nothing more.
 # ─────────────────────────────────────────────────────────────────────────────
 services:
   pipeline:

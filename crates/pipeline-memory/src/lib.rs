@@ -79,7 +79,10 @@ impl Memory {
             if stmt.trim().is_empty() {
                 continue;
             }
-            sqlx::query(&stmt).execute(&self.pool).await?;
+            // Safe: each statement is a slice of the compiled-in SCHEMA constant, never input.
+            sqlx::query(sqlx::AssertSqlSafe(stmt))
+                .execute(&self.pool)
+                .await?;
         }
         Ok(())
     }
@@ -312,16 +315,16 @@ impl Memory {
     async fn active_work(&self, project_id: &str) -> Result<ActiveWork, MemoryError> {
         let mut work = ActiveWork::default();
 
-        if let Some(raw) = self.recall(project_id, "plan", "prd").await? {
-            if let Ok(prd) = serde_json::from_str::<serde_json::Value>(&raw) {
-                work.goal = prd
-                    .get("summary")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(ToOwned::to_owned);
-                work.goals = string_list(prd.get("goals"));
-                work.non_goals = string_list(prd.get("non_goals"));
-            }
+        if let Some(raw) = self.recall(project_id, "plan", "prd").await?
+            && let Ok(prd) = serde_json::from_str::<serde_json::Value>(&raw)
+        {
+            work.goal = prd
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned);
+            work.goals = string_list(prd.get("goals"));
+            work.non_goals = string_list(prd.get("non_goals"));
         }
 
         // ! Plan order, ✗ recency order. list_scope is created_at DESC, which would
@@ -592,7 +595,8 @@ impl Memory {
         sql.push_str(&conditions.join(" OR "));
         sql.push_str(") ORDER BY f.created_at DESC LIMIT ?");
 
-        let mut q = sqlx::query_as::<_, FailureRecord>(&sql).bind(project_id);
+        // Safe: the dynamic part is only repeated `LIKE ?` placeholders; every keyword is bound.
+        let mut q = sqlx::query_as::<_, FailureRecord>(sqlx::AssertSqlSafe(sql)).bind(project_id);
         for kw in &keywords {
             q = q.bind(format!("%{kw}%"));
         }

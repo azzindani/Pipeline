@@ -403,12 +403,11 @@ async fn milestone_progress(args: Value, state: Arc<ServerState>) -> ToolRespons
     let mut done = 0usize;
     let total = feature_ids.len();
     for fid in &feature_ids {
-        if let Ok(Some(s)) = mem.recall(&project, "feature", fid).await {
-            if let Ok(v) = serde_json::from_str::<Value>(&s) {
-                if v.get("status").and_then(Value::as_str) == Some("done") {
-                    done += 1;
-                }
-            }
+        if let Ok(Some(s)) = mem.recall(&project, "feature", fid).await
+            && let Ok(v) = serde_json::from_str::<Value>(&s)
+            && v.get("status").and_then(Value::as_str) == Some("done")
+        {
+            done += 1;
         }
     }
     #[allow(clippy::cast_precision_loss)]
@@ -784,7 +783,7 @@ fn median(xs: &mut [f64]) -> f64 {
     }
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = xs.len() / 2;
-    if xs.len() % 2 == 0 {
+    if xs.len().is_multiple_of(2) {
         f64::midpoint(xs[mid - 1], xs[mid])
     } else {
         xs[mid]
@@ -1100,11 +1099,11 @@ async fn stored_notes(
         .await
         .map_err(|e| format!("research notes unreadable: {e}"))?;
     for (_, blob) in &notes {
-        if let Ok(v) = serde_json::from_str::<Value>(blob) {
-            if let Some(excerpt) = v.get("excerpt").and_then(Value::as_str) {
-                corpus.push(' ');
-                corpus.push_str(&excerpt.to_lowercase());
-            }
+        if let Ok(v) = serde_json::from_str::<Value>(blob)
+            && let Some(excerpt) = v.get("excerpt").and_then(Value::as_str)
+        {
+            corpus.push(' ');
+            corpus.push_str(&excerpt.to_lowercase());
         }
     }
     Ok(notes.len())
@@ -1242,12 +1241,12 @@ fn classify_url(url: &str) -> &'static str {
 
 fn extract_title(html: &str) -> String {
     let lower = html.to_ascii_lowercase();
-    if let Some(start) = lower.find("<title") {
-        if let Some(gt) = lower[start..].find('>') {
-            let after = &html[start + gt + 1..];
-            if let Some(end) = after.to_ascii_lowercase().find("</title>") {
-                return after[..end].trim().to_owned();
-            }
+    if let Some(start) = lower.find("<title")
+        && let Some(gt) = lower[start..].find('>')
+    {
+        let after = &html[start + gt + 1..];
+        if let Some(end) = after.to_ascii_lowercase().find("</title>") {
+            return after[..end].trim().to_owned();
         }
     }
     String::new()

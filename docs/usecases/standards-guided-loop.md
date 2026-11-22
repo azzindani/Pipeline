@@ -237,7 +237,7 @@ The agent now holds everything it needs to close the loop:
 
 - **Transport.** This walkthrough drives the **stdio** transport (`pipeline mcp --transport
   stdio`), which a local Claude Code / Ollama / LM Studio agent spawns directly. The identical
-  envelope works over the **HTTP** transport at `/mcp` (e.g. the live `pipe.example.com`
+  envelope works over the **HTTP** transport at `/mcp` (e.g. a live `pipe.example.com`
   deployment) — the only difference is a `Bearer` token and, in the default `read_only` mode,
   the destructive actions being gated. Every call in this loop is read-only, so it runs
   unchanged over either.

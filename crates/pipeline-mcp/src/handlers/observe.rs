@@ -40,10 +40,10 @@ async fn metrics_setup(args: &Value) -> ToolResponse {
     };
     let prom_path = cwd.join("observability/prometheus.yml");
     let otel_path = cwd.join("observability/otel-collector.yml");
-    if let Some(parent) = prom_path.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return err(format!("mkdir: {e}"));
-        }
+    if let Some(parent) = prom_path.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        return err(format!("mkdir: {e}"));
     }
     if let Err(e) = tokio::fs::write(&prom_path, PROMETHEUS_YML).await {
         return err(format!("write prometheus.yml: {e}"));
@@ -604,10 +604,10 @@ async fn traces_setup(_args: &Value) -> ToolResponse {
         Err(e) => return err(format!("cwd: {e}")),
     };
     let path = cwd.join("observability/jaeger-compose.yml");
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return err(format!("mkdir: {e}"));
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return err(format!("mkdir: {e}"));
     }
     if path.exists() {
         return err(format!("refusing to overwrite {}", path.display()));
@@ -630,10 +630,10 @@ async fn alerts_define(args: &Value) -> ToolResponse {
         Err(e) => return err(format!("cwd: {e}")),
     };
     let path = cwd.join("observability/alerts.yml");
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return err(format!("mkdir: {e}"));
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return err(format!("mkdir: {e}"));
     }
     // ! Only "absent" means empty. Treating a permission/encoding error as an
     // empty file makes the write below silently destroy every existing rule and

@@ -37,16 +37,16 @@ use tokio::process::Command;
 const PLAYWRIGHT_IMAGE: &str = "mcr.microsoft.com/playwright:v1.49.0-noble";
 
 /// Whole-suite runs · slowest legitimate case.
-const SUITE_LIMIT: Duration = Duration::from_secs(900);
+const SUITE_LIMIT: Duration = Duration::from_mins(15);
 /// One page: launch · navigate · act.
-const PAGE_LIMIT: Duration = Duration::from_secs(180);
+const PAGE_LIMIT: Duration = Duration::from_mins(3);
 /// `npm i` then one page · install dominates.
-const INSTALL_LIMIT: Duration = Duration::from_secs(300);
+const INSTALL_LIMIT: Duration = Duration::from_mins(5);
 /// Docker bookkeeping — `rm` · `ps` · `logs` · `inspect`.
-const QUICK_LIMIT: Duration = Duration::from_secs(60);
+const QUICK_LIMIT: Duration = Duration::from_mins(1);
 /// How long `browser_launch` waits for the in-container handshake · must cover
 /// a cold vendoring step, ✗ only the navigation.
-const HANDSHAKE_LIMIT: Duration = Duration::from_secs(300);
+const HANDSHAKE_LIMIT: Duration = Duration::from_mins(5);
 
 /// Marks a machine-readable line inside otherwise human-readable container
 /// output · ✗ parse bare stdout, Playwright writes banners to it.
@@ -207,10 +207,10 @@ fn motion_baseline(args: &Value) -> ToolResponse {
         Err(e) => return err(e),
     };
     let path = cwd.join(motion_baseline_path(environment, route));
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return err(format!("mkdir {}: {e}", parent.display()));
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return err(format!("mkdir {}: {e}", parent.display()));
     }
     let body = match serde_json::to_string_pretty(record) {
         Ok(b) => b,

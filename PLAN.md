@@ -278,7 +278,7 @@ Exit: maintenance daemon runs unattended for 7 days · auto-PR on green dependen
 
 ## 5b. Remote MCP transport
 
-**Status: built + tested + DEPLOYED at pipe.example.com · ✗ released.** Runs as a local Docker container behind the shared `the reverse proxy`; no GHCR image is published.
+**Status: built + tested · ✗ released.** Runs as a local Docker container behind a reverse proxy; no GHCR image is published.
 
 Pipeline is an **MCP endpoint, not a web app** — there is no browser UI. (An earlier pass ported Folio's `/library` file manager over the record; it was removed once the workflow settled on terminal-only use, where `ls`/`cat`/`$EDITOR` already do the job and a filesystem-write surface over HTTP is pure liability with no user.) The endpoint contract is deliberately IDENTICAL to Folio's and Sift's `/mcp` — one key, one client config, one monitor probe works against any of the three.
 
@@ -300,7 +300,7 @@ Pipeline is an **MCP endpoint, not a web app** — there is no browser UI. (An e
 
 **Wire conformance** — the whole `notifications/*` namespace → **202 + empty body** (a notification has no id, so any response object is unanswerable; strict SDK clients drop the connection on one). `GET`/`DELETE /mcp` → 405 + `Allow`. All of the above is covered by the in-process `oneshot` integration suite (`http_tests.rs`), which drives the real router with no socket or env.
 
-`caddy/proxy config` documents the route contract for the shared router. ! ✗ run it as a standalone Caddy — `the reverse proxy` owns :80/:443.
+`docs/deploy/reverse_proxy.md` documents the route contract any reverse proxy in front of Pipeline must meet.
 
 Not yet: SSE streaming.
 

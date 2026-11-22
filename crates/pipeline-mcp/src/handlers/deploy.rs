@@ -46,10 +46,10 @@ async fn cicd_generate(args: &Value) -> ToolResponse {
         "gitlab" => (cwd.join(".gitlab-ci.yml"), GITLAB_CI.to_owned()),
         other => return err(format!("unsupported provider '{other}' · github|gitlab")),
     };
-    if let Some(parent) = path.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return err(format!("mkdir: {e}"));
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        return err(format!("mkdir: {e}"));
     }
     if path.exists() {
         return err(format!("refusing to overwrite {}", path.display()));

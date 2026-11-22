@@ -370,7 +370,7 @@ fn persist(file: &Path, map: &HashMap<String, Grant>) {
 
 /// Public origin of this deployment, as the client sees it.
 ///
-/// ! Behind the shared reverse-proxy, the socket is plain HTTP on :8080 — only
+/// ! Behind a reverse proxy, the socket is plain HTTP on :8080 — only
 /// the forwarded headers know it is really `https://pipe.example.com`. Get this
 /// wrong and every absolute URL in the OAuth metadata points at the wrong host.
 pub(crate) fn base_url(headers: &HeaderMap) -> String {
@@ -856,7 +856,7 @@ mod tests {
 
     #[test]
     fn base_url_prefers_forwarded_headers_over_the_socket() {
-        // ! behind reverse-proxy the socket is plain http on :8080 — only the
+        // ! behind a reverse proxy the socket is plain http on :8080 — only the
         // forwarded headers know the public origin.
         let mut h = HeaderMap::new();
         h.insert("host", "pipeline:8080".parse().unwrap());
@@ -1052,10 +1052,10 @@ mod tests {
         assert_eq!(o.resolve("not-a-token"), None);
 
         // Force expiry → resolve must miss.
-        if let Ok(mut m) = o.access.lock() {
-            if let Some(g) = m.get_mut(&tok) {
-                g.expires_at = now_ms() - 1;
-            }
+        if let Ok(mut m) = o.access.lock()
+            && let Some(g) = m.get_mut(&tok)
+        {
+            g.expires_at = now_ms() - 1;
         }
         assert_eq!(o.resolve(&tok), None, "expired token must not resolve");
     }

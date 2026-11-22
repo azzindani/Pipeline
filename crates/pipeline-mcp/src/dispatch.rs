@@ -39,22 +39,22 @@ pub async fn call_tool(name: &str, req: ToolRequest, state: Arc<ServerState>) ->
         // success. Refusing at the boundary makes the fidelity marker
         // self-enforcing: flipping an action to `Real` is the only thing that
         // lets its handler run, so the marker cannot drift from behaviour.
-        if let Some(spec) = desc.action(&req.action) {
-            if spec.fidelity == crate::spec::Fidelity::Planned {
-                return ToolResponse {
-                    ok: false,
-                    data: serde_json::json!({
-                        "action": format!("{name}.{}", req.action),
-                        "fidelity": "planned",
-                    }),
-                    next_suggested: vec![],
-                    memory_refs: vec![],
-                    error: Some(format!(
-                        "{name}.{} is not implemented · {} · ✗ retry: this refusal is deliberate, not transient",
-                        req.action, spec.summary
-                    )),
-                };
-            }
+        if let Some(spec) = desc.action(&req.action)
+            && spec.fidelity == crate::spec::Fidelity::Planned
+        {
+            return ToolResponse {
+                ok: false,
+                data: serde_json::json!({
+                    "action": format!("{name}.{}", req.action),
+                    "fidelity": "planned",
+                }),
+                next_suggested: vec![],
+                memory_refs: vec![],
+                error: Some(format!(
+                    "{name}.{} is not implemented · {} · ✗ retry: this refusal is deliberate, not transient",
+                    req.action, spec.summary
+                )),
+            };
         }
     }
 

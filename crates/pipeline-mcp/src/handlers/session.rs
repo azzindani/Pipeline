@@ -720,10 +720,10 @@ fn collect_text(rec: &Value, fields: &[&str]) -> String {
 
 fn record_label(rec: &Value) -> String {
     for field in ["name", "title", "url"] {
-        if let Some(s) = rec.get(field).and_then(Value::as_str) {
-            if !s.is_empty() {
-                return s.to_owned();
-            }
+        if let Some(s) = rec.get(field).and_then(Value::as_str)
+            && !s.is_empty()
+        {
+            return s.to_owned();
         }
     }
     String::new()

@@ -45,7 +45,7 @@ ln -sf "$(pwd)/target/release/pipeline" ~/.local/bin/pipeline
 
 | Component | Why · how to install |
 |---|---|
-| Rust 1.85+ | `curl https://sh.rustup.rs -sSf \| sh` |
+| Rust 1.94+ | `curl https://sh.rustup.rs -sSf \| sh` |
 | Docker 24+ | container · integration · e2e · security stages run containerized tools |
 | Git 2.40+ | session locking · `pipeline_run.commit/push` · `pipeline_repo.register` |
 | `cargo-llvm-cov` (optional) | needed only for `pipeline_test.coverage` · `cargo install cargo-llvm-cov` |
@@ -263,7 +263,7 @@ Pipeline ships a second transport — **Streamable HTTP** — that exposes the s
 ```
 [Claude mobile/browser]
        ↓ HTTPS · Authorization: Bearer <PIPELINE_TOKEN>
-[VPS · Caddy reverse proxy · TLS termination via Let's Encrypt]
+[VPS · reverse proxy · TLS termination]
        ↓ HTTP localhost:8080
 [pipeline mcp --transport http · capability gate enforced]
        ↓ read_only (default) · git + the memory volume · ✗ Docker
@@ -302,7 +302,7 @@ Anything off the list in `read_only` returns:
 
 Blocked although they only read: `deploy.health` (fetches a caller-supplied URL) · `data.db_diff` (connects to a caller-supplied DSN). `test.flake_detect` runs the test suite, so it executes project code.
 
-### Quick deploy (VPS · Docker Compose · Caddy)
+### Quick deploy (VPS · Docker Compose · reverse proxy)
 
 ```bash
 # 1. Provision a VPS · point DNS at it.
@@ -312,8 +312,8 @@ export PIPELINE_DOMAIN=pipeline.example.com
 # Optional · unlock destructive actions.
 export PIPELINE_REMOTE_MODE=read_only   # change to "full" only after auditing access
 
-# 3. Bring up Pipeline + Caddy.
-docker compose -f compose.deploy.yml up -d
+# 3. Bring up Pipeline, then point a TLS reverse proxy at pipeline:8080.
+docker compose up -d --build
 
 # 4. Verify.
 curl https://$PIPELINE_DOMAIN/health
@@ -326,7 +326,7 @@ curl -H "Authorization: Bearer $PIPELINE_TOKEN" \
 # → {"result":{"serverInfo":{"name":"pipeline-mcp","version":"0.0.1"}, ...}}
 ```
 
-The repo ships [`compose.deploy.yml`](compose.deploy.yml) and [`proxy config`](proxy config) ready to use. Caddy auto-fetches a Let's Encrypt cert on first request.
+The proxy's contract (routes, forwarded headers, no buffering on `/mcp`, timeouts, security headers) is [`docs/deploy/reverse_proxy.md`](docs/deploy/reverse_proxy.md).
 
 ### Wiring Claude mobile / browser to the remote endpoint
 
@@ -364,9 +364,9 @@ curl -H "Authorization: Bearer dev-token" \
 ### Hardening checklist before going public
 
 - [ ] `PIPELINE_TOKEN` set to a strong random value (`openssl rand -hex 32` minimum)
-- [ ] Bound to `127.0.0.1` inside the container · only Caddy reaches it
-- [ ] Caddy serving HTTPS via Let's Encrypt · HTTP 80 redirects
-- [ ] HSTS · X-Frame-Options · CSP set in proxy config (default config does this)
+- [ ] No host port published · only the reverse proxy reaches it
+- [ ] The proxy serving HTTPS · HTTP 80 redirects
+- [ ] HSTS · X-Frame-Options · CSP set at the proxy (`docs/deploy/reverse_proxy.md`)
 - [ ] Access log to a persistent volume · review for abuse
 - [ ] Token rotation plan (re-deploy with new token · old token invalidated immediately on restart)
 - [ ] `PIPELINE_REMOTE_MODE=read_only` unless you trust every token holder

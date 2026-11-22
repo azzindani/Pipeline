@@ -228,7 +228,7 @@ fn median(sorted: &[i64]) -> Option<i64> {
     if n % 2 == 1 {
         Some(sorted[n / 2])
     } else {
-        Some((sorted[n / 2 - 1] + sorted[n / 2]) / 2)
+        Some(i64::midpoint(sorted[n / 2 - 1], sorted[n / 2]))
     }
 }
 

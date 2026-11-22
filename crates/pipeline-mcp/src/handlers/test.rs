@@ -229,10 +229,10 @@ async fn generate(args: &Value) -> ToolResponse {
     };
     let path = resolve_test_path(&cwd, &target, kind);
 
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return err(format!("create_dir_all: {e}"));
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return err(format!("create_dir_all: {e}"));
     }
     if path.exists() {
         return err(format!(
@@ -313,10 +313,10 @@ async fn ac_to_test(args: &Value, state: Arc<ServerState>) -> ToolResponse {
     };
     let slug = slugify(name);
     let path = cwd.join("tests").join(format!("ac_{slug}.rs"));
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return err(format!("create_dir_all: {e}"));
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return err(format!("create_dir_all: {e}"));
     }
     let content = render_ac_tests(name, &ac);
     if let Err(e) = std::fs::write(&path, &content) {
@@ -486,10 +486,10 @@ async fn property_generate(args: &Value) -> ToolResponse {
     if path.exists() {
         return err(format!("refusing to overwrite {}", path.display()));
     }
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return err(format!("mkdir: {e}"));
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return err(format!("mkdir: {e}"));
     }
     let body = format!(
         "//! Property tests scaffolded by pipeline_test.property_generate · target = {target}.\n//! Add `proptest = \"1\"` to [dev-dependencies] in Cargo.toml.\n\nuse proptest::prelude::*;\n\nproptest! {{\n    #[test]\n    fn {fn_name}(input in any::<u64>()) {{\n        // TODO: invariant for {target}(input)\n        let _ = input;\n    }}\n}}\n",
